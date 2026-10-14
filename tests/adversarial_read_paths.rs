@@ -7,6 +7,7 @@
 //! every surface agree with the model and with each other, across the
 //! memtable, frozen memtables and every SSTable level, with range
 //! tombstones and snapshots in the mix.
+#![cfg(not(target_arch = "wasm32"))]
 
 use std::collections::BTreeMap;
 use std::ops::Bound;
@@ -211,11 +212,8 @@ fn check_seeks(db: &Db, model: &BTreeMap<Vec<u8>, Vec<u8>>, step: usize) {
 }
 
 fn run(seed: u64, steps: usize, opts: Options) {
-    let merges_enabled = opts.merge_operator.is_some();
-    let reopen_opts = Options {
-        merge_operator: opts.merge_operator.clone(),
-        ..Options::default()
-    };
+    let merges_enabled = opts.get_merge_operator().is_some();
+    let reopen_opts = Options::default().merge_operator(opts.get_merge_operator().cloned());
     let dir = TempDir::new().unwrap();
     let db = Db::open(dir.path(), opts).unwrap();
     let mut model: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
@@ -226,12 +224,12 @@ fn run(seed: u64, steps: usize, opts: Options) {
             0..=39 => {
                 let k = key_of(rng.below(KEY_SPACE));
                 let v = value_of(&mut rng);
-                db.put(&k, &v).unwrap();
+                regolith::through_stalls(|| db.put(&k, &v)).unwrap();
                 model.insert(k, v);
             }
             40..=54 => {
                 let k = key_of(rng.below(KEY_SPACE));
-                db.delete(&k).unwrap();
+                regolith::through_stalls(|| db.delete(&k)).unwrap();
                 model.remove(&k);
             }
             55..=64 => {
@@ -239,7 +237,7 @@ fn run(seed: u64, steps: usize, opts: Options) {
                 let b = rng.below(KEY_SPACE);
                 let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
                 let (lo, hi) = (key_of(lo), key_of(hi));
-                db.delete_range(&lo, &hi).unwrap();
+                regolith::through_stalls(|| db.delete_range(&lo, &hi)).unwrap();
                 let doomed: Vec<Vec<u8>> = model
                     .range(lo.clone()..hi.clone())
                     .map(|(k, _)| k.clone())
@@ -252,13 +250,13 @@ fn run(seed: u64, steps: usize, opts: Options) {
                 let k = key_of(rng.below(KEY_SPACE));
                 let operand = value_of(&mut rng);
                 if merges_enabled {
-                    db.merge(&k, &operand).unwrap();
+                    regolith::through_stalls(|| db.merge(&k, &operand)).unwrap();
                     model
                         .entry(k)
                         .and_modify(|v| v.extend_from_slice(&operand))
                         .or_insert_with(|| operand.clone());
                 } else {
-                    db.put(&k, &operand).unwrap();
+                    regolith::through_stalls(|| db.put(&k, &operand)).unwrap();
                     model.insert(k, operand);
                 }
             }
@@ -277,7 +275,7 @@ fn run(seed: u64, steps: usize, opts: Options) {
                         staged.push((k, Some(v)));
                     }
                 }
-                db.write(batch).unwrap();
+                regolith::through_stalls(|| db.write(batch.clone())).unwrap();
                 for (k, v) in staged {
                     match v {
                         Some(v) => {
@@ -290,7 +288,7 @@ fn run(seed: u64, steps: usize, opts: Options) {
                 }
             }
             _ => {
-                db.compact_range(None, None).unwrap();
+                db.compact_range(None, None).wait().unwrap();
             }
         }
 
@@ -317,13 +315,11 @@ fn run(seed: u64, steps: usize, opts: Options) {
 /// Small memtables and small blocks, so entries scatter across the
 /// memtable, frozen memtables and several SSTable levels.
 fn churny() -> Options {
-    Options {
-        write_buffer_size: 8 * 1024,
-        block_size: 512,
-        target_file_size: 32 * 1024,
-        l0_compaction_trigger: 2,
-        ..Options::default()
-    }
+    Options::default()
+        .write_buffer_size(8 * 1024)
+        .block_size(512)
+        .target_file_size(32 * 1024)
+        .l0_compaction_trigger(2)
 }
 
 #[test]
@@ -340,24 +336,20 @@ fn every_read_surface_agrees_with_the_model_across_many_seeds() {
 
 #[test]
 fn every_read_surface_agrees_with_a_partitioned_index_and_a_tiny_cache() {
-    let opts = Options {
-        partitioned_index: true,
-        metadata_block_size: 512,
-        cache_index_and_filter_blocks: true,
-        block_cache_size: 8 * 1024,
-        block_cache_num_shard_bits: 0,
-        ..churny()
-    };
+    let opts = churny()
+        .partitioned_index(true)
+        .metadata_block_size(512)
+        .cache_index_and_filter_blocks(true)
+        .block_cache_size(8 * 1024)
+        .block_cache_num_shard_bits(0);
     run(0xA5A5_5A5A, 900, opts);
 }
 
 #[test]
 fn every_read_surface_agrees_under_the_embedded_arena_profile() {
-    let opts = Options {
-        arena_profile: regolith::ArenaProfile::EMBEDDED,
-        write_buffer_size: 4 * 1024,
-        ..churny()
-    };
+    let opts = churny()
+        .arena_profile(regolith::ArenaProfile::EMBEDDED)
+        .write_buffer_size(4 * 1024);
     run(0x0BAD_C0DE, 900, opts);
 }
 
@@ -368,10 +360,7 @@ fn every_read_surface_agrees_under_the_embedded_arena_profile() {
 fn every_read_surface_agrees_with_a_merge_operator() {
     for seed in [11u64, 0xC0FFEE] {
         println!("--- merge seed {seed} ---");
-        let opts = Options {
-            merge_operator: Some(Arc::new(Concat)),
-            ..churny()
-        };
+        let opts = churny().merge_operator(Some(Arc::new(Concat)));
         run(seed, 900, opts);
     }
 }

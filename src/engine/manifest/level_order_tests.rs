@@ -43,6 +43,8 @@ fn table(
             largest_key: largest.to_vec(),
             file_size: 1,
             num_entries,
+            global_seq: None,
+            deletions: None,
         },
         Arc::clone(reader),
     )
@@ -293,7 +295,11 @@ fn applying_tables_that_overlap_below_l0_trips_the_debug_check() {
 /// A MANIFEST holding exactly `records`, after its stamp.
 fn write_manifest(dir: &Path, records: &[ManifestRecord]) {
     let mut bytes = VersionSet::encode_stamp().to_vec();
-    bytes.extend_from_slice(&VersionSet::encode_records(records).unwrap());
+    bytes.extend_from_slice(
+        &VersionSet::encode_records(records, MANIFEST_STAMP_LEN as u64, None)
+            .unwrap()
+            .0,
+    );
     std::fs::write(dir.join("MANIFEST"), bytes).unwrap();
 }
 
@@ -310,9 +316,11 @@ fn legacy_overlap_is_repaired_but_duplicate_deep_table_references_are_refused() 
     };
 
     write_manifest(dir.path(), &[add(1, &wide), add(1, &inside)]);
-    let vs = VersionSet::open(dir.path(), &sst_dir).unwrap();
+    let mut vs = VersionSet::open(dir.path(), &sst_dir).unwrap();
     assert_eq!(ids(&vs.current().levels[0]), [1, 2]);
     assert!(vs.current().levels[1].is_empty());
+    let moved = vs.take_demotion().expect("the open moved the level");
+    assert_eq!((moved.tables, moved.deepest_level), (2, 1));
     drop(vs);
 
     // A duplicate reference is not a legacy range-widening defect.
@@ -384,8 +392,7 @@ enum Step {
     Pick,
     /// Everything pushed to the bottom.
     Settle,
-    /// A manual compaction of a key range, run only while L0 is empty (see
-    /// the test).
+    /// A manual compaction of a key range.
     Bounded(u16, u16),
 }
 
@@ -405,11 +412,6 @@ fn key(n: u16) -> Vec<u8> {
     format!("k{n:04}").into_bytes()
 }
 
-fn files_at_level(db: &Db, level: usize) -> u64 {
-    db.get_int_property(&format!("regolith.num-files-at-level{level}"))
-        .unwrap()
-}
-
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(24))]
     /// Whatever the engine writes, a level below L0 stays one sorted run:
@@ -420,46 +422,36 @@ proptest! {
         steps in proptest::collection::vec(step(), 1..60),
     ) {
         let dir = TempDir::new().unwrap();
-        let options = Options {
-            max_background_compactions: 0,
-            write_buffer_size: 4 * 1024,
-            target_file_size: 1024,
-            block_size: 256,
-            level_base_bytes: 8 * 1024,
-            ..Options::default()
-        };
+        let options = Options::default()
+.max_background_compactions(0)
+.write_buffer_size(4 * 1024)
+.target_file_size(1024)
+.block_size(256)
+.level_base_bytes(8 * 1024);
         let db = Db::open(dir.path(), options.clone()).unwrap();
         let mut model: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
         for (index, step) in steps.iter().enumerate() {
             match *step {
                 Step::Put(n) => {
                     let value = format!("value-{n}-{index}-{}", "x".repeat(40)).into_bytes();
-                    db.put(&key(n), &value).unwrap();
+                    crate::through_stalls(|| db.put(&key(n), &value)).unwrap();
                     model.insert(key(n), value);
                 }
                 Step::Delete(n) => {
-                    db.delete(&key(n)).unwrap();
+                    crate::through_stalls(|| db.delete(&key(n))).unwrap();
                     model.remove(&key(n));
                 }
                 Step::DeleteRange(lo, hi) => {
-                    db.delete_range(&key(lo), &key(hi)).unwrap();
+                    crate::through_stalls(|| db.delete_range(&key(lo), &key(hi))).unwrap();
                     model.retain(|k, _| !(key(lo)..key(hi)).contains(k));
                 }
                 Step::Flush => db.flush().unwrap(),
                 Step::Pick => {
                     db.compact_step().unwrap();
                 }
-                Step::Settle => db.compact_range(None, None).unwrap(),
+                Step::Settle => db.compact_range(None, None).wait().unwrap(),
                 Step::Bounded(lo, hi) => {
-                    // A bounded compaction takes the L0 tables that intersect
-                    // its range and no others, so with two or more in L0 it
-                    // can move a newer table down and leave an older one
-                    // above it, shadowing it. That is a defect of its own and
-                    // not what this test is about, so it runs only when the
-                    // flush it starts with makes L0 a single table.
-                    if files_at_level(&db, 0) == 0 {
-                        db.compact_range(Some(&key(lo)), Some(&key(hi))).unwrap();
-                    }
+                    db.compact_range(Some(&key(lo)), Some(&key(hi))).wait().unwrap();
                 }
             }
             prop_assert!(

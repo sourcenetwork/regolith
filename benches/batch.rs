@@ -33,16 +33,15 @@ fn env_u64(name: &str, default: u64) -> u64 {
     }
 }
 
-/// One cache shard keeps RSS bounded across the sweep; the default 64 MiB
-/// memtable keeps a batch repetition off the flush path so the number is the
-/// batch write path itself.
+/// One cache shard keeps RSS bounded across the sweep; a memtable larger than
+/// any repetition writes keeps it off the flush path, so the number is the
+/// batch write path itself, and each repetition checks that it was. The
+/// memtable grows only with what a repetition writes.
 fn opts() -> Options {
-    Options {
-        write_buffer_size: 64 * 1024 * 1024,
-        block_cache_size: 8 * 1024 * 1024,
-        block_cache_num_shard_bits: 0,
-        ..common::default_opts()
-    }
+    common::default_opts()
+        .write_buffer_size(1 << 30)
+        .block_cache_size(8 * 1024 * 1024)
+        .block_cache_num_shard_bits(0)
 }
 
 fn batch_rep(batch_ops: usize, dur: Duration) -> f64 {
@@ -69,6 +68,10 @@ fn batch_rep(batch_ops: usize, dur: Duration) -> f64 {
         batches += 1;
     }
     let elapsed = start.elapsed().as_secs_f64();
+    assert!(
+        !common::rotated(&db),
+        "a memtable was sealed inside a timed repetition: raise write_buffer_size so every row times the write path alone"
+    );
     db.close().expect("close db");
     drop(db);
     drop(tmp);

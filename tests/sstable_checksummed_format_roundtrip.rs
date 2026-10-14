@@ -6,6 +6,7 @@
 //! A format change that only survives inside the writing process is not
 //! a format change; these are the paths where a table is written by one
 //! handle and read by another.
+#![cfg(not(target_arch = "wasm32"))]
 
 use std::fs;
 use std::path::Path;
@@ -24,19 +25,17 @@ fn value(i: usize) -> Vec<u8> {
 }
 
 fn opts(partitioned: bool) -> Options {
-    Options {
-        write_buffer_size: 16 * 1024,
-        partitioned_index: partitioned,
-        metadata_block_size: if partitioned { 256 } else { 4096 },
-        ..Options::default()
-    }
+    Options::default()
+        .write_buffer_size(16 * 1024)
+        .partitioned_index(partitioned)
+        .metadata_block_size(if partitioned { 256 } else { 4096 })
 }
 
 fn fill(db: &Db) {
     for i in 0..N {
-        db.put(&key(i), &value(i)).expect("put");
+        regolith::through_stalls(|| db.put(&key(i), &value(i))).expect("put");
     }
-    db.delete_range(b"k_0000100", b"k_0000150").expect("range");
+    regolith::through_stalls(|| db.delete_range(b"k_0000100", b"k_0000150")).expect("range");
 }
 
 fn check(db: &Db, what: &str) {
@@ -81,7 +80,7 @@ fn a_checksummed_database_survives_backup_and_restore() {
         let src = TempDir::new().expect("tempdir");
         let db = Db::open(src.path(), opts(partitioned)).expect("open");
         fill(&db);
-        db.compact_range(None, None).expect("compact");
+        db.compact_range(None, None).wait().expect("compact");
 
         let backup_dir = TempDir::new().expect("tempdir");
         let mut engine = BackupEngine::open(backup_dir.path()).expect("backup engine");
@@ -91,7 +90,7 @@ fn a_checksummed_database_survives_backup_and_restore() {
 
         let target = TempDir::new().expect("tempdir");
         let restored_root = target.path().join("restored");
-        engine.restore(id, &restored_root).expect("restore");
+        engine.restore(id, &restored_root, None).expect("restore");
         let restored = Db::open(&restored_root, opts(partitioned)).expect("open restored");
         check(&restored, &format!("restored (partitioned={partitioned})"));
         println!(
@@ -107,11 +106,11 @@ fn a_checksummed_database_survives_a_checkpoint() {
         let src = TempDir::new().expect("tempdir");
         let db = Db::open(src.path(), opts(partitioned)).expect("open");
         fill(&db);
-        db.compact_range(None, None).expect("compact");
+        db.compact_range(None, None).wait().expect("compact");
 
         let holder = TempDir::new().expect("tempdir");
         let cp = holder.path().join("cp");
-        db.checkpoint(&cp).expect("checkpoint");
+        db.checkpoint(&cp).wait().expect("checkpoint");
         db.close().expect("close");
         drop(db);
 
@@ -153,6 +152,7 @@ fn a_checksummed_external_table_ingests_and_reads_back() {
         let dir = TempDir::new().expect("tempdir");
         let db = Db::open(dir.path(), opts(partitioned)).expect("open");
         db.ingest_external_files(&[path], IngestOptions::default())
+            .wait()
             .expect("ingest");
         for i in 0..N {
             assert_eq!(
@@ -173,7 +173,7 @@ fn a_partitioned_database_survives_compaction_and_reopen() {
     let db = Db::open(dir.path(), opts(true)).expect("open");
     fill(&db);
     for round in 0..3 {
-        db.compact_range(None, None).expect("compact");
+        db.compact_range(None, None).wait().expect("compact");
         check(&db, &format!("partitioned after compaction round {round}"));
     }
     db.close().expect("close");

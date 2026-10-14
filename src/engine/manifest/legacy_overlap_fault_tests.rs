@@ -1,10 +1,9 @@
-//! Failed repair I/O must fail the open and leave the old inputs recoverable.
+//! Failed repair I/O must fail the edit that records the repair, which is
+//! the open's first, and leave the old inputs recoverable.
 
-use std::time::Duration;
-
-use super::legacy_overlap_tests::{assert_layout, fixture};
+use super::legacy_overlap_tests::{assert_layout, fixture, fixture_with_ingest_seq, options};
 use super::*;
-use crate::env::{Capabilities, DirEntry, FileLock, FileMeta, JoinHandle, ReadFile, WriteFile};
+use crate::env::{Capabilities, FileLock, FileMeta, JoinHandle, ReadDir, ReadFile, WriteFile};
 
 #[derive(Clone, Copy, Debug)]
 enum Failure {
@@ -57,7 +56,7 @@ impl Env for FailingEnv {
         self.inner.create_dir_all(path)
     }
 
-    fn read_dir(&self, path: &Path) -> io::Result<Vec<DirEntry>> {
+    fn read_dir(&self, path: &Path) -> io::Result<ReadDir<'_>> {
         self.inner.read_dir(path)
     }
 
@@ -119,10 +118,6 @@ impl Env for FailingEnv {
     ) -> io::Result<Box<dyn JoinHandle>> {
         self.inner.spawn(name, body)
     }
-
-    fn sleep(&self, duration: Duration) {
-        self.inner.sleep(duration)
-    }
 }
 
 #[test]
@@ -135,9 +130,9 @@ fn repair_append_and_sync_failures_fail_the_open_and_keep_every_table() {
             failure,
         });
         let error =
-            VersionSet::open_with_policy(&env, dir.path(), &sst_dir, MetadataPolicy::Pinned)
-                .err()
-                .expect("repair I/O must fail the open");
+            VersionSet::open_with_policy(&env, dir.path(), &sst_dir, MetadataPolicy::Pinned, None)
+                .and_then(|mut vs| vs.apply(&[]))
+                .expect_err("repair I/O must fail the open's first edit");
         assert!(error.to_string().contains("injected repair"));
         for id in [8, 3, 10, 90, 77] {
             assert!(
@@ -147,5 +142,42 @@ fn repair_append_and_sync_failures_fail_the_open_and_keep_every_table() {
         }
         let vs = VersionSet::open(dir.path(), &sst_dir).unwrap();
         assert_layout(&vs.current());
+    }
+}
+
+/// The whole open through a manifest that cannot take the record of the
+/// move: the open fails, and the next one reads what the range tombstone of
+/// the moved table says, whether the failed write left half a batch (the
+/// tables are moved again) or a whole one (the move is found recorded).
+#[test]
+fn a_database_open_that_cannot_record_the_move_fails_and_the_next_one_reads_the_same() {
+    for (failure, moved_again) in [(Failure::Write, 3), (Failure::Sync, 0)] {
+        let (dir, _) = fixture_with_ingest_seq(40);
+        let env: Arc<dyn Env> = Arc::new(FailingEnv {
+            inner: crate::env::std_env(),
+            failure,
+        });
+        let error = crate::Db::open(dir.path(), options().env(env))
+            .expect_err("an open that cannot record the move fails");
+        assert!(error.to_string().contains("injected repair"), "{error}");
+
+        let db = crate::Db::open(dir.path(), options()).unwrap();
+        assert_eq!(
+            db.get_int_property("regolith.manifest.tables_demoted"),
+            Some(moved_again),
+            "{failure:?}"
+        );
+        // The moved table's tombstone, at sequence 40, over `k` at 30.
+        assert_eq!(db.get(b"k").unwrap(), None, "{failure:?}");
+        assert_eq!(
+            db.get(b"e").unwrap().as_deref(),
+            Some(b"l0".as_slice()),
+            "{failure:?}"
+        );
+        assert_eq!(
+            db.get(b"z").unwrap().as_deref(),
+            Some(b"ingested".as_slice()),
+            "{failure:?}"
+        );
     }
 }

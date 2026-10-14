@@ -21,7 +21,7 @@ use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-use regolith::{IsolationLevel, OptimisticTransactionDb, Options};
+use regolith::{IsolationLevel, OptimisticTransactionDb, Options, TxnOptions};
 use tempfile::TempDir;
 
 static ARMED: AtomicBool = AtomicBool::new(false);
@@ -80,7 +80,7 @@ const VALUE_LEN: usize = 1024;
 fn commit_alloc_bytes() -> (usize, usize) {
     let dir = TempDir::new().expect("tempdir");
     let db = Arc::new(OptimisticTransactionDb::open(dir.path(), Options::default()).expect("open"));
-    let txn = db.begin_transaction_owned(IsolationLevel::Serializable);
+    let txn = db.begin(&TxnOptions::new().isolation(IsolationLevel::Serializable));
 
     let value = vec![0xA5u8; VALUE_LEN];
     for i in 0..ENTRIES {

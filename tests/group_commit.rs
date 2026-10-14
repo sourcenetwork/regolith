@@ -1,17 +1,21 @@
-//! Group-commit behaviour through the public API.
+//! Commits that share a sync of the log, through the public API.
 //!
 //! The three properties these tests defend, in priority order:
 //!
-//! 1. A snapshot never observes a torn batch. The read horizon moves only
-//!    after a whole group is durable and applied.
-//! 2. Every writer that returns `Ok` really did commit, and every writer in
-//!    a group that failed learns it did not.
-//! 3. N concurrent durable writers cost far fewer than N fsyncs, which is
-//!    the whole point of the change and is the one thing here that is
-//!    deterministic enough to assert on.
+//! 1. A snapshot never observes a torn batch. The read horizon passes a
+//!    commit only once the whole of it is durable and applied.
+//! 2. Every writer that returns `Ok` really did commit, and every writer
+//!    whose commit a failed sync discarded learns it did not.
+//! 3. N concurrent durable writers cost far fewer than N fsyncs: one sync
+//!    covers every record written when it starts. Threads started together
+//!    overlap only by luck, so that test holds the sync round until every
+//!    writer's write is decided and waits behind it, which needs the
+//!    engine's internals: it lives beside them, in
+//!    `src/engine/commit/overlap_tests.rs`, and still writes through `Db`.
+#![cfg(not(target_arch = "wasm32"))]
 
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Barrier};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -19,84 +23,9 @@ use regolith::{Db, DurabilityMode, Options, Statistics, Ticker, WriteBatch, Writ
 use tempfile::TempDir;
 
 fn durable_opts(stats: Option<Arc<Statistics>>) -> Options {
-    Options {
-        durability: DurabilityMode::Immediate,
-        statistics: stats,
-        ..Options::default()
-    }
-}
-
-#[test]
-fn concurrent_durable_writers_cost_far_fewer_fsyncs_than_writes() {
-    // The deterministic proof that group commit works. Throughput on this
-    // host is not characterisable, but a counter is.
-    const WRITERS: usize = 8;
-    const PER_WRITER: usize = 250;
-    // Group commit amortises an fsync across writers that are inside the
-    // commit path at the same time. A barrier gets them to start
-    // together but cannot keep them overlapping, so on a loaded host
-    // every write can legitimately form its own group and the ratio does
-    // not appear. That is a scheduling outcome, not a defect, and one
-    // attempt at it is a coin flip: this test failed under full-suite
-    // load while passing on its own.
-    //
-    // So the workload runs until amortisation is observed. If group
-    // commit works, a round where eight threads hammer produces a
-    // multi-writer group almost immediately; if none of the attempts
-    // ever does, the mechanism is broken and that is worth failing on.
-    const ATTEMPTS: usize = 5;
-
-    let mut observed = None;
-    for attempt in 1..=ATTEMPTS {
-        let dir = TempDir::new().unwrap();
-        let stats = Arc::new(Statistics::new());
-        let db = Arc::new(Db::open(dir.path(), durable_opts(Some(Arc::clone(&stats)))).unwrap());
-
-        let gate = Arc::new(Barrier::new(WRITERS));
-        let mut handles = Vec::with_capacity(WRITERS);
-        for w in 0..WRITERS {
-            let (db, gate) = (Arc::clone(&db), Arc::clone(&gate));
-            handles.push(thread::spawn(move || {
-                gate.wait();
-                for i in 0..PER_WRITER {
-                    db.put(format!("w{w}k{i:05}").as_bytes(), b"value").unwrap();
-                }
-            }));
-        }
-        for handle in handles {
-            handle.join().unwrap();
-        }
-
-        let writes = (WRITERS * PER_WRITER) as u64;
-        let syncs = stats.get_ticker(Ticker::WalSyncCount);
-        assert!(syncs >= 1, "durable writes must reach stable storage");
-
-        // Every write that returned Ok must be readable, on every
-        // attempt, whether or not this one amortised.
-        for w in 0..WRITERS {
-            for i in 0..PER_WRITER {
-                let key = format!("w{w}k{i:05}");
-                assert_eq!(
-                    db.get(key.as_bytes()).unwrap(),
-                    Some(b"value".to_vec()),
-                    "every write that returned Ok must be readable"
-                );
-            }
-        }
-
-        if syncs < writes {
-            observed = Some((attempt, syncs, writes));
-            break;
-        }
-    }
-
-    let (attempt, syncs, writes) = observed.unwrap_or_else(|| {
-        panic!(
-            "group commit never amortised an fsync across {WRITERS} concurrent writers in \
-             {ATTEMPTS} attempts of {PER_WRITER} writes each: every write formed its own group"
-        )
-    });
-    println!("group commit: {syncs} syncs for {writes} durable writes, on attempt {attempt}");
+    Options::default()
+        .durability(DurabilityMode::Immediate)
+        .statistics(stats)
 }
 
 #[test]
@@ -108,15 +37,15 @@ fn a_serial_durable_writer_still_syncs_once_per_write() {
     let db = Db::open(dir.path(), durable_opts(Some(Arc::clone(&stats)))).unwrap();
 
     for i in 0..16 {
-        db.put(format!("k{i:03}").as_bytes(), b"v").unwrap();
+        regolith::through_stalls(|| db.put(format!("k{i:03}").as_bytes(), b"v")).unwrap();
     }
     assert_eq!(stats.get_ticker(Ticker::WalSyncCount), 16);
 }
 
 #[test]
 fn a_snapshot_never_observes_a_torn_batch() {
-    // The invariant the engine already guaranteed and group commit must
-    // not break: a batch is all-or-nothing to every reader.
+    // A batch is all-or-nothing to every reader, however many commits
+    // share its sync.
     const BATCH: usize = 32;
     const ROUNDS: usize = 400;
 
@@ -169,7 +98,7 @@ fn a_snapshot_never_observes_a_torn_batch() {
                 for i in 0..BATCH {
                     batch.put(format!("b{round:04}_{i:02}").as_bytes(), b"v");
                 }
-                db.write(batch).unwrap();
+                regolith::through_stalls(|| db.write(batch.clone())).unwrap();
             }
         }));
     }
@@ -206,7 +135,7 @@ fn every_writer_reads_its_own_write_immediately() {
         handles.push(thread::spawn(move || {
             for i in 0..PER_WRITER {
                 let key = format!("ryw{w}_{i:05}");
-                db.put(key.as_bytes(), b"mine").unwrap();
+                regolith::through_stalls(|| db.put(key.as_bytes(), b"mine")).unwrap();
                 let snap = db.snapshot();
                 assert_eq!(
                     snap.get(key.as_bytes()).unwrap(),
@@ -234,8 +163,10 @@ fn every_committed_write_survives_a_reopen() {
             let db = Arc::clone(&db);
             handles.push(thread::spawn(move || {
                 for i in 0..PER_WRITER {
-                    db.put(format!("d{w}_{i:04}").as_bytes(), b"durable")
-                        .unwrap();
+                    regolith::through_stalls(|| {
+                        db.put(format!("d{w}_{i:04}").as_bytes(), b"durable")
+                    })
+                    .unwrap();
                 }
             }));
         }
@@ -260,7 +191,7 @@ fn every_committed_write_survives_a_reopen() {
 #[test]
 fn every_synced_write_replays_from_the_wal_without_a_close() {
     // No `close()` and a write buffer large enough that nothing flushes,
-    // so recovery has to come out of the grouped WAL records alone.
+    // so recovery has to come out of the WAL records alone.
     const WRITERS: usize = 4;
     const PER_WRITER: usize = 200;
 
@@ -269,10 +200,7 @@ fn every_synced_write_replays_from_the_wal_without_a_close() {
         let db = Arc::new(
             Db::open(
                 dir.path(),
-                Options {
-                    write_buffer_size: 64 * 1024 * 1024,
-                    ..durable_opts(None)
-                },
+                durable_opts(None).write_buffer_size(64 * 1024 * 1024),
             )
             .unwrap(),
         );
@@ -281,7 +209,8 @@ fn every_synced_write_replays_from_the_wal_without_a_close() {
             let db = Arc::clone(&db);
             handles.push(thread::spawn(move || {
                 for i in 0..PER_WRITER {
-                    db.put(format!("wal{w}_{i:04}").as_bytes(), b"v").unwrap();
+                    regolith::through_stalls(|| db.put(format!("wal{w}_{i:04}").as_bytes(), b"v"))
+                        .unwrap();
                 }
             }));
         }
@@ -326,8 +255,10 @@ fn mixed_durability_writers_all_commit() {
         let db = Arc::clone(&db);
         handles.push(thread::spawn(move || {
             for i in 0..PER_LANE {
-                db.put_opt(&opts, format!("m{lane}_{i:04}").as_bytes(), b"v")
-                    .unwrap();
+                regolith::through_stalls(|| {
+                    db.put_opt(&opts, format!("m{lane}_{i:04}").as_bytes(), b"v")
+                })
+                .unwrap();
             }
         }));
     }
@@ -347,19 +278,12 @@ fn mixed_durability_writers_all_commit() {
 
 #[test]
 fn administrative_operations_still_exclude_writers() {
-    // `compact_range` and `close` take the same pipeline mutex the commit
-    // leader does, so they cannot interleave with a group.
+    // `compact_range` and `close` run their steps as ordered units of the
+    // commit ring, in ring order with the writes, so they cannot interleave
+    // with a commit.
     let dir = TempDir::new().unwrap();
-    let db = Arc::new(
-        Db::open(
-            dir.path(),
-            Options {
-                write_buffer_size: 8 * 1024,
-                ..Options::default()
-            },
-        )
-        .unwrap(),
-    );
+    let db =
+        Arc::new(Db::open(dir.path(), Options::default().write_buffer_size(8 * 1024)).unwrap());
 
     let stop = Arc::new(AtomicBool::new(false));
     let mut writers = Vec::new();
@@ -369,8 +293,10 @@ fn administrative_operations_still_exclude_writers() {
         writers.push(thread::spawn(move || {
             let mut i = 0usize;
             while !stop.load(Ordering::Acquire) {
-                db.put(format!("a{w}_{i:05}").as_bytes(), &[b'x'; 128])
-                    .unwrap();
+                regolith::through_stalls(|| {
+                    db.put(format!("a{w}_{i:05}").as_bytes(), &[b'x'; 128])
+                })
+                .unwrap();
                 i += 1;
             }
             i
@@ -379,7 +305,7 @@ fn administrative_operations_still_exclude_writers() {
 
     let deadline = Instant::now() + Duration::from_millis(500);
     while Instant::now() < deadline {
-        db.compact_range(None, None).unwrap();
+        db.compact_range(None, None).wait().unwrap();
     }
     stop.store(true, Ordering::Release);
 
@@ -406,12 +332,12 @@ fn a_batch_of_many_operations_gets_one_sync() {
     for i in 0..256 {
         batch.put(format!("batch{i:04}").as_bytes(), b"v");
     }
-    db.write(batch).unwrap();
+    regolith::through_stalls(|| db.write(batch.clone())).unwrap();
 
     assert_eq!(
         stats.get_ticker(Ticker::WalSyncCount),
         1,
-        "a 256-operation batch is one group and therefore one fdatasync"
+        "a 256-operation batch is one commit and therefore one fdatasync"
     );
     for i in 0..256 {
         assert_eq!(

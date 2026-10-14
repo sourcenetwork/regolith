@@ -33,20 +33,18 @@ fn values_larger_than_one_shard_stay_inside_the_budget() {
         let dir = TempDir::new().unwrap();
         let db = Db::open(
             dir.path(),
-            Options {
-                block_cache_size: BUDGET,
-                block_cache_num_shard_bits: shard_bits,
-                write_buffer_size: 8 * 1024 * 1024,
-                ..Options::default()
-            },
+            Options::default()
+                .block_cache_size(BUDGET)
+                .block_cache_num_shard_bits(shard_bits)
+                .write_buffer_size(8 * 1024 * 1024),
         )
         .unwrap();
 
         let value = vec![7u8; VALUE_LEN];
         for i in 0..KEYS {
-            db.put(format!("k{i:05}").as_bytes(), &value).unwrap();
+            regolith::through_stalls(|| db.put(format!("k{i:05}").as_bytes(), &value)).unwrap();
         }
-        db.compact_range(None, None).unwrap();
+        db.compact_range(None, None).wait().unwrap();
         for i in 0..KEYS {
             assert!(db.get(format!("k{i:05}").as_bytes()).unwrap().is_some());
         }
@@ -64,18 +62,16 @@ fn a_budget_below_one_block_holds_nothing_it_cannot_afford() {
     let dir = TempDir::new().unwrap();
     let db = Db::open(
         dir.path(),
-        Options {
-            block_cache_size: 1024,
-            block_size: 16 * 1024,
-            write_buffer_size: 16 * 1024,
-            ..Options::default()
-        },
+        Options::default()
+            .block_cache_size(1024)
+            .block_size(16 * 1024)
+            .write_buffer_size(16 * 1024),
     )
     .unwrap();
     for i in 0..2000u32 {
-        db.put(format!("k{i:06}").as_bytes(), &[9u8; 128]).unwrap();
+        regolith::through_stalls(|| db.put(format!("k{i:06}").as_bytes(), &[9u8; 128])).unwrap();
     }
-    db.compact_range(None, None).unwrap();
+    db.compact_range(None, None).wait().unwrap();
     for i in 0..2000u32 {
         assert!(db.get(format!("k{i:06}").as_bytes()).unwrap().is_some());
     }
@@ -91,20 +87,18 @@ fn strict_capacity_limit_holds_the_budget() {
     let dir = TempDir::new().unwrap();
     let db = Db::open(
         dir.path(),
-        Options {
-            block_cache_size: 16 * 1024 * 1024,
-            block_cache_num_shard_bits: 8,
-            strict_capacity_limit: true,
-            write_buffer_size: 8 * 1024 * 1024,
-            ..Options::default()
-        },
+        Options::default()
+            .block_cache_size(16 * 1024 * 1024)
+            .block_cache_num_shard_bits(8)
+            .strict_capacity_limit(true)
+            .write_buffer_size(8 * 1024 * 1024),
     )
     .unwrap();
     let value = vec![3u8; 256 * 1024];
     for i in 0..200u32 {
-        db.put(format!("k{i:05}").as_bytes(), &value).unwrap();
+        regolith::through_stalls(|| db.put(format!("k{i:05}").as_bytes(), &value)).unwrap();
     }
-    db.compact_range(None, None).unwrap();
+    db.compact_range(None, None).wait().unwrap();
     for i in 0..200u32 {
         assert!(db.get(format!("k{i:05}").as_bytes()).unwrap().is_some());
     }
@@ -117,19 +111,19 @@ fn a_zero_budget_serves_a_real_read_workload() {
     let dir = TempDir::new().unwrap();
     let db = Db::open(
         dir.path(),
-        Options {
-            block_cache_size: 0,
-            write_buffer_size: 16 * 1024,
-            block_size: 1024,
-            ..Options::default()
-        },
+        Options::default()
+            .block_cache_size(0)
+            .write_buffer_size(16 * 1024)
+            .block_size(1024),
     )
     .unwrap();
     for i in 0..5000u32 {
-        db.put(format!("k{i:06}").as_bytes(), format!("v{i:06}").as_bytes())
-            .unwrap();
+        regolith::through_stalls(|| {
+            db.put(format!("k{i:06}").as_bytes(), format!("v{i:06}").as_bytes())
+        })
+        .unwrap();
     }
-    db.compact_range(None, None).unwrap();
+    db.compact_range(None, None).wait().unwrap();
 
     for i in 0..5000u32 {
         assert_eq!(
@@ -165,18 +159,16 @@ fn the_configured_block_size_does_not_shrink_the_cache() {
     {
         let db = Db::open(
             dir.path(),
-            Options {
-                block_size: 1024,
-                write_buffer_size: 64 * 1024,
-                ..Options::default()
-            },
+            Options::default()
+                .block_size(1024)
+                .write_buffer_size(64 * 1024),
         )
         .unwrap();
         for i in 0..KEYS {
-            db.put(format!("k{i:06}").as_bytes(), &[i as u8; 64])
+            regolith::through_stalls(|| db.put(format!("k{i:06}").as_bytes(), &[i as u8; 64]))
                 .unwrap();
         }
-        db.compact_range(None, None).unwrap();
+        db.compact_range(None, None).wait().unwrap();
         db.close().unwrap();
     }
 
@@ -186,12 +178,10 @@ fn the_configured_block_size_does_not_shrink_the_cache() {
         let stats = Arc::new(Statistics::new());
         let db = Db::open(
             dir.path(),
-            Options {
-                block_size,
-                block_cache_size: 64 * 1024 * 1024,
-                statistics: Some(Arc::clone(&stats)),
-                ..Options::default()
-            },
+            Options::default()
+                .block_size(block_size)
+                .block_cache_size(64 * 1024 * 1024)
+                .statistics(Some(Arc::clone(&stats))),
         )
         .unwrap();
         for _ in 0..2 {

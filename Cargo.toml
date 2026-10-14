@@ -27,6 +27,10 @@ categories = ["database-implementations"]
 
 [features]
 fuzzing = []
+# `regolith::testing`: property checks a caller runs in its own test suite
+# against its own trait implementations. Not built for wasm, which has no
+# `proptest`.
+testing = ["dep:proptest"]
 # Atomics for a target with no hardware compare-and-swap, such as
 # `thumbv6m-none-eabi`. `portable-atomic` then implements the missing
 # operations inside a critical section. The *binary* must also depend
@@ -43,7 +47,6 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }
 [dependencies]
 kovan = "0.1.22"
 kovan-map = "0.1.22"
-kovan-mvcc = "0.1.22"
 kovan-queue = "0.1.22"
 kovan-channel = "0.1.22"
 
@@ -61,8 +64,25 @@ xxhash-rust = { version = "0.8", features = ["xxh3"] }
 tracing = "0.1"
 thiserror = "1.0"
 
-[target.'cfg(unix)'.dependencies]
+# Encryption at rest (`Options::key_provider`). AES-256-GCM-SIV from
+# RustCrypto: pure Rust, with AES-NI/CLMUL (x86) and the ARMv8 crypto
+# extensions detected at run time, and constant-time software AES
+# elsewhere (wasm32, armv7). `zeroize` wipes a cached key schedule when
+# it drops; `getrandom` draws each frame's nonce from the OS.
+aes-gcm-siv = { version = "0.12", default-features = false, features = ["aes", "zeroize"] }
+zeroize = "1"
+getrandom = "0.4"
+
+[target.'cfg(any(unix, target_os = "wasi"))'.dependencies]
 rustix = { version = "1.1", features = ["fs"] }
+
+# `sync_file_range`, which rustix does not wrap: the log's early writeback
+# (`LogFile::start_writeback`). Already in the tree through getrandom.
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+proptest = { version = "1", optional = true }
 
 [target.'cfg(loom)'.dependencies]
 loom = "0.7"
@@ -77,6 +97,9 @@ loom = "0.7"
 js-sys = "0.3"
 wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4"
+# The browser has no OS randomness call; `wasm_js` reaches
+# `crypto.getRandomValues` instead.
+getrandom = { version = "0.4", features = ["wasm_js"] }
 
 [dev-dependencies]
 tempfile = "3.8"
@@ -100,6 +123,11 @@ wasm-bindgen-test = "0.3"
 [target.'cfg(not(target_family = "wasm"))'.dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
 proptest = "1"
+
+# `tests/sync_no_syscall.rs` installs a seccomp filter around the
+# `regolith::sync` hot loops; seccomp is Linux-only.
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+libc = "0.2"
 
 # The test suite is compute-bound: compaction merges, checksums, bloom
 # hashing and skip-list walks, driven millions of times by the
@@ -164,7 +192,19 @@ name = "transaction"
 harness = false
 
 [[bench]]
+name = "append"
+harness = false
+
+[[bench]]
+name = "txn_callbacks"
+harness = false
+
+[[bench]]
 name = "scan_commit"
+harness = false
+
+[[bench]]
+name = "read_rules"
 harness = false
 
 [[bench]]
@@ -173,6 +213,14 @@ harness = false
 
 [[bench]]
 name = "memory"
+harness = false
+
+[[bench]]
+name = "wal_replay"
+harness = false
+
+[[bench]]
+name = "open_recovery"
 harness = false
 
 [[bench]]
@@ -185,4 +233,44 @@ harness = false
 
 [[bench]]
 name = "collect"
+harness = false
+
+[[bench]]
+name = "sync"
+harness = false
+
+[[bench]]
+name = "group_commit"
+harness = false
+
+[[bench]]
+name = "commit_nowait"
+harness = false
+
+[[bench]]
+name = "ingest"
+harness = false
+
+[[bench]]
+name = "cf_drop"
+harness = false
+
+[[bench]]
+name = "io_queue"
+harness = false
+
+[[bench]]
+name = "encryption"
+harness = false
+
+[[bench]]
+name = "per_core"
+harness = false
+
+[[bench]]
+name = "per_core_reads"
+harness = false
+
+[[bench]]
+name = "tables"
 harness = false

@@ -70,10 +70,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("  probe          {}", Probe::describe());
     println!("  profile        {profile}");
     println!("  writes         {puts} x {VALUE_SIZE} B values, 16 B keys");
-    println!("  write_buffer   {} KiB", opts.write_buffer_size / 1024);
-    println!("  block_cache    {} KiB", opts.block_cache_size / 1024);
-    println!("  target_file    {} KiB", opts.target_file_size / 1024);
-    println!("  bg_compactions {}", opts.max_background_compactions);
+    println!(
+        "  write_buffer   {} KiB",
+        opts.get_write_buffer_size() / 1024
+    );
+    println!(
+        "  block_cache    {} KiB",
+        opts.get_block_cache_size() / 1024
+    );
+    println!(
+        "  target_file    {} KiB",
+        opts.get_target_file_size() / 1024
+    );
+    println!("  bg_compactions {}", opts.get_max_background_compactions());
     println!();
 
     let mut report = Report::new();
@@ -111,7 +120,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let scanned = db.scan_page(Some(&key(0)), None, 512)?.entries.len();
     report.record("after a 512-row page scan");
 
-    db.compact_range(None, None)?;
+    db.compact_range(None, None).wait()?;
     report.record("after compact_range");
 
     db.close()?;

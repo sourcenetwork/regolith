@@ -63,32 +63,32 @@
 //!   chunk that really entered a ring, and decremented only by the size
 //!   of one that really left, so it can neither underflow nor
 //!   over-report the bound.
-//! - **A8 (single allocator).** At most one thread is inside
-//!   [`Arena::alloc`] at a time, and no other code reads `state` while
-//!   the arena is live. The only production caller is
-//!   `ArenaSkipList::insert`, which already holds the skip list's
-//!   single-writer guard (S2), and the engine runs that on the commit
-//!   leader only. `alloc` carries its own debug guard so the contract is
-//!   checked at the arena, not inferred from its caller; under loom the
-//!   cell is instrumented and any unordered access fails the model.
-//!   Readers never depend on `state`: a reader learns a node's address
-//!   only through a tower link loaded with `Acquire` (S1), and the chunk
-//!   acquisition, the cursor bump and every node byte write are
-//!   sequenced before the writer's `Release` store of that link, so they
-//!   happen-before the reader's use with no further fence. `Arena::drop`
-//!   runs with `&mut self` after the last `Arc<Arena>` is gone; `Arc`'s
-//!   Release decrement and Acquire fence order the writer's last cursor
-//!   write before the drain, the same argument that already justifies
-//!   `get_mut` there.
+//! - **A8 (many allocators, no lock).** Any number of threads may be
+//!   inside [`Arena::alloc`] at once: the commit pipeline lets whichever
+//!   thread reaches a decided commit apply it, so two threads can insert
+//!   into one memtable together (`engine::commit`). Nothing is serialized:
+//!   - A chunk's bump cursor is an atomic, advanced by compare-and-swap. A
+//!     thread owns exactly the bytes between the cursor it read and the one
+//!     it installed, so two allocations never overlap, and a thread that
+//!     loses the swap computes again from the cursor that won.
+//!   - The chunk list is a singly linked stack. A thread that finds the
+//!     newest chunk too small builds the next one, with its own allocation
+//!     already carved out of it, and installs it by compare-and-swap on the
+//!     head. A thread that loses that swap hands its chunk back to the pool
+//!     and allocates from the chunk that won. A chunk is never unlinked and
+//!     never freed before `Arena::drop`, so a head pointer read once stays
+//!     valid for the arena's life (A5).
+//!   - Readers never look at the chunk list: a reader learns a node's
+//!     address only through a tower link loaded with `Acquire` (S1), and
+//!     the allocation and every node byte write are sequenced before the
+//!     writer's publication of that link.
 //!
-//!   Ordering summary: `state` is plain, non-atomic memory, touched only
-//!   by the A8 thread and never read by a reader. `used` and `reserved`
-//!   stay `Relaxed` atomics; other threads read them for statistics, but
-//!   neither guards a memory access. Reader visibility of a freshly
-//!   grown chunk's bytes is unchanged: S1's `Acquire`/`Release` pair on
-//!   the tower link. Pool hand-off is unchanged: `ChunkPool::take`/`give`
-//!   go through the MPMC ring, and a chunk arriving from a dead arena was
-//!   released by that arena's `drop`.
+//!   Ordering summary: the head is published with `AcqRel` and read with
+//!   `Acquire`, so a thread that sees a chunk sees its fields; a cursor swap
+//!   is `AcqRel`. `used` and `reserved` stay `Relaxed` atomics; other
+//!   threads read them for statistics and for the next chunk's size, but
+//!   neither guards a memory access. `Arena::drop` runs with `&mut self`
+//!   after the last `Arc<Arena>` is gone.
 
 #![allow(unsafe_code)]
 
@@ -97,7 +97,7 @@ use std::ptr::NonNull;
 
 use kovan_queue::array_queue::ArrayQueue;
 
-use crate::sync::{Arc, AtomicUsize, Ordering, UnsafeCell};
+use crate::sync::internal::{Arc, AtomicPtr, AtomicUsize, Ordering};
 
 /// Alignment every chunk is allocated at. Covers every alignment the
 /// skip-list asks for, so a fresh chunk never needs leading padding.
@@ -376,37 +376,75 @@ impl ChunkPool {
     }
 }
 
-/// Chunks owned by one arena, plus the bump cursor into the newest one.
-///
-/// Only the writer touches this (A8); readers follow node pointers, which
-/// are absolute addresses and never go through the chunk list.
-struct ArenaState {
-    chunks: Vec<ChunkHandle>,
-    /// Bytes handed out of `chunks.last()`.
-    offset: usize,
+/// One chunk of an arena's chunk list: its memory, the chunk older than it,
+/// and the bump cursor into it.
+struct Chunk {
+    handle: ChunkHandle,
+    /// The chunk this one was installed over, or null for the first. Never
+    /// changes once the chunk is published.
+    older: *mut Chunk,
+    /// This chunk's number in the arena, from zero: what sizes the next one.
+    index: usize,
+    /// Bytes handed out of this chunk. Only ever grows, by compare-and-swap.
+    cursor: AtomicUsize,
+}
+
+impl Chunk {
+    /// Where an allocation of `size` bytes aligned to `align` would sit when
+    /// the cursor is `offset`: its first byte's offset and the cursor after
+    /// it, or `None` when it does not fit.
+    fn fit(&self, offset: usize, size: usize, align: usize) -> Option<(usize, usize)> {
+        let base = self.handle.ptr.as_ptr() as usize;
+        // A2: the fit is checked before any pointer is formed, because
+        // forming an out-of-range pointer is undefined even unread.
+        let start = base.checked_add(offset)?.next_multiple_of(align);
+        let end = start.checked_add(size)?;
+        (end <= base.checked_add(self.handle.size)?).then_some((start - base, end - base))
+    }
+
+    /// The pointer `start` bytes into this chunk.
+    fn at(&self, start: usize) -> Option<NonNull<u8>> {
+        // SAFETY (A2, A3): `start` came from `fit`, so it is within the
+        // chunk's allocation and aligned as asked.
+        NonNull::new(unsafe { self.handle.ptr.as_ptr().add(start) })
+    }
+
+    /// Carve `size` bytes out of this chunk, or `None` if they do not fit.
+    fn bump(&self, size: usize, align: usize) -> Option<NonNull<u8>> {
+        let mut offset = self.cursor.load(Ordering::Acquire);
+        loop {
+            let (start, end) = self.fit(offset, size, align)?;
+            // A8: the swap is what hands `[offset, end)` to this thread.
+            match self.cursor.compare_exchange_weak(
+                offset,
+                end,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return self.at(start),
+                Err(observed) => offset = observed,
+            }
+        }
+    }
 }
 
 /// Bump allocator over a list of pooled chunks.
 pub(crate) struct Arena {
-    /// Writer-private (A8): only the allocating thread reaches it,
-    /// through [`Arena::alloc`]; readers hold absolute node pointers and
-    /// never look here.
-    state: UnsafeCell<ArenaState>,
+    /// The newest chunk, or null before the first allocation. Each chunk
+    /// names the one before it (A8).
+    head: AtomicPtr<Chunk>,
     reserved: AtomicUsize,
     used: AtomicUsize,
     pool: Arc<ChunkPool>,
     budget: usize,
     base: usize,
     max_chunk_size: usize,
-    #[cfg(debug_assertions)]
-    allocating: crate::sync::AtomicBool,
 }
 
-// SAFETY (A8): at most one thread is ever inside `alloc`, which is the
-// only code that touches `state`, and every pointer `alloc` returns
-// addresses memory this arena owns until it is dropped, which cannot
-// happen while any `Arc<Arena>` (including one held by a live
-// `DbSlice`) survives. The atomics carry the byte counters.
+// SAFETY (A8): the chunk list and every cursor are atomics, every pointer
+// `alloc` returns addresses bytes one thread alone was handed, and those
+// bytes stay valid until the arena is dropped, which cannot happen while
+// any `Arc<Arena>` (including one held by a live `DbSlice`) survives.
 unsafe impl Send for Arena {}
 // SAFETY: see the `Send` impl above.
 unsafe impl Sync for Arena {}
@@ -423,22 +461,18 @@ impl Arena {
         };
         let base = base_class(profile, budget);
         Self {
-            state: UnsafeCell::new(ArenaState {
-                chunks: Vec::new(),
-                offset: 0,
-            }),
+            head: AtomicPtr::new(std::ptr::null_mut()),
             reserved: AtomicUsize::new(0),
             used: AtomicUsize::new(0),
             pool,
             budget,
             base,
             max_chunk_size: profile.max_chunk_size.max(base),
-            #[cfg(debug_assertions)]
-            allocating: crate::sync::AtomicBool::new(false),
         }
     }
 
-    /// Bump-allocate `size` bytes aligned to `align`.
+    /// Bump-allocate `size` bytes aligned to `align`. Any number of threads
+    /// may call this at once (A8); none waits for another.
     ///
     /// Returns `None` only when the global allocator refused a new
     /// chunk. The arena does not refuse at its budget: it records the
@@ -450,59 +484,60 @@ impl Arena {
         if size == 0 {
             return None;
         }
-        #[cfg(debug_assertions)]
-        let _writer = crate::sync::SingleWriterGuard::enter(
-            &self.allocating,
-            "Arena::alloc is single-writer (A8); the memtable's one writer is its only allocator",
-        );
+        loop {
+            let head = self.head.load(Ordering::Acquire);
+            // SAFETY (A5, A8): a published chunk is never freed before the
+            // arena is dropped.
+            let newest = unsafe { head.as_ref() };
+            if let Some(ptr) = newest.and_then(|chunk| chunk.bump(size, align)) {
+                self.used.fetch_add(size, Ordering::Relaxed);
+                return Some(ptr);
+            }
 
-        // SAFETY (A8): this thread is the only one touching `state` for
-        // the duration of the closure, and the pointer addresses the
-        // cell's own contents.
-        let (bumped, chunk_index) = self.state.with_mut(|state| {
-            let state = unsafe { &mut *state };
-            (Self::bump(state, size, align), state.chunks.len())
-        });
-        if let Some(ptr) = bumped {
-            self.used.fetch_add(size, Ordering::Relaxed);
-            return Some(ptr);
+            // The newest chunk is too small: build the next one with this
+            // allocation already carved out, so no other thread can take the
+            // room a dedicated chunk was sized for.
+            let index = newest.map_or(0, |chunk| chunk.index + 1);
+            let chunk_size = self.next_chunk_size(index, size);
+            let handle = match self.pool.take(chunk_size) {
+                Some(chunk) => chunk,
+                None => ChunkHandle::alloc(chunk_size)?,
+            };
+            let reserved = handle.size;
+            let fresh = Chunk {
+                handle,
+                older: head,
+                index,
+                cursor: AtomicUsize::new(0),
+            };
+            let Some((start, end)) = fresh.fit(0, size, align) else {
+                // `next_chunk_size` never returns less than `size`.
+                self.pool.give(fresh.handle);
+                return None;
+            };
+            fresh.cursor.store(end, Ordering::Relaxed);
+            let ptr = fresh.at(start);
+            let fresh = Box::into_raw(Box::new(fresh));
+            match self
+                .head
+                .compare_exchange(head, fresh, Ordering::AcqRel, Ordering::Acquire)
+            {
+                Ok(_) => {
+                    self.reserved.fetch_add(reserved, Ordering::Relaxed);
+                    self.used.fetch_add(size, Ordering::Relaxed);
+                    return ptr;
+                }
+                Err(_) => {
+                    // Another thread installed a chunk first. This one was
+                    // never published, so it is still this thread's alone:
+                    // back to the pool, and allocate from the one that won.
+                    // SAFETY: `fresh` came from `Box::into_raw` just above
+                    // and no other thread has seen it.
+                    let lost = unsafe { Box::from_raw(fresh) };
+                    self.pool.give(lost.handle);
+                }
+            }
         }
-
-        let chunk_size = self.next_chunk_size(chunk_index, size);
-        let chunk = match self.pool.take(chunk_size) {
-            Some(chunk) => chunk,
-            None => ChunkHandle::alloc(chunk_size)?,
-        };
-        self.reserved.fetch_add(chunk.size, Ordering::Relaxed);
-        // SAFETY (A8): as above.
-        let ptr = self.state.with_mut(|state| {
-            let state = unsafe { &mut *state };
-            state.chunks.push(chunk);
-            state.offset = 0;
-            Self::bump(state, size, align)
-        })?;
-        self.used.fetch_add(size, Ordering::Relaxed);
-        Some(ptr)
-    }
-
-    /// Carve `size` bytes out of the newest chunk, or `None` if they do
-    /// not fit.
-    fn bump(state: &mut ArenaState, size: usize, align: usize) -> Option<NonNull<u8>> {
-        let chunk = state.chunks.last()?;
-        let base = chunk.ptr.as_ptr() as usize;
-        // A2: the fit is checked before any pointer is formed, because
-        // forming an out-of-range pointer is undefined even unread.
-        let start = base.checked_add(state.offset)?.next_multiple_of(align);
-        let end = start.checked_add(size)?;
-        if end > base.checked_add(chunk.size)? {
-            return None;
-        }
-        state.offset = end - base;
-        // SAFETY (A2, A3): `start - base` and `end - base` are both
-        // within `chunk.size`, so the result stays inside the chunk's
-        // allocation, and `start` was rounded up to `align`.
-        let ptr = unsafe { chunk.ptr.as_ptr().add(start - base) };
-        NonNull::new(ptr)
     }
 
     /// Size of chunk number `chunk_index`, given that the allocation
@@ -547,20 +582,24 @@ impl Arena {
         self.used.load(Ordering::Relaxed)
     }
 
-    /// How many chunks this arena holds.
-    #[cfg(test)]
-    pub(crate) fn chunk_count(&self) -> usize {
-        // SAFETY (A8): tests calling this are single-threaded with
-        // respect to the arena.
-        self.state.with(|s| unsafe { &*s }.chunks.len())
-    }
-
     /// The sizes of this arena's chunks, oldest first.
     #[cfg(test)]
     pub(crate) fn chunk_sizes(&self) -> Vec<usize> {
-        // SAFETY (A8): as above.
-        self.state
-            .with(|s| unsafe { &*s }.chunks.iter().map(|c| c.size).collect())
+        let mut sizes = Vec::new();
+        let mut cursor = self.head.load(Ordering::Acquire);
+        // SAFETY (A5): published chunks live until the arena is dropped.
+        while let Some(chunk) = unsafe { cursor.as_ref() } {
+            sizes.push(chunk.handle.size);
+            cursor = chunk.older;
+        }
+        sizes.reverse();
+        sizes
+    }
+
+    /// How many chunks this arena holds.
+    #[cfg(test)]
+    pub(crate) fn chunk_count(&self) -> usize {
+        self.chunk_sizes().len()
     }
 }
 
@@ -569,13 +608,15 @@ impl Drop for Arena {
     /// `Arc<Arena>` dies, which includes every outstanding
     /// [`crate::DbSlice`] taken from this memtable (A5).
     fn drop(&mut self) {
-        // SAFETY (A8): `&mut self` proves exclusivity here, and
-        // `self.pool` and `self.state` are disjoint field borrows.
-        self.state.with_mut(|state| {
-            for chunk in unsafe { &mut *state }.chunks.drain(..) {
-                self.pool.give(chunk);
-            }
-        });
+        let mut cursor = self.head.swap(std::ptr::null_mut(), Ordering::AcqRel);
+        while !cursor.is_null() {
+            // SAFETY (A8): `&mut self` proves no allocator is running, and
+            // every chunk in the list came from `Box::into_raw` in `alloc`
+            // and is unlinked exactly once, here.
+            let chunk = unsafe { Box::from_raw(cursor) };
+            cursor = chunk.older;
+            self.pool.give(chunk.handle);
+        }
     }
 }
 

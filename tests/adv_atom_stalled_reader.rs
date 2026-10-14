@@ -3,6 +3,7 @@
 //! data it captured, with the files it needs kept alive through the
 //! `Arc<Version>` -> `Arc<LiveSst>` pin chain that the read view now
 //! sits on top of.
+#![cfg(not(target_arch = "wasm32"))]
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -12,16 +13,7 @@ use regolith::{Db, Options};
 use tempfile::TempDir;
 
 fn open(dir: &TempDir) -> Arc<Db> {
-    Arc::new(
-        Db::open(
-            dir.path(),
-            Options {
-                write_buffer_size: 8 * 1024,
-                ..Options::default()
-            },
-        )
-        .expect("open"),
-    )
+    Arc::new(Db::open(dir.path(), Options::default().write_buffer_size(8 * 1024)).expect("open"))
 }
 
 const KEYS: usize = 512;
@@ -40,7 +32,7 @@ fn a_snapshot_read_after_many_publications_still_sees_its_own_instant() {
     let db = open(&dir);
 
     for i in 0..KEYS {
-        db.put(&key(i), format!("stamp{:04}", 0).as_bytes())
+        regolith::through_stalls(|| db.put(&key(i), format!("stamp{:04}", 0).as_bytes()))
             .expect("seed");
     }
     let snap = db.snapshot();
@@ -52,10 +44,10 @@ fn a_snapshot_read_after_many_publications_still_sees_its_own_instant() {
             let mut v = 1u32;
             while !stop.load(Ordering::Acquire) && v <= 60 {
                 for i in 0..KEYS {
-                    db.put(&key(i), format!("stamp{v:04}").as_bytes())
+                    regolith::through_stalls(|| db.put(&key(i), format!("stamp{v:04}").as_bytes()))
                         .expect("put");
                 }
-                db.compact_range(None, None).expect("compact");
+                db.compact_range(None, None).wait().expect("compact");
                 v += 1;
             }
         })
@@ -96,9 +88,9 @@ fn an_iterator_outlives_the_compaction_that_unlinks_its_files() {
     let dir = TempDir::new().expect("tempdir");
     let db = open(&dir);
     for i in 0..KEYS {
-        db.put(&key(i), b"v0").expect("seed");
+        regolith::through_stalls(|| db.put(&key(i), b"v0")).expect("seed");
     }
-    db.compact_range(None, None).expect("compact");
+    db.compact_range(None, None).wait().expect("compact");
 
     let mut iter = db.iter();
     iter.seek_to_first();
@@ -111,9 +103,9 @@ fn an_iterator_outlives_the_compaction_that_unlinks_its_files() {
 
     for v in 1..=20u32 {
         for i in 0..KEYS {
-            db.put(&key(i), format!("v{v}").as_bytes()).expect("put");
+            regolith::through_stalls(|| db.put(&key(i), format!("v{v}").as_bytes())).expect("put");
         }
-        db.compact_range(None, None).expect("compact");
+        db.compact_range(None, None).wait().expect("compact");
     }
 
     while iter.valid() {

@@ -11,16 +11,13 @@
 
 #![no_main]
 
-use regolith::{Db, Options, WriteBatch};
 use libfuzzer_sys::fuzz_target;
+use regolith::{Db, Options, WriteBatch};
 use tempfile::TempDir;
 
 fuzz_target!(|data: &[u8]| {
     let dir = TempDir::new().unwrap();
-    let opts = Options {
-        write_buffer_size: 4 * 1024,
-        ..Options::default()
-    };
+    let opts = Options::default().write_buffer_size(4 * 1024);
     let Ok(db) = Db::open(dir.path(), opts) else {
         return;
     };

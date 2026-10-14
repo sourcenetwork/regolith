@@ -4,24 +4,32 @@
 //! Regolith: ACID, performance oriented, embedded key-value database engine for edge systems.
 //!
 //! Regolith provides a fast, embedded key-value store with:
-//! - **Read committed, snapshot isolation, repeatable read, or serializable**
-//!   per transaction, via MVCC sequence numbers
-//! - **Lock-free transactions** whose reads and writes take `&self`, so
-//!   one transaction can be shared across threads without a lock
+//! - **Read committed, snapshot isolation, repeatable read, serializable, or
+//!   DefraLevel** per transaction, via MVCC sequence numbers
+//! - **Shareable transactions** whose reads and writes take `&self`, so one
+//!   transaction can be used from several threads. An optimistic transaction
+//!   takes no key locks; every commit passes through one write pipeline
 //! - **Crash recovery** via write-ahead logging (WAL)
 //! - **LZ4 compression** for data blocks
 //! - **Bloom filters** for fast negative lookups
-//! - **Level-based compaction** on a dedicated OS thread
-//! - **Lock-free reads** via an arena-backed skip list memtable
+//! - **Level-based compaction** on background worker threads, or inline on a
+//!   target that has none
+//! - **Reads that take no lock**: the published view of memtables and tables
+//!   is loaded wait-free, the arena-backed skip list memtable and its range
+//!   tombstones are walked without a lock, and the CLOCK block cache admits,
+//!   evicts and serves blocks by compare-and-swap, never evicting a block a
+//!   reader holds
 //! - **Zero-copy reads** via [`DbSlice`], which borrows the bytes the
 //!   database already holds
 //!
 //! # Quick Start
 //!
-//! ```no_run
+//! ```
 //! use regolith::{Db, Options};
 //!
-//! let db = Db::open("/tmp/my_db", Options::default()).unwrap();
+//! // In memory, so the example runs anywhere. With `Options::default()`
+//! // the database lives in the directory named here.
+//! let db = Db::open("my_db", Options::memory()).unwrap();
 //!
 //! // Write
 //! db.put(b"hello", b"world").unwrap();
@@ -53,32 +61,42 @@
 #![deny(unsafe_code)]
 #![warn(missing_docs)]
 
+mod allocate;
 mod backup;
 mod checkpoint;
 mod column_family;
+mod conflict;
+mod encryption;
 mod engine;
 pub mod env;
 mod error;
 mod event_listener;
+mod io_queue;
 mod iter;
-mod mvcc;
+mod log_layout;
 mod options;
+mod per_thread;
 mod perf_context;
 mod portability;
 mod rate_limiter;
 mod slice;
+mod snapshot_wait;
 mod sst_file_writer;
 mod statistics;
 mod stream_writer;
-mod sync;
+pub mod sync;
 mod tailing;
+#[cfg(all(feature = "testing", not(target_family = "wasm")))]
+pub mod testing;
 mod transaction;
 mod ttl;
 mod txn_buffer;
 
-pub use backup::{BackupEngine, BackupId, BackupInfo};
+pub use backup::{BackupEngine, BackupId, BackupInfo, Backups, UnreadableBackup};
 pub use checkpoint::Checkpoint;
 pub use column_family::{ColumnFamilyHandle, DEFAULT_CF_NAME};
+pub use conflict::{Access, Conflict, WriteKind};
+pub use encryption::{KeyId, KeyMaterial, KeyProvider};
 pub use engine::compaction::CompactionOutcome;
 #[cfg(target_os = "wasi")]
 pub use env::WasiEnv;
@@ -87,9 +105,16 @@ pub use error::Error;
 pub use event_listener::{
     BackgroundErrorReason, CompactionJobInfo, EventListener, ExternalFileIngestionInfo,
     FlushJobInfo, TableFileCreationInfo, TableFileCreationReason, TableFileDeletionInfo,
-    WalFullInfo,
+    WalTailDiscardedInfo,
+};
+#[cfg(not(target_arch = "wasm32"))]
+pub use io_queue::through_stalls;
+pub use io_queue::{
+    CommitTicket, IoBudget, IoProgress, IoQueue, IoUnit, IoWait, JobTicket, LockWait, QueueId,
+    ReadMode, StallWait, WouldBlock,
 };
 pub use iter::Iter;
+pub use log_layout::LogLayout;
 pub use options::{
     ArenaProfile, CompactionDecision, CompactionFilter, CompactionStyle, CompressionType,
     DEFAULT_MAX_BACKGROUND_COMPACTIONS, DEFAULT_MAX_KEY_SIZE, DEFAULT_MAX_VALUE_SIZE,
@@ -100,21 +125,33 @@ pub use options::{
 pub use perf_context::{PerfContext, PerfContextSnapshot, PerfLevel};
 pub use rate_limiter::{Priority, RateLimiter, TokenBucketRateLimiter};
 pub use slice::DbSlice;
+pub use snapshot_wait::SnapshotWait;
 pub use sst_file_writer::{IngestOptions, SstFileMeta, SstFileWriter};
 pub use statistics::{Histogram, HistogramSnapshot, Statistics, Ticker};
 pub use stream_writer::{StreamOptions, StreamingWriter};
 pub use tailing::TailingIter;
 pub use transaction::{
-    IsolationLevel, KeyClass, KeyClassifier, OptimisticTransactionDb, OwnedTransaction,
-    ScanDirection, Transaction, TransactionDb, TransactionError, TxResult, TxnScanStream,
+    AbortReason, CommitInfo, CommitReceipt, IsolationLevel, KeyClass, KeyClassifier,
+    OptimisticTransactionDb, Page, RetryPolicy, ScanCheck, ScanDirection, TransactError,
+    Transaction, TransactionDb, TransactionError, TransactionHooks, TxResult, TxnCursor,
+    TxnOptions, TxnScanStream, ready,
 };
 
 /// The transactional API and the traits a caller implements, in one import:
 /// `use regolith::prelude::*;`.
+///
+/// Every trait a caller implements is here ([`KeyClassifier`],
+/// [`MergeOperator`], [`LogLayout`], [`TransactionHooks`], [`EventListener`],
+/// [`KeyProvider`], [`CompactionFilter`], [`Env`]), with the types its
+/// required methods name. The file traits an [`Env`] hands out stay in
+/// [`crate::env`].
 pub mod prelude {
     pub use crate::{
-        Db, IsolationLevel, KeyClass, KeyClassifier, MergeOperator, OptimisticTransactionDb,
-        Options, OwnedTransaction, Transaction, TransactionError, TxResult,
+        AbortReason, CommitInfo, CommitReceipt, CommitTicket, CompactionDecision, CompactionFilter,
+        Conflict, Db, Env, EventListener, IoBudget, IoQueue, IsolationLevel, JobTicket, KeyClass,
+        KeyClassifier, KeyId, KeyMaterial, KeyProvider, LockWait, LogLayout, MergeOperator,
+        OptimisticTransactionDb, Options, QueueId, ReadMode, RetryPolicy, StallWait, TransactError,
+        Transaction, TransactionError, TransactionHooks, TxResult, TxnOptions, WouldBlock,
     };
 }
 pub use ttl::{DbWithTtl, TtlCompactionFilter, strip_timestamp};
@@ -132,7 +169,16 @@ pub mod loom_exports {
     //! check, and this module is the seam that lets the test target call
     //! them. It does not exist in an ordinary build.
 
-    pub use crate::engine::loom_model::{arena, handoff, skiplist, slice, version};
+    pub use crate::engine::commit::loom_model as pipeline;
+    pub use crate::engine::commit::loom_turn_wait as turn_wait;
+    pub use crate::engine::commit::loom_write_unit as write_unit;
+    pub use crate::engine::loom_model::{
+        arena, families, gate, handoff, io_queue, jobs, park, skiplist, slice, snapshots, step,
+        tombstones, version,
+    };
+    pub use crate::env::open_file_limit::loom_model as open_files;
+    pub use crate::sync::loom_model as sync;
+    pub use crate::transaction::lock_loom as locks;
 }
 
 #[cfg(feature = "fuzzing")]
@@ -166,6 +212,7 @@ pub mod fuzzing {
                 &crate::env::std_env(),
                 path,
                 crate::engine::wal_replay::WalPosition::Newest,
+                None,
             ) else {
                 return;
             };
@@ -183,6 +230,7 @@ pub mod fuzzing {
                 path,
                 0,
                 crate::engine::sstable::MetadataPolicy::Pinned,
+                None,
             );
         });
     }
@@ -232,11 +280,7 @@ use std::sync::Arc;
 use engine::RegolithEngine;
 
 fn invalid_cf_handle_error(cf: &ColumnFamilyHandle) -> Error {
-    Error::invalid_column_family(format!(
-        "column family handle '{}' with id {} is not live",
-        cf.name(),
-        cf.id()
-    ))
+    column_family::invalid_handle_error(cf)
 }
 
 fn invalid_input_error(message: impl Into<String>) -> Error {
@@ -244,7 +288,7 @@ fn invalid_input_error(message: impl Into<String>) -> Error {
 }
 
 fn invalid_cf_id_error(cf_id: u32) -> Error {
-    Error::invalid_column_family(format!("column family id {cf_id} is not live"))
+    column_family::dropped_family_error(cf_id)
 }
 
 fn invalid_cf_id_io_error(cf_id: u32) -> std::io::Error {
@@ -301,6 +345,17 @@ pub struct ScanPage {
     /// This key is the first matching key that was not returned in
     /// [`ScanPage::entries`].
     pub next_start: Option<Vec<u8>>,
+}
+
+/// Whether the column family a prefixed key names is live in `cfs`: the one
+/// check a write's keys and an ingested file's keys share.
+fn check_prefixed_cf(cfs: &CfRegistry, prefixed_key: &[u8]) -> std::io::Result<()> {
+    let cf_id = prefixed_cf_id(prefixed_key)?;
+    if cfs.contains_id(cf_id) {
+        Ok(())
+    } else {
+        Err(invalid_cf_id_io_error(cf_id))
+    }
 }
 
 fn prefixed_cf_id(prefixed_key: &[u8]) -> std::io::Result<u32> {
@@ -381,6 +436,16 @@ pub struct MemTableStats {
 pub type Result<T> = std::result::Result<T, Error>;
 
 /// A key-value database backed by an LSM-tree.
+///
+/// No write waits on a write stall. A write that a stop threshold stops
+/// (too many level-0 tables, too many memtables, or pending compaction
+/// bytes over the hard limit) applies nothing and returns
+/// [`Error::WouldBlock`] with a [`WouldBlock::Stall`] wait, completed on the
+/// writer's own [`IoQueue`] once background work clears the stall; run the
+/// write again then, or wrap it in [`through_stalls`] to wait on this
+/// thread. A slowdown threshold delays nothing. A transaction's commit is
+/// the exception, since it cannot be run again: it waits the stall out
+/// ([`Transaction::commit`], [`Transaction::commit_nowait`]).
 pub struct Db {
     engine: Arc<RegolithEngine>,
     durability: engine::DurabilityMode,
@@ -413,6 +478,47 @@ impl Db {
     /// Returns [`Error::Io`] with [`std::io::ErrorKind::Unsupported`]
     /// when the platform cannot start the background compaction
     /// thread, as a single-threaded target does.
+    ///
+    /// # Databases written by 0.1.x
+    ///
+    /// A database written by a 0.1.x release can hold a level below level 0
+    /// whose tables overlap in key range: that release placed an ingested
+    /// table carrying a range tombstone by the range of its keys and
+    /// recorded it with the wider range of the tombstone. Such a database
+    /// is valid and opens. The first open moves the tables of that level,
+    /// and of every level above it down to level 1, into level 0, oldest
+    /// level first, where tables may overlap. No table is rewritten and
+    /// nothing is lost: every read returns the newest version, and a key
+    /// that a range tombstone of a moved table covers and that is older
+    /// than it reads as deleted, as that tombstone says (0.1.x could still
+    /// return it from a level it read first). The open logs one warning,
+    /// counts the moved tables in [`Ticker::ManifestTablesDemoted`] and in
+    /// the `regolith.manifest.tables_demoted` property, and records the move
+    /// before it returns, so the next open has nothing to move. Compaction
+    /// then brings the tables back down as it does any level 0 table; until
+    /// it has, they count toward the level 0 write thresholds. A read-only
+    /// open makes the same move in its own view, every time, and writes
+    /// nothing.
+    ///
+    /// The same releases could leave an ingested table's range delete in the
+    /// bottom level below older keys it deletes, with no level overlapping. A
+    /// point read then found such a key before the range delete and returned
+    /// it, while a scan did not; a compaction of the bottom level would drop
+    /// the range delete and bring the key back for good. The first open of a
+    /// database that does not record this check copies every range delete
+    /// that has a newer level, a level 0 table read before it or the
+    /// recovered log holding keys in its range in front of every key, so the
+    /// key reads as deleted everywhere. A copy deletes only what its range
+    /// delete deletes, so the copies of range deletes that were in front
+    /// already change no read. The open logs one warning, counts the copies
+    /// in [`Ticker::ManifestRangeDeletesCopied`] and in the
+    /// `regolith.manifest.range_deletes_copied` property, and records the
+    /// check before it returns; a database this release creates records it
+    /// from the start and is never checked. The copies are one level 0
+    /// table after the first flush, which compaction carries down; where the
+    /// copied ranges are wide, that is a one-time rewrite of the data inside
+    /// them. A read-only open copies in its own view, every time, and writes
+    /// nothing.
     pub fn open<P: AsRef<Path>>(path: P, opts: Options) -> Result<Self> {
         opts.validate()?;
         let read_only = opts.read_only;
@@ -430,6 +536,9 @@ impl Db {
             RegolithEngine::open(path.as_ref(), engine_opts)?
         };
         let cfs = Arc::new(CfRegistry::new());
+        // Attached before the first write, so every write is fenced against
+        // the registry when it is decided, from the start.
+        engine.attach_families(Arc::clone(&cfs));
         let db = Self {
             engine,
             durability,
@@ -448,7 +557,9 @@ impl Db {
     /// The handle replays any existing WAL files into memory so reads
     /// see committed-but-unflushed writes, but it does not create,
     /// rewrite, compact, or delete files. Mutating APIs return
-    /// [`Error::ReadOnly`].
+    /// [`Error::ReadOnly`]. A database a 0.1.x release left with an
+    /// overlapping level, or with a range delete below older keys it
+    /// deletes, reads correctly here too, see [`Db::open`].
     pub fn open_read_only<P: AsRef<Path>>(path: P, mut opts: Options) -> Result<Self> {
         opts.read_only = true;
         Self::open(path, opts)
@@ -671,15 +782,8 @@ impl Db {
     pub fn put_opt(&self, opts: &WriteOptions, key: &[u8], value: &[u8]) -> Result<()> {
         self.ensure_writable()?;
         self.validate_write_kv_sizes(key, value)?;
-        self.wait_for_write_capacity(opts)?;
-        let stats = self.stats();
-        let _scope = statistics::TimeScope::new(stats, Histogram::DbWrite);
-        let bytes = (key.len() + value.len()) as u64;
-        if let Some(s) = stats {
-            s.add(Ticker::KeysWritten, 1);
-            s.add(Ticker::BytesWritten, bytes);
-            s.record(Histogram::BytesPerWrite, bytes);
-        }
+        self.admit_write(opts)?;
+        let _scope = statistics::TimeScope::new(self.stats(), Histogram::DbWrite);
         perf_context::record_write_call();
         let (dm, disable_wal) = self.resolve_write_opts(opts);
         self.engine
@@ -704,10 +808,7 @@ impl Db {
     pub fn delete_opt(&self, opts: &WriteOptions, key: &[u8]) -> Result<()> {
         self.ensure_writable()?;
         self.validate_key_size(key)?;
-        self.wait_for_write_capacity(opts)?;
-        if let Some(s) = self.stats() {
-            s.add(Ticker::KeysDeleted, 1);
-        }
+        self.admit_write(opts)?;
         let mut batch = BTreeMap::new();
         batch.insert(prefix_key(DEFAULT_CF_ID, key), None);
         let (dm, disable_wal) = self.resolve_write_opts(opts);
@@ -720,7 +821,8 @@ impl Db {
     /// Layer a merge operand on top of `key` in the default
     /// column family.
     ///
-    /// Requires an [`Options::merge_operator`] to be configured. The
+    /// Requires an [`Options::merge_operator`] to be configured, and returns
+    /// [`Error::NoMergeOperator`] without writing when none is. The
     /// operand is written cheaply (no read-modify-write); readers
     /// collapse the chain of merges plus any base value via the
     /// configured operator at visibility time.
@@ -731,11 +833,9 @@ impl Db {
     /// [`Db::merge`] with an explicit [`WriteOptions`] override.
     pub fn merge_opt(&self, opts: &WriteOptions, key: &[u8], operand: &[u8]) -> Result<()> {
         self.ensure_writable()?;
+        self.engine.require_merge_operator()?;
         self.validate_write_kv_sizes(key, operand)?;
-        self.wait_for_write_capacity(opts)?;
-        if let Some(s) = self.stats() {
-            s.add(Ticker::MergesWritten, 1);
-        }
+        self.admit_write(opts)?;
         let (dm, disable_wal) = self.resolve_write_opts(opts);
         self.engine
             .apply_grouped_batch(
@@ -776,10 +876,7 @@ impl Db {
         }
         self.validate_key_size(start)?;
         self.validate_key_size(end)?;
-        self.wait_for_write_capacity(opts)?;
-        if let Some(s) = self.stats() {
-            s.add(Ticker::RangeDeletesWritten, 1);
-        }
+        self.admit_write(opts)?;
         let (dm, disable_wal) = self.resolve_write_opts(opts);
         self.engine
             .apply_grouped_batch(
@@ -874,41 +971,9 @@ impl Db {
         let (dm, disable_wal) = self.resolve_write_opts(opts);
         self.validate_batch_cf_liveness(&batch)?;
         self.validate_batch_sizes(&batch, disable_wal)?;
-        self.wait_for_write_capacity(opts)?;
+        self.admit_write(opts)?;
         perf_context::record_write_call();
-        let stats = self.stats();
-        let _scope = statistics::TimeScope::new(stats, Histogram::DbWrite);
-        if let Some(s) = stats {
-            let mut bytes: u64 = 0;
-            let mut puts: u64 = 0;
-            let mut deletes: u64 = 0;
-            let mut range_deletes: u64 = 0;
-            let mut merges: u64 = 0;
-            for op in &batch.ops {
-                match op {
-                    WriteBatchOp::Put { key, value } => {
-                        puts += 1;
-                        bytes += (key.len() + value.len()) as u64;
-                    }
-                    WriteBatchOp::Delete { key } => {
-                        deletes += 1;
-                        bytes += key.len() as u64;
-                    }
-                    WriteBatchOp::DeleteRange { .. } => {
-                        range_deletes += 1;
-                    }
-                    WriteBatchOp::Merge { .. } => {
-                        merges += 1;
-                    }
-                }
-            }
-            s.add(Ticker::KeysWritten, puts);
-            s.add(Ticker::KeysDeleted, deletes);
-            s.add(Ticker::BytesWritten, bytes);
-            s.add(Ticker::RangeDeletesWritten, range_deletes);
-            s.add(Ticker::MergesWritten, merges);
-            s.record(Histogram::BytesPerWrite, bytes);
-        }
+        let _scope = statistics::TimeScope::new(self.stats(), Histogram::DbWrite);
         self.engine
             .submit_batch(batch.ops, dm, disable_wal)
             .map_err(Error::from)
@@ -945,13 +1010,12 @@ impl Db {
         (dm, opts.disable_wal)
     }
 
-    /// Run the write-stall pre-check. Block the caller until the
-    /// engine is ready to accept another write, or return
-    /// [`Error::Busy`] immediately if `opts.no_slowdown` is set and
-    /// any stall condition is currently active.
-    fn wait_for_write_capacity(&self, opts: &WriteOptions) -> Result<()> {
-        self.engine.wait_for_write_capacity(opts.no_slowdown)?;
-        Ok(())
+    /// Run the write-stall admission. Never waits: a write a stop stopped
+    /// returns [`Error::WouldBlock`] with a [`StallWait`] for the stall to
+    /// clear, and one that set `opts.no_slowdown` returns [`Error::Busy`]
+    /// under any stall.
+    fn admit_write(&self, opts: &WriteOptions) -> Result<()> {
+        self.engine.admit_write(opts.no_slowdown)
     }
 
     fn ensure_open(&self) -> Result<()> {
@@ -1033,6 +1097,7 @@ impl Db {
                     record.delete_range(start, end);
                 }
                 WriteBatchOp::Merge { key, operand } => {
+                    self.engine.require_merge_operator()?;
                     self.validate_prefixed_key_size(key)?;
                     self.validate_value_size(operand)?;
                     record.merge(key, operand);
@@ -1057,18 +1122,9 @@ impl Db {
         self.cfs.is_live_handle(cf)
     }
 
-    fn validate_prefixed_cf_io(&self, prefixed_key: &[u8]) -> std::io::Result<()> {
-        let cf_id = prefixed_cf_id(prefixed_key)?;
-        if self.cfs.contains_id(cf_id) {
-            Ok(())
-        } else {
-            Err(invalid_cf_id_io_error(cf_id))
-        }
-    }
-
     /// Check one prefixed key's column family, remembering the last id
-    /// found live so a run of ops in one column family takes the
-    /// registry lock once.
+    /// found live so a run of ops in one column family costs one registry
+    /// lookup.
     fn validate_prefixed_cf(&self, live: &mut Option<u32>, prefixed_key: &[u8]) -> Result<()> {
         let cf_id = prefixed_cf_id(prefixed_key).map_err(Error::from)?;
         if *live == Some(cf_id) {
@@ -1082,12 +1138,14 @@ impl Db {
     }
 
     fn validate_batch_cf_liveness(&self, batch: &WriteBatch) -> Result<()> {
-        // A batch is usually one column family, or a few long runs of one,
-        // and every distinct run still reaches the registry once. A drop
-        // that lands between two runs of the same id in one call is the
-        // same race the per-op form had: the lock was never held across the
-        // batch, so neither form promises more than "rejected or applied
-        // as a whole" for a drop that overlaps the write.
+        // The early check, at the API boundary: a batch naming a family
+        // already gone is refused before any work. A batch is usually one
+        // column family, or a few long runs of one, and every distinct run
+        // reaches the registry once. A drop that lands after this check is
+        // caught by the fence made when the batch's slot is decided
+        // (`engine::commit::families`), which refuses the batch whole, so a
+        // batch racing a drop is applied whole before the tombstone or
+        // refused whole, never split across it.
         let mut live = None;
         for op in &batch.ops {
             match op {
@@ -1112,13 +1170,39 @@ impl Db {
     /// [`CompactionFilter`] (see its note on snapshots). Dropping the
     /// returned `Snapshot` releases the pin and may allow subsequent
     /// compactions to reclaim more space.
+    ///
+    /// A snapshot held for long also defers the compaction of deleted
+    /// ranges: a table holding a deletion newer than the oldest live
+    /// snapshot is not compacted for its deletions until that snapshot is
+    /// dropped (see [`CompactionStyle`]), so scans over a range deleted
+    /// since then keep walking its deletions meanwhile.
     pub fn snapshot(&self) -> Snapshot {
-        let seq = self.engine.register_snapshot_at_horizon();
+        let (seq, pin) = self.engine.register_snapshot_at_horizon();
         Snapshot {
             engine: Arc::clone(&self.engine),
             cfs: Arc::clone(&self.cfs),
             seq,
+            mode: ReadMode::Blocking,
+            pin,
         }
+    }
+
+    /// A new I/O queue for the calling thread.
+    ///
+    /// Hand its [`IoQueue::id`] to the read handles this thread uses, in
+    /// [`ReadMode::CacheOnly`] through [`Snapshot::with_read_mode`] or
+    /// [`TxnOptions::read_mode`]: their reads then never touch the device,
+    /// and return [`Error::WouldBlock`] when they need a block the cache
+    /// does not hold. The thread polls the queue with [`IoQueue::poll`] when
+    /// it has nothing else to run, which reads those blocks, and runs the
+    /// reads again. regolith adds no thread for this: each thread does its
+    /// own I/O.
+    ///
+    /// One queue per thread; only the thread holding it polls it. A queue
+    /// costs nothing while it waits on nothing, and a database that never
+    /// opens one pays nothing for the mechanism.
+    pub fn io_queue(&self) -> IoQueue {
+        self.engine.io_queue()
     }
 
     /// Scan a key range lazily, holding one entry rather than the range.
@@ -1131,12 +1215,24 @@ impl Db {
     /// The scan is served from a snapshot pinned when it is created, so
     /// concurrent writes cannot shift the range underneath it.
     ///
-    /// ```no_run
+    /// Each item is a `Result`. A scan that fails part-way ends with one
+    /// `Err`, then `None`, so a failure is never read as the end of the
+    /// range.
+    ///
+    /// ```
     /// # use regolith::{Db, Options};
-    /// # let db = Db::open("/tmp/scan_stream_doc", Options::default()).unwrap();
-    /// for (key, value) in db.scan_stream(Some(b"user:"), Some(b"user;"))? {
-    ///     println!("{} is {} bytes", String::from_utf8_lossy(&key), value.len());
+    /// # let db = Db::open("users", Options::memory())?;
+    /// db.put(b"user:ada", b"1815")?;
+    /// db.put(b"user:bob", b"1970")?;
+    /// db.put(b"visit:1", b"ada")?;
+    ///
+    /// // `;` is the byte after `:`, so this is every key under `user:`.
+    /// let mut users = Vec::new();
+    /// for entry in db.scan_stream(Some(b"user:"), Some(b"user;"))? {
+    ///     let (key, value) = entry?;
+    ///     users.push((key, value.len()));
     /// }
+    /// assert_eq!(users, [(b"user:ada".to_vec(), 4), (b"user:bob".to_vec(), 4)]);
     /// # Ok::<(), regolith::Error>(())
     /// ```
     pub fn scan_stream(&self, start: Option<&[u8]>, end: Option<&[u8]>) -> Result<ScanStream> {
@@ -1222,53 +1318,88 @@ impl Db {
     }
 
     /// Delete all data in the database.
+    ///
+    /// A call that does its own I/O and waits on this thread: for the
+    /// compaction pass or job in flight, and for the commits in
+    /// flight, to end. Call it off a thread that must not block. On
+    /// `wasm32`, whose one thread cannot wait for itself, a call made from
+    /// inside a compaction or a checkpoint (a listener, a compaction filter)
+    /// fails with an I/O error of kind
+    /// [`WouldBlock`](std::io::ErrorKind::WouldBlock) instead.
     pub fn drop_all(&self) -> Result<()> {
         self.ensure_writable()?;
         self.engine.drop_all().map_err(Error::from)
     }
 
-    /// Synchronously compact every SSTable overlapping the default
-    /// column-family user-key range `[start, end)` down to the
-    /// bottommost non-empty level.
+    /// Compact every SSTable overlapping the default column-family
+    /// user-key range `[start, end)` down to the bottommost non-empty
+    /// level, as a job: the call returns a [`JobTicket`] at once and never
+    /// waits on the compaction gate.
     ///
     /// Passing `None` for either bound means "unbounded" on that side,
     /// so `compact_range(None, None)` compacts the entire default
     /// column family.
     ///
-    /// Active memtable contents that fall in the range are flushed to
-    /// L0 first. The call blocks until the requested compaction work
-    /// is finished and is serialized with the background compaction
-    /// scheduler so the two paths can't fight over the same inputs.
-    pub fn compact_range(&self, start: Option<&[u8]>, end: Option<&[u8]>) -> Result<()> {
-        self.ensure_writable()?;
-        if let Some(start) = start {
-            self.validate_key_size(start)?;
-        }
-        if let Some(end) = end {
-            self.validate_key_size(end)?;
-        }
-        let lower = match start {
-            Some(s) => prefix_key(DEFAULT_CF_ID, s),
-            None => cf_lower_bound(DEFAULT_CF_ID),
+    /// The job runs on the compaction worker, or, with no worker, on this
+    /// thread's [`IoQueue`] when it polls; a thread with neither runs it
+    /// before this returns. It flushes the active memtable contents that
+    /// fall in the range to L0 first, and is serialized with the background
+    /// compaction so the two can't fight over the same inputs. Neither
+    /// starves the other: a compaction pass waits out a bounded number of
+    /// jobs like this one, and a job a bounded number of passes
+    /// ([`sync::MAX_BYPASS`]). A poll never waits for a pass in flight
+    /// either: until the job may go on it stays pending on the queue, whose
+    /// owner is woken when it may. The ticket
+    /// completes on this thread's queue (or, with none, when the job
+    /// finished): await it, poll the queue, or [`JobTicket::wait`] for it
+    /// from a thread with no queue. An invalid bound fails the ticket at
+    /// once.
+    ///
+    /// On a database encrypted at rest ([`Options::key_provider`]) it also
+    /// re-seals the whole database, whatever the range: every table not
+    /// sealed under the provider's current key, the active write-ahead log,
+    /// and a manifest holding a batch under another key are rewritten under
+    /// it. This is the one-time re-encryption after encryption is turned on
+    /// and after a key rotation; once its ticket is ready, no file names
+    /// another key.
+    pub fn compact_range(&self, start: Option<&[u8]>, end: Option<&[u8]>) -> JobTicket {
+        let bounds = || -> Result<(Vec<u8>, Vec<u8>)> {
+            self.ensure_writable()?;
+            if let Some(start) = start {
+                self.validate_key_size(start)?;
+            }
+            if let Some(end) = end {
+                self.validate_key_size(end)?;
+            }
+            let lower = match start {
+                Some(s) => prefix_key(DEFAULT_CF_ID, s),
+                None => cf_lower_bound(DEFAULT_CF_ID),
+            };
+            let upper = match end {
+                Some(e) => prefix_key(DEFAULT_CF_ID, e),
+                None => cf_upper_bound(DEFAULT_CF_ID),
+            };
+            Ok((lower, upper))
         };
-        let upper = match end {
-            Some(e) => prefix_key(DEFAULT_CF_ID, e),
-            None => cf_upper_bound(DEFAULT_CF_ID),
-        };
-        self.engine
-            .compact_range(Some(&lower), Some(&upper))
-            .map_err(Error::from)
+        match bounds() {
+            Ok((lower, upper)) => self
+                .engine
+                .start_foreground(engine::Work::CompactRange { lower, upper }),
+            Err(err) => JobTicket::ready(Arc::downgrade(&self.engine), Err(err)),
+        }
     }
 
-    /// Rotate the active memtable and write it to a level-0 SSTable,
-    /// on this thread, before returning.
+    /// Rotate the active memtable and see it written to a level-0
+    /// SSTable before returning.
     ///
     /// A no-op when the active memtable holds no entries and no range
     /// tombstones. This is the same flush a full memtable triggers on
     /// the write path, made explicit so a caller can decide when to
-    /// pay for it. Memtable flushes are written by the calling thread
-    /// in every mode, so this behaves identically with and without
-    /// background compaction workers.
+    /// pay for it. This thread writes the table, unless a compaction
+    /// worker gets to the sealed memtable first: the worker then writes
+    /// it, paced by [`Options::rate_limiter`] like the rest of its work,
+    /// and this call returns once the table is in level 0. With no
+    /// worker it is always this thread.
     ///
     /// Flushing does not compact: the new file lands in L0 and stays
     /// there until a compaction job merges it. See [`Db::compact_step`]
@@ -1282,25 +1413,34 @@ impl Db {
     ///
     /// Returns `Ok(true)` when a job ran. Callers running with
     /// [`Options::max_background_compactions`] set to `0` use this to
-    /// keep the level structure healthy outside the write path; a
-    /// writer that would otherwise stall already performs the same job
-    /// itself, so this is an optimization of write latency rather than
-    /// a requirement for correctness.
+    /// keep the level structure healthy outside the write path. With
+    /// [`Options::inline_compaction`] on, a writer a stall stops performs
+    /// the same job itself; with it off, this (or [`Db::flush`]) is what
+    /// clears a stall, and the stopped writes' [`StallWait`]s complete when
+    /// it does.
     ///
     /// The returned [`CompactionOutcome`] separates the two reasons a
     /// pass can do nothing, because a caller has to act on them
     /// differently. [`CompactionOutcome::Idle`] means nothing was over
-    /// its compaction trigger and the tree is settled.
-    /// [`CompactionOutcome::Contended`] means work is pending but
-    /// another thread holds the input files, so the right response is to
-    /// wait for that thread rather than conclude the engine is done.
+    /// its compaction trigger, no deleted range was worth a pass (see
+    /// [`CompactionStyle`]), and the tree is settled.
+    /// [`CompactionOutcome::Contended`] means work may be pending but
+    /// another thread is in the way, so the right response is to try again
+    /// later rather than conclude the engine is done: another pass holds the
+    /// input files, or a [`Db::compact_range`], an ingest, a checkpoint, a
+    /// backup or a [`Db::drop_all`] holds the compaction gate alone or is
+    /// owed it. This call never waits for that thread.
     ///
     /// A drain therefore looks like this, and stops only on `Idle`:
     ///
-    /// ```no_run
+    /// ```
     /// # use regolith::{CompactionOutcome, Db, Options};
     /// # fn main() -> regolith::Result<()> {
-    /// # let db = Db::open("/tmp/db", Options::default())?;
+    /// # let db = Db::open("rows", Options::memory())?;
+    /// # for round in 0..8u8 {
+    /// #     db.put(b"row", &[round])?;
+    /// #     db.flush()?;
+    /// # }
     /// loop {
     ///     match db.compact_step()? {
     ///         CompactionOutcome::DidWork => continue,
@@ -1308,18 +1448,21 @@ impl Db {
     ///         CompactionOutcome::Idle => break,
     ///     }
     /// }
+    /// # assert_eq!(db.compact_step()?, CompactionOutcome::Idle);
+    /// # assert_eq!(db.get(b"row")?, Some(vec![7]));
     /// # Ok(())
     /// # }
     /// ```
     ///
-    /// Every compaction style regolith offers reduces the file count it
-    /// merges, so a loop driven by `DidWork` cannot be fed forever by
-    /// its own output.
+    /// A size-triggered compaction reduces the file count it merges, and
+    /// a compaction picked for its deletions moves them one level down or
+    /// discards them, so a loop driven by `DidWork` cannot be fed forever
+    /// by its own output.
     ///
     /// Safe to call with background workers running: the job is picked
-    /// under the same engine-wide compaction lock and the same
-    /// in-progress file set the workers use, so the two can never pick
-    /// overlapping inputs.
+    /// under the same engine-wide compaction gate and the same claims on
+    /// tables the workers use, so the two can never pick overlapping
+    /// inputs.
     pub fn compact_step(&self) -> Result<CompactionOutcome> {
         self.ensure_writable()?;
         self.engine.run_one_compaction_pass().map_err(Error::from)
@@ -1345,6 +1488,31 @@ impl Db {
         }
     }
 
+    /// The statistics this database was opened with
+    /// ([`Options::statistics`]), or `None` when it was opened with none.
+    ///
+    /// It is the object the caller configured, not a copy: every handle on
+    /// this database adds to it, a ticker read through it is the total they
+    /// all added, and [`Statistics::reset`] through it zeroes it for all of
+    /// them. Clone the `Arc` to keep it past the database handle. A database
+    /// opened without statistics never makes one, so this stays `None` for
+    /// its whole life. What a read sees while updates run is stated on
+    /// [`Statistics`].
+    ///
+    /// ```
+    /// # use std::sync::Arc;
+    /// # use regolith::{Db, Options, Statistics, Ticker};
+    /// let options = Options::memory().statistics(Some(Arc::new(Statistics::new())));
+    /// let db = Db::open("statistics-doc", options)?;
+    /// db.put(b"k", b"v")?;
+    /// let stats = db.statistics().expect("opened with statistics");
+    /// assert_eq!(stats.get_ticker(Ticker::KeysWritten), 1);
+    /// # Ok::<(), regolith::Error>(())
+    /// ```
+    pub fn statistics(&self) -> Option<&Arc<Statistics>> {
+        self.engine.statistics_shared()
+    }
+
     /// What the environment this database was opened on can
     /// actually do.
     ///
@@ -1361,17 +1529,34 @@ impl Db {
 
     /// Return the integer value of a named property, or `None` if
     /// `name` isn't recognized or doesn't have an integer form.
-    /// `regolith.recovery.tables_demoted` counts tables moved from legacy
-    /// overlapping levels during this open. A later open reports zero
-    /// once the repair has been persisted; read-only opens repair only
-    /// their in-memory view.
+    ///
+    /// `regolith.manifest.tables_demoted` is the number of tables this open
+    /// moved to level 0 out of levels a 0.1.x release left overlapping (see
+    /// [`Db::open`]): zero once a read-write open has recorded the move, and
+    /// the same count at every read-only open until then.
+    /// `regolith.manifest.range_deletes_copied` is the number of range
+    /// deletes this open copied in front of keys an earlier release may have
+    /// left them behind (see [`Db::open`]): zero once a read-write open has
+    /// recorded the check, and the same count at every read-only open until
+    /// then.
+    ///
+    /// `regolith.disk-available-bytes` and `regolith.disk-available-inodes`
+    /// are what the environment's [`env::Env::disk_space`] reports, and
+    /// `None` where it reports nothing: the default [`env::StdEnv`] reports
+    /// them on Unix, and not on Windows or WASI.
+    ///
+    /// `regolith.num-uncounted-tables` is the number of tables whose
+    /// deletions have not been counted yet (see [`CompactionStyle`]).
     pub fn get_int_property(&self, name: &str) -> Option<u64> {
         if let Some(level_str) = name.strip_prefix("regolith.num-files-at-level") {
             let level: usize = level_str.parse().ok()?;
             return Some(self.engine.num_files_at_level(level));
         }
         match name {
-            "regolith.recovery.tables_demoted" => Some(self.engine.tables_demoted_at_open()),
+            "regolith.manifest.tables_demoted" => Some(self.engine.tables_demoted_at_open()),
+            "regolith.manifest.range_deletes_copied" => {
+                Some(self.engine.range_deletes_copied_at_open())
+            }
             "regolith.total-sst-files-size" => Some(self.engine.total_sst_size()),
             "regolith.cur-size-active-mem-table" => Some(self.engine.active_memtable_size()),
             "regolith.memtable-reserved-bytes" => Some(self.engine.memtables_reserved_size()),
@@ -1411,6 +1596,11 @@ impl Db {
                 self.engine.disk_space().map(|d| d.available_inodes)
             }
             "regolith.background-errors" => Some(self.engine.background_error_count()),
+            // Tables whose deletions have not been counted yet: tables an
+            // earlier version or a restored backup left, which are counted
+            // in the background. A table that cannot be read stays counted
+            // here.
+            "regolith.num-uncounted-tables" => Some(self.engine.current_version().uncounted as u64),
             _ => None,
         }
     }
@@ -1551,38 +1741,50 @@ impl Db {
         MemTableStats { count, size }
     }
 
-    /// Bulk-ingest one or more externally-built SSTable files. Each
-    /// file must have been produced by [`SstFileWriter`]; on success
-    /// every ingested file is placed at the appropriate level and its
-    /// keys become visible to new reads and iterators. See
-    /// [`IngestOptions`] for the snapshot-consistency and placement
-    /// rules.
+    /// Bulk-ingest one or more externally-built SSTable files, as a job:
+    /// the call returns a [`JobTicket`] at once and never waits on the
+    /// compaction gate. The job runs where [`Db::compact_range`]'s does,
+    /// and its ticket completes the same way. Each
+    /// file must have been produced by [`SstFileWriter`], or hold at most
+    /// one entry per key as it does; a file holding a key twice is
+    /// refused. On success every ingested file is placed at the
+    /// appropriate level and its keys become visible to new reads and
+    /// iterators. See [`IngestOptions`] for the snapshot-consistency,
+    /// placement and move rules.
     ///
-    /// The source files are left untouched on disk - the engine
-    /// re-emits each file into the database's own SSTable directory
-    /// so it can rewrite entry sequence numbers. Callers may delete
-    /// the source files or re-ingest them at any time.
+    /// Each file takes a fresh sequence number, and every entry in it
+    /// reads at that sequence. The file is not rewritten: it is copied
+    /// into the database's own SSTable directory, or linked when
+    /// [`IngestOptions::move_files`] is set, with no lock held, so writers
+    /// never wait for the copy. They wait only for the flush of a memtable
+    /// holding a key of the file's range, when there is one, and for the
+    /// manifest edit that installs the file. So the ingested entries order
+    /// after every write acknowledged before the call and before every
+    /// write acknowledged after it, no snapshot sees them appear under it,
+    /// and a write running alongside the call orders on one side of it.
+    /// Files are installed one at a time, each at its own sequence; an
+    /// error leaves the files before it installed.
     ///
-    /// The call waits for any flush already in progress. A memtable that
-    /// fills while a file is being ingested is sealed without waiting, and
-    /// the call writes it to disk right after that file is installed, so
-    /// the ingested entries order after every write acknowledged before
-    /// the call and before every write acknowledged after it. Until then
-    /// those memtables count toward [`Options::max_write_buffer_number`],
-    /// which slows and then stops writes. If writing them fails, the call
-    /// returns that error with the file already ingested, and they stay
-    /// readable until a later [`Db::flush`] writes them.
+    /// On a database encrypted at rest ([`Options::key_provider`]) a file
+    /// sealed under any key the provider has is installed as it is, while
+    /// a plaintext file is written in sealed under the current key instead
+    /// of copied or linked, with no lock held: an encrypted database holds
+    /// no table in plaintext. A sealed file under a key the provider lacks
+    /// is refused with [`Error::UnknownKey`].
     pub fn ingest_external_files(
         &self,
         files: &[std::path::PathBuf],
         opts: IngestOptions,
-    ) -> Result<()> {
-        self.ensure_writable()?;
-        self.engine
-            .ingest_external_files(files, &opts, |user_key| {
-                self.validate_prefixed_cf_io(user_key)
-            })
-            .map_err(Error::from)
+    ) -> JobTicket {
+        if let Err(err) = self.ensure_writable() {
+            return JobTicket::ready(Arc::downgrade(&self.engine), Err(err));
+        }
+        let cfs = Arc::clone(&self.cfs);
+        self.engine.start_foreground(engine::Work::Ingest {
+            files: files.to_vec(),
+            options: opts,
+            check: Box::new(move |user_key| check_prefixed_cf(&cfs, user_key)),
+        })
     }
 
     /// Flush all data to disk and shut down background threads.
@@ -1590,32 +1792,56 @@ impl Db {
     /// After a successful close, result-returning operations on this
     /// handle fail with [`Error::Closed`]. Calling `close` more than
     /// once is allowed.
+    ///
+    /// Close does not give the directory back: it stays locked, and opening
+    /// it again fails, until this handle and every snapshot, iterator and
+    /// transaction made from it have been dropped.
+    ///
+    /// Close syncs the write-ahead log and ends it with a record saying it
+    /// is complete, so every write survives a power cut after `close`
+    /// returns, under either durability mode. A close whose sync fails
+    /// returns the error and leaves the database refusing writes until it
+    /// is reopened, since what reached the device is unknown; the next
+    /// open recovers it as it would after a crash. A database dropped
+    /// without `close` is recovered the same way.
+    ///
+    /// A transaction still open when `close` begins is aborted: its
+    /// [`Transaction::on_abort`](crate::Transaction::on_abort) callbacks and
+    /// the database's [`TransactionHooks::on_abort`] run on this thread with
+    /// [`AbortReason::Closed`], before the data is flushed, and the
+    /// transaction's later commit fails with [`Error::Closed`]. A transaction
+    /// that had begun to commit is left to finish. Those callbacks must not
+    /// call back into the database.
     pub fn close(&self) -> Result<()> {
         self.engine.close().map_err(Error::from)
     }
 
-    /// Block until no [`Snapshot`] and no snapshot-backed iterator is
-    /// live, returning how many pins were still outstanding when
-    /// `timeout` elapsed. `0` means the wait succeeded.
+    /// How many [`Snapshot`]s and snapshot-backed iterators are live, and a
+    /// wait for the last of them to be released. The call itself never
+    /// waits: it returns a [`SnapshotWait`] at once.
     ///
     /// A snapshot pins the SSTables it can see, so closing a database
     /// while one is outstanding leaves those files on disk and their
     /// readers open. An embedder that wants a clean shutdown has to wait
-    /// for its readers to finish, and this is that wait: it blocks on
-    /// the release itself rather than polling a counter, so it costs
-    /// nothing while it waits and adds no latency once the last reader
-    /// is done.
+    /// for its readers to finish, and the handle is that wait: ask it
+    /// ([`SnapshotWait::pinned`]), await it from a task, or block on it by
+    /// name ([`SnapshotWait::wait`]). Either wait is for the release
+    /// itself rather than a polled counter, so it costs nothing while it
+    /// waits and adds no latency once the last reader is done.
     ///
     /// Counts pins, not handles. An iterator taken from a snapshot pins
     /// it again for as long as the iterator lives, so a `Snapshot` that
     /// has already been dropped can still be counted here, which is
     /// exactly the case an embedder tracking its own transaction objects
-    /// would miss.
+    /// would miss. An open transaction pins its snapshot too, until its
+    /// commit is decided or it is rolled back; a
+    /// [`Transaction::commit_nowait`](crate::Transaction::commit_nowait)
+    /// commit holds it until the commit lands.
     ///
-    /// Returns a count rather than an error because whether outstanding
-    /// readers are a failure is the caller's decision: [`Db::close`]
-    /// does not require this wait, and a database closed with snapshots
-    /// live is consistent, just not tidy.
+    /// The handle reports a count rather than an error because whether
+    /// outstanding readers are a failure is the caller's decision:
+    /// [`Db::close`] does not require this wait, and a database closed with
+    /// snapshots live is consistent, just not tidy.
     ///
     /// ```
     /// # use std::time::Duration;
@@ -1626,16 +1852,19 @@ impl Db {
     /// db.put(b"k", b"v")?;
     ///
     /// let snapshot = db.snapshot();
-    /// assert_eq!(db.wait_for_snapshots(Duration::from_millis(50)), 1);
+    /// let readers = db.wait_for_snapshots();
+    /// assert_eq!(readers.pinned(), 1);
+    /// assert_eq!(readers.wait(Duration::from_millis(50)), 1);
     ///
     /// drop(snapshot);
-    /// assert_eq!(db.wait_for_snapshots(Duration::from_secs(5)), 0);
+    /// assert!(readers.is_ready());
+    /// assert_eq!(readers.wait(Duration::from_secs(5)), 0);
     /// db.close()?;
     /// # Ok(())
     /// # }
     /// ```
-    pub fn wait_for_snapshots(&self, timeout: std::time::Duration) -> u64 {
-        self.engine.wait_for_snapshots(timeout)
+    pub fn wait_for_snapshots(&self) -> SnapshotWait {
+        SnapshotWait::new(Arc::clone(&self.engine))
     }
 
     /// Test-only: number of SSTable files at `level`.
@@ -1644,16 +1873,21 @@ impl Db {
         self.engine.level_file_count(level)
     }
 
-    /// Create a hard-linked [`Checkpoint`] of the database.
+    /// Create a hard-linked [`Checkpoint`] of the database, as a job: the
+    /// call returns a [`JobTicket`] at once and never waits on the
+    /// compaction gate. The job runs where [`Db::compact_range`]'s does,
+    /// and its ticket completes the same way.
     ///
-    /// Equivalent to [`Checkpoint::new`] followed by
-    /// [`Checkpoint::create`]. The call briefly flushes the active
-    /// memtable and compacts the manifest before any files are
-    /// linked; concurrent writers continue to make progress.
-    pub fn checkpoint<P: AsRef<Path>>(&self, target_dir: P) -> Result<()> {
-        self.ensure_writable()?;
-        let cp = Checkpoint::new(self)?;
-        cp.create(target_dir)
+    /// The job briefly flushes the active memtable and compacts the manifest
+    /// before any files are linked; concurrent writers continue to make
+    /// progress.
+    pub fn checkpoint<P: AsRef<Path>>(&self, target_dir: P) -> JobTicket {
+        if let Err(err) = self.ensure_writable() {
+            return JobTicket::ready(Arc::downgrade(&self.engine), Err(err));
+        }
+        self.engine.start_foreground(engine::Work::Checkpoint {
+            target: target_dir.as_ref().to_path_buf(),
+        })
     }
 
     // ── column families ─────────────────────────────────────────────────
@@ -1687,7 +1921,11 @@ impl Db {
     /// returns the existing handle (idempotent).
     ///
     /// The new CF is persisted to the on-disk metadata before this
-    /// call returns, so it survives a crash and a reopen.
+    /// call returns, so it survives a crash and a reopen. It becomes
+    /// visible only once that write is committed, and concurrent creates
+    /// of one name return the same handle. Ids are never reused: a name
+    /// created again after a drop is a new family, and a handle to the
+    /// old one stays refused.
     pub fn create_column_family(&self, name: &str) -> Result<ColumnFamilyHandle> {
         self.ensure_writable()?;
         if name.is_empty() {
@@ -1699,22 +1937,14 @@ impl Db {
             return Ok(existing);
         }
         self.validate_prefixed_key_size(&meta::name_key(name))?;
-        let Some((handle, next_id)) = self.cfs.allocate(name) else {
-            return Err(Error::invalid_argument(
-                "the column-family id space is exhausted",
-            ));
-        };
-        let mut batch = BTreeMap::new();
-        batch.insert(
-            meta::name_key(name),
-            Some(handle.id().to_be_bytes().to_vec()),
-        );
-        batch.insert(meta::next_id_key(), Some(next_id.to_be_bytes().to_vec()));
+        // Before the ordered step, so a write that cannot be admitted leaves
+        // no name registered.
+        self.admit_write(&WriteOptions::default())?;
+        // The id is drawn, persisted and published in one ordered step, so a
+        // racing create of the same name returns this family.
         self.engine
-            .apply_grouped_batch(batch, Vec::new(), Vec::new(), self.durability, false)
-            .map(|_| ())
-            .map_err(Error::from)?;
-        Ok(handle)
+            .create_family(name, self.durability)
+            .map_err(Error::from)
     }
 
     /// Drop a column family. Every key stored in the CF is removed
@@ -1725,6 +1955,13 @@ impl Db {
     ///
     /// Dropping the default column family is not allowed and
     /// returns an error.
+    ///
+    /// A write to the family that races the drop either commits before
+    /// it, and the range tombstone deletes it, or is refused with
+    /// [`Error::InvalidColumnFamily`]; it never lands after the
+    /// tombstone. Every later write, read or drop through a handle to the
+    /// family is refused the same way. Two drops of one family race to
+    /// one success.
     pub fn drop_column_family(&self, cf: ColumnFamilyHandle) -> Result<()> {
         self.ensure_writable()?;
         if cf.id() == DEFAULT_CF_ID {
@@ -1738,20 +1975,15 @@ impl Db {
             ));
         }
         self.validate_cf_handle(&cf)?;
-        let lo = cf_lower_bound(cf.id());
-        let hi = cf_upper_bound(cf.id());
-        // Apply the data range-delete and the metadata entry
-        // removal in a single atomic batch so a crash mid-drop
-        // either leaves the CF fully present or fully removed.
-        let mut point_ops = BTreeMap::new();
-        point_ops.insert(meta::name_key(cf.name()), None);
-        let range_deletes = vec![(lo, hi)];
+        self.admit_write(&WriteOptions::default())?;
+        // The range tombstone and the meta delete commit as one group, so a
+        // crash mid-drop leaves the CF fully present or fully removed, and
+        // the family is retired in the same ordered step: a write racing the
+        // drop is either deleted by the tombstone or refused, never committed
+        // after it.
         self.engine
-            .apply_grouped_batch(point_ops, range_deletes, Vec::new(), self.durability, false)
-            .map(|_| ())
-            .map_err(Error::from)?;
-        self.cfs.remove(cf.name());
-        Ok(())
+            .drop_family(&cf, self.durability)
+            .map_err(Error::from)
     }
 
     /// Read `key` from column family `cf`. Same semantics as
@@ -1777,6 +2009,7 @@ impl Db {
         self.ensure_writable()?;
         self.validate_cf_handle(cf)?;
         self.validate_write_kv_sizes(key, value)?;
+        self.admit_write(&WriteOptions::default())?;
         let mut batch = BTreeMap::new();
         batch.insert(prefix_key(cf.id(), key), Some(value.to_vec()));
         self.engine
@@ -1790,6 +2023,7 @@ impl Db {
         self.ensure_writable()?;
         self.validate_cf_handle(cf)?;
         self.validate_key_size(key)?;
+        self.admit_write(&WriteOptions::default())?;
         let mut batch = BTreeMap::new();
         batch.insert(prefix_key(cf.id(), key), None);
         self.engine
@@ -1811,6 +2045,7 @@ impl Db {
         self.validate_cf_handle(cf)?;
         self.validate_key_size(start)?;
         self.validate_key_size(end)?;
+        self.admit_write(&WriteOptions::default())?;
         self.engine
             .apply_grouped_batch(
                 BTreeMap::new(),
@@ -1824,11 +2059,14 @@ impl Db {
     }
 
     /// Layer a merge operand on top of `key` in column family `cf`.
-    /// Requires [`Options::merge_operator`] to be set.
+    /// Requires [`Options::merge_operator`] to be set, and returns
+    /// [`Error::NoMergeOperator`] without writing when it is not.
     pub fn merge_cf(&self, cf: &ColumnFamilyHandle, key: &[u8], operand: &[u8]) -> Result<()> {
         self.ensure_writable()?;
+        self.engine.require_merge_operator()?;
         self.validate_cf_handle(cf)?;
         self.validate_write_kv_sizes(key, operand)?;
+        self.admit_write(&WriteOptions::default())?;
         self.engine
             .apply_grouped_batch(
                 BTreeMap::new(),
@@ -2040,6 +2278,15 @@ impl<'a> CfIter<'a> {
         self.inner.seek_for_prev(&prefix_key(self.cf_id, target));
     }
 
+    /// Position the cursor at the last key strictly below `end` in the CF,
+    /// and set the scan direction to reverse.
+    pub(crate) fn seek_before(&mut self, end: &[u8]) {
+        if !self.valid_cf {
+            return;
+        }
+        self.inner.seek_to_last_before(&prefix_key(self.cf_id, end));
+    }
+
     /// Position the cursor at the first key in this CF that starts
     /// with `prefix`, and bound subsequent forward iteration to
     /// that prefix. Delegates to the underlying [`Iter::seek_prefix`],
@@ -2067,6 +2314,15 @@ impl<'a> CfIter<'a> {
             return;
         }
         self.inner.prev();
+    }
+
+    /// Run the seek or step a [`WouldBlock`] interrupted again, once the
+    /// queue it names was polled. See [`Iter::resume`].
+    pub fn resume(&mut self) {
+        if !self.valid_cf {
+            return;
+        }
+        self.inner.resume();
     }
 
     /// Whether the caller has positioned this cursor at all. See
@@ -2145,7 +2401,8 @@ pub struct OwnedSnapshotIter {
 impl OwnedSnapshotIter {
     fn new(snapshot: Snapshot) -> Self {
         let inner = Iter::<'static>::from_internal(snapshot.engine.new_iter_at(snapshot.seq))
-            .with_stats(snapshot.engine.statistics_arc());
+            .with_stats(snapshot.engine.statistics_arc())
+            .with_mode(snapshot.mode);
         Self {
             inner: CfIter::new(inner, DEFAULT_CF_ID),
             _snapshot: snapshot,
@@ -2193,6 +2450,18 @@ impl OwnedSnapshotIter {
         self.inner.prev();
     }
 
+    /// Run the seek or step a [`WouldBlock`] interrupted again, once the
+    /// queue it names was polled. See [`Iter::resume`].
+    ///
+    /// A cursor made from a [`ReadMode::CacheOnly`] snapshot stops on a block
+    /// the cache does not hold: [`valid`](Self::valid) turns `false` and
+    /// [`status`](Self::status) reports [`Error::WouldBlock`]. This carries
+    /// the walk on from exactly where it stopped, so a walk interrupted any
+    /// number of times yields the same entries as one that never was.
+    pub fn resume(&mut self) {
+        self.inner.resume();
+    }
+
     /// Whether the caller has positioned this cursor at all. See
     /// [`Iter::positioned`].
     pub fn positioned(&self) -> bool {
@@ -2228,11 +2497,23 @@ impl OwnedSnapshotIter {
 
 /// A lazy, bounded scan over a key range.
 ///
-/// Returned by [`Db::scan_stream`] and [`Snapshot::scan_stream`]. Holds
-/// one entry at a time rather than the range, so a caller that stops
-/// early pays only for what it read: the opposite of [`Db::scan`], which
-/// reads the whole range up front. The value is a [`DbSlice`], so no
-/// value bytes are copied.
+/// Returned by [`Db::scan_stream`], [`Snapshot::scan_stream`] and
+/// [`Snapshot::into_scan_stream`]. Holds one entry at a time rather than
+/// the range, so a caller that stops early pays only for what it read: the
+/// opposite of [`Db::scan`], which reads the whole range up front. The
+/// value is a [`DbSlice`], so no value bytes are copied.
+///
+/// Each item is a `Result`: a scan that fails in the middle of the range
+/// (a corrupt block, a failed read, a key the merge operator declines) ends
+/// with one `Err` item, so a failed scan is never read as a short one.
+/// After the `Err`, or after the end of the range, the stream returns
+/// `None`. The entries before the `Err` are a prefix of the range and the
+/// rest was never read; `collect::<Result<Vec<_>>>()` keeps the rows only
+/// when the whole range was read.
+///
+/// The one `Err` that does not end the stream is [`Error::WouldBlock`], from
+/// a stream of a [`ReadMode::CacheOnly`] snapshot: poll the queue it names
+/// and take the next item, and the scan carries on exactly where it stopped.
 ///
 /// The scan runs against a pinned snapshot, so writes that land while it
 /// is being drained are invisible to it and the range cannot shift
@@ -2245,39 +2526,19 @@ pub struct ScanStream {
     done: bool,
 }
 
-impl ScanStream {
-    /// Why the scan stopped.
-    ///
-    /// `Ok(())` means the range ended. An error means it did not: what the
-    /// stream yielded is a prefix of the range and the rest was never read.
-    ///
-    /// This matters because [`Iterator`] cannot carry a failure. A scan that
-    /// dies on a corrupt block ends exactly like one that reached the end of
-    /// its range, and a caller that only iterates cannot tell a short answer
-    /// from a complete one. Check this after iterating whenever a missing row
-    /// would be worse than an error.
-    ///
-    /// ```no_run
-    /// # use regolith::{Db, Options};
-    /// # let db = Db::open("/tmp/scan_status_doc", Options::default()).unwrap();
-    /// let mut scan = db.scan_stream(None, None)?;
-    /// let rows: Vec<_> = scan.by_ref().collect();
-    /// scan.status()?;  // the rows above are the whole range only if this is Ok
-    /// # Ok::<(), regolith::Error>(())
-    /// ```
-    pub fn status(&self) -> Result<()> {
-        self.entries.status()
-    }
-}
-
 impl Iterator for ScanStream {
-    type Item = (Vec<u8>, DbSlice);
+    type Item = Result<(Vec<u8>, DbSlice)>;
 
     fn next(&mut self) -> Option<Self::Item> {
         if self.done {
             return None;
         }
-        let (key, value) = self.entries.next()?;
+        // `Entries` hands a failure out once and is finished after it, so
+        // passing the item on is all it takes to keep that contract here.
+        let (key, value) = match self.entries.next()? {
+            Ok(entry) => entry,
+            Err(error) => return Some(Err(error)),
+        };
         if let Some(end) = &self.end
             && key.as_slice() >= end.as_slice()
         {
@@ -2286,7 +2547,7 @@ impl Iterator for ScanStream {
             self.done = true;
             return None;
         }
-        Some((key, value))
+        Some(Ok((key, value)))
     }
 }
 
@@ -2307,6 +2568,16 @@ impl std::fmt::Debug for ScanStream {
 /// buffer the cursor owns and has to be copied out, while a value is
 /// stored whole and can be handed over by reference.
 ///
+/// Each item is a `Result`: a walk that failed in the middle of the range
+/// ends with one `Err` item, so a failed scan is never read as a short one.
+/// After it, or after the end of the range, the iterator returns `None`.
+///
+/// [`Error::WouldBlock`] is the one error that does not end the walk: a
+/// cursor read in [`ReadMode::CacheOnly`] hands it out when it needs a block
+/// the cache does not hold. Poll the queue it names, then ask for the next
+/// item: the cursor resumes where it stopped, and the items that follow are
+/// exactly those an uninterrupted walk would have yielded.
+///
 /// This is the seam to build a `Stream` on. regolith's IO is synchronous
 /// and it requires no async runtime, so wrapping a ready iterator with
 /// `futures::stream::iter` belongs where the async context is rather than
@@ -2315,6 +2586,11 @@ pub struct Entries<C> {
     cursor: C,
     started: bool,
     reverse: bool,
+    /// The range ended or the walk failed; nothing more is read.
+    ended: bool,
+    /// The last item was a `WouldBlock`: the next one resumes the cursor
+    /// instead of stepping it.
+    blocked: bool,
 }
 
 impl<C> Entries<C> {
@@ -2323,6 +2599,8 @@ impl<C> Entries<C> {
             cursor,
             started: false,
             reverse,
+            ended: false,
+            blocked: false,
         }
     }
 
@@ -2338,10 +2616,17 @@ impl<C> Entries<C> {
 macro_rules! impl_entries {
     ($cursor:ty $(, $lt:lifetime)?) => {
         impl$(<$lt>)? Iterator for Entries<$cursor> {
-            type Item = (Vec<u8>, DbSlice);
+            type Item = Result<(Vec<u8>, DbSlice)>;
 
             fn next(&mut self) -> Option<Self::Item> {
-                if self.started {
+                if self.ended {
+                    return None;
+                }
+                if self.blocked {
+                    // The step or seek the last item interrupted runs again.
+                    self.blocked = false;
+                    self.cursor.resume();
+                } else if self.started {
                     if self.reverse {
                         self.cursor.prev();
                     } else {
@@ -2363,23 +2648,29 @@ macro_rules! impl_entries {
                 }
                 if !self.cursor.valid() {
                     // A cursor goes invalid for two reasons that look
-                    // identical from here: the range ended, or the walk
-                    // failed. `Iterator` has nowhere to put the difference,
-                    // so say it out loud rather than let a failed scan read
-                    // as a complete one. `Entries::status` returns it to a
-                    // caller that checks.
-                    if let Err(e) = self.cursor.status() {
-                        tracing::error!(
-                            error = %e,
-                            "scan ended early: the iterator failed mid-range, \
-                             so the rows returned are a prefix and not the range"
-                        );
-                    }
-                    return None;
+                    // identical from the position alone: the range ended, or
+                    // the walk failed. The status tells them apart, and a
+                    // failure is handed out as an item so it cannot pass for
+                    // the end of the range. A `WouldBlock` pauses the walk
+                    // rather than ending it.
+                    return match self.cursor.status() {
+                        Ok(()) => {
+                            self.ended = true;
+                            None
+                        }
+                        Err(error @ Error::WouldBlock(_)) => {
+                            self.blocked = true;
+                            Some(Err(error))
+                        }
+                        Err(error) => {
+                            self.ended = true;
+                            Some(Err(error))
+                        }
+                    };
                 }
                 let key = self.cursor.key()?.to_vec();
                 let value = self.cursor.value_slice()?;
-                Some((key, value))
+                Some(Ok((key, value)))
             }
         }
 
@@ -2397,7 +2688,7 @@ macro_rules! impl_entries {
         }
 
         impl$(<$lt>)? IntoIterator for $cursor {
-            type Item = (Vec<u8>, DbSlice);
+            type Item = Result<(Vec<u8>, DbSlice)>;
             type IntoIter = Entries<$cursor>;
 
             fn into_iter(self) -> Self::IntoIter {
@@ -2435,10 +2726,19 @@ impl<'a> CfIter<'a> {
 }
 
 /// A point-in-time snapshot for consistent reads.
+///
+/// A snapshot reads in a [`ReadMode`], `Blocking` unless
+/// [`Snapshot::with_read_mode`] says otherwise, and every iterator, cursor and
+/// stream made from it reads in the same mode.
 pub struct Snapshot {
     engine: Arc<RegolithEngine>,
     cfs: Arc<CfRegistry>,
     seq: u64,
+    /// Where this snapshot's block-cache misses go.
+    mode: ReadMode,
+    /// Where `seq` is pinned in the engine's snapshot registry. The drop
+    /// releases exactly there, whichever thread it runs on.
+    pin: engine::SnapshotPin,
 }
 
 impl Drop for Snapshot {
@@ -2448,7 +2748,7 @@ impl Drop for Snapshot {
         // version it was keeping alive for this snapshot's sake,
         // subject to other live snapshots that may still pin older
         // seqs.
-        self.engine.release_snapshot(self.seq);
+        self.engine.release_snapshot(self.pin.take());
     }
 }
 
@@ -2462,12 +2762,39 @@ impl std::fmt::Debug for Snapshot {
 
 impl Snapshot {
     fn clone_pin(&self) -> Self {
-        self.engine.register_snapshot(self.seq);
         Self {
             engine: Arc::clone(&self.engine),
             cfs: Arc::clone(&self.cfs),
             seq: self.seq,
+            mode: self.mode,
+            pin: self.engine.clone_snapshot_pin(&self.pin),
         }
+    }
+
+    /// This snapshot, reading in `mode` from now on.
+    ///
+    /// Under [`ReadMode::CacheOnly`] no read through this snapshot touches
+    /// the device: a point read, a scan, an iterator step or a stream item
+    /// that needs a block the cache does not hold returns
+    /// [`Error::WouldBlock`], and the block is read when the queue the mode
+    /// names is polled. Run the read again after that poll; an iterator or a
+    /// stream resumes where it stopped. A point read run again reads the same
+    /// sequence, so it sees what the first attempt would have seen.
+    pub fn with_read_mode(mut self, mode: ReadMode) -> Self {
+        self.mode = mode;
+        self
+    }
+
+    /// The mode this snapshot reads in.
+    pub fn read_mode(&self) -> ReadMode {
+        self.mode
+    }
+
+    /// Run `read` in this snapshot's mode. `Blocking` sets nothing.
+    #[inline]
+    fn reading<T>(&self, read: impl FnOnce() -> T) -> T {
+        let _scope = self.mode.scope();
+        read()
     }
 
     fn validate_cf_handle(&self, cf: &ColumnFamilyHandle) -> Result<()> {
@@ -2512,8 +2839,7 @@ impl Snapshot {
     }
 
     fn lookup_slice(&self, lk: &LookupKey) -> Result<Option<DbSlice>> {
-        self.engine
-            .get_slice(lk)
+        self.reading(|| self.engine.get_slice(lk))
             .map_err(|err| map_point_read_error(err, lk.prefixed_user_key()))
     }
 
@@ -2568,8 +2894,7 @@ impl Snapshot {
     }
 
     fn lookup_size(&self, lk: &LookupKey, limit: Option<usize>) -> Result<Option<usize>> {
-        self.engine
-            .get_size(lk, limit)
+        self.reading(|| self.engine.get_size(lk, limit))
             .map_err(|err| map_point_read_error(err, lk.prefixed_user_key()))
     }
 
@@ -2577,8 +2902,7 @@ impl Snapshot {
     pub fn multi_get(&self, keys: &[&[u8]]) -> Result<Vec<Option<Vec<u8>>>> {
         let owned: Vec<Vec<u8>> = keys.iter().map(|k| prefix_key(DEFAULT_CF_ID, k)).collect();
         let refs: Vec<&[u8]> = owned.iter().map(|k| k.as_slice()).collect();
-        self.engine
-            .multi_get_at(&refs, self.seq)
+        self.reading(|| self.engine.multi_get_at(&refs, self.seq))
             .map_err(Error::from)
     }
 
@@ -2601,7 +2925,8 @@ impl Snapshot {
             Some(e) => prefix_key(DEFAULT_CF_ID, e),
             None => cf_upper_bound(DEFAULT_CF_ID),
         };
-        let raw = collect_range(self.engine.new_iter_at(self.seq), Some(&lo), Some(&hi))?;
+        let raw = self
+            .reading(|| collect_range(self.engine.new_iter_at(self.seq), Some(&lo), Some(&hi)))?;
         strip_cf_prefix_entries(raw)
     }
 
@@ -2624,7 +2949,7 @@ impl Snapshot {
             Some(e) => prefix_key(DEFAULT_CF_ID, e),
             None => cf_upper_bound(DEFAULT_CF_ID),
         };
-        collect_page(self.engine.new_iter_at(self.seq), &lo, &hi, limit)
+        self.reading(|| collect_page(self.engine.new_iter_at(self.seq), &lo, &hi, limit))
             .and_then(strip_cf_prefix_page)
     }
 
@@ -2633,7 +2958,8 @@ impl Snapshot {
     pub fn iter(&self) -> CfIter<'_> {
         CfIter::new(
             Iter::from_internal(self.engine.new_iter_at(self.seq))
-                .with_stats(self.engine.statistics_arc()),
+                .with_stats(self.engine.statistics_arc())
+                .with_mode(self.mode),
             DEFAULT_CF_ID,
         )
     }
@@ -2693,8 +3019,7 @@ impl Snapshot {
         self.validate_cf_handle(cf)?;
         let owned: Vec<Vec<u8>> = keys.iter().map(|k| prefix_key(cf.id(), k)).collect();
         let refs: Vec<&[u8]> = owned.iter().map(|k| k.as_slice()).collect();
-        self.engine
-            .multi_get_at(&refs, self.seq)
+        self.reading(|| self.engine.multi_get_at(&refs, self.seq))
             .map_err(Error::from)
     }
 
@@ -2720,7 +3045,8 @@ impl Snapshot {
             Some(e) => prefix_key(cf.id(), e),
             None => cf_upper_bound(cf.id()),
         };
-        let raw = collect_range(self.engine.new_iter_at(self.seq), Some(&lo), Some(&hi))?;
+        let raw = self
+            .reading(|| collect_range(self.engine.new_iter_at(self.seq), Some(&lo), Some(&hi)))?;
         strip_cf_prefix_entries(raw)
     }
 
@@ -2746,14 +3072,15 @@ impl Snapshot {
             Some(e) => prefix_key(cf.id(), e),
             None => cf_upper_bound(cf.id()),
         };
-        collect_page(self.engine.new_iter_at(self.seq), &lo, &hi, limit)
+        self.reading(|| collect_page(self.engine.new_iter_at(self.seq), &lo, &hi, limit))
             .and_then(strip_cf_prefix_page)
     }
 
     /// CF-scoped streaming iterator at this snapshot.
     pub fn iter_cf<'a>(&'a self, cf: &ColumnFamilyHandle) -> CfIter<'a> {
         let inner = Iter::from_internal(self.engine.new_iter_at(self.seq))
-            .with_stats(self.engine.statistics_arc());
+            .with_stats(self.engine.statistics_arc())
+            .with_mode(self.mode);
         if self.is_live_cf_handle(cf) {
             CfIter::new(inner, cf.id())
         } else {
@@ -2845,7 +3172,7 @@ fn strip_cf_prefix_page(page: ScanPage) -> Result<ScanPage> {
 }
 
 /// One ordered operation in a [`WriteBatch`].
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(crate) enum WriteBatchOp {
     /// Write a value for `key`.
     Put { key: Vec<u8>, value: Vec<u8> },
@@ -2879,7 +3206,7 @@ impl WriteBatchOp {
 /// [`Error::InvalidArgument`] before applying any of it; split it into
 /// smaller batches. A batch written with `WriteOptions::disable_wal`
 /// logs nothing and is not subject to this limit.
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct WriteBatch {
     ops: Vec<WriteBatchOp>,
 }
@@ -2944,6 +3271,10 @@ impl WriteBatch {
     /// existing value or merge chain and collapsed at read time.
     /// Multiple merges on the same key in a single batch are
     /// allowed and applied in insertion order.
+    ///
+    /// A batch does not know its database, so the operator is checked when
+    /// the batch is applied: [`Db::write`] returns [`Error::NoMergeOperator`]
+    /// and applies none of the batch when the database has no operator.
     pub fn merge(&mut self, key: &[u8], operand: &[u8]) {
         self.ops.push(WriteBatchOp::Merge {
             key: prefix_key(DEFAULT_CF_ID, key),
@@ -2977,7 +3308,9 @@ impl WriteBatch {
         });
     }
 
-    /// Add a merge operand scoped to column family `cf`.
+    /// Add a merge operand scoped to column family `cf`. As for
+    /// [`WriteBatch::merge`], applying the batch to a database with no merge
+    /// operator returns [`Error::NoMergeOperator`].
     pub fn merge_cf(&mut self, cf: &ColumnFamilyHandle, key: &[u8], operand: &[u8]) {
         self.ops.push(WriteBatchOp::Merge {
             key: prefix_key(cf.id(), key),
@@ -3057,6 +3390,12 @@ impl WriteBatch {
 #[cfg(test)]
 mod write_limit_tests;
 
+#[cfg(all(test, not(target_family = "wasm")))]
+mod cf_race_tests;
+
+#[cfg(all(test, not(target_family = "wasm")))]
+mod prefix_form_tests;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3103,14 +3442,7 @@ mod tests {
     #[test]
     fn test_db_open_rejects_invalid_options() {
         let dir = TempDir::new().unwrap();
-        let err = Db::open(
-            dir.path(),
-            Options {
-                write_buffer_size: 0,
-                ..Options::default()
-            },
-        )
-        .unwrap_err();
+        let err = Db::open(dir.path(), Options::default().write_buffer_size(0)).unwrap_err();
         match err {
             Error::InvalidArgument(message) => assert!(message.contains("write_buffer_size")),
             other => panic!("expected invalid argument, got {other:?}"),
@@ -3121,10 +3453,7 @@ mod tests {
     fn test_open_read_only_replays_wal_without_mutating_files() {
         let dir = TempDir::new().unwrap();
         {
-            let opts = Options {
-                durability: DurabilityMode::Immediate,
-                ..Options::default()
-            };
+            let opts = Options::default().durability(DurabilityMode::Immediate);
             let db = Db::open(dir.path(), opts).unwrap();
             db.put(b"wal_only", b"value").unwrap();
         }
@@ -3228,7 +3557,9 @@ mod tests {
         let db = Db::open(dir.path(), Options::default()).unwrap();
         db.put(b"k", b"v").unwrap();
 
-        let blocked_wal_path = dir.path().join("wal").join("wal_000002.log");
+        // The log close creates after its flush: the open's log is 1 and the
+        // flush's table 2.
+        let blocked_wal_path = dir.path().join("wal").join("wal_000003.log");
         std::fs::create_dir(&blocked_wal_path).unwrap();
 
         match db.close().unwrap_err() {
@@ -3237,6 +3568,8 @@ mod tests {
         }
 
         assert_eq!(db.get(b"k").unwrap(), Some(b"v".to_vec()));
+        // The failed close left the database taking writes again.
+        db.put(b"after", b"close").unwrap();
 
         std::fs::remove_dir(&blocked_wal_path).unwrap();
         db.close().unwrap();
@@ -3252,16 +3585,16 @@ mod tests {
         drop(db);
         let reopened = Db::open(dir.path(), Options::default()).unwrap();
         assert_eq!(reopened.get(b"k").unwrap(), Some(b"v".to_vec()));
+        assert_eq!(reopened.get(b"after").unwrap(), Some(b"close".to_vec()));
     }
 
     #[test]
     fn test_configured_key_value_size_limits_are_enforced() {
         let dir = TempDir::new().unwrap();
-        let opts = Options {
-            max_key_size: 8,
-            max_value_size: 4,
-            ..Options::default()
-        };
+        let opts = Options::default()
+            .max_key_size(8)
+            .max_value_size(4)
+            .merge_operator(Some(Arc::new(AppendMerge)));
         let db = Db::open(dir.path(), opts).unwrap();
 
         db.put(b"abc", b"1234").unwrap();
@@ -3289,10 +3622,7 @@ mod tests {
 
     /// Options that force flushes early so tests can exercise the SSTable path.
     fn tiny_flush_opts() -> Options {
-        Options {
-            write_buffer_size: 4 * 1024,
-            ..Options::default()
-        }
+        Options::default().write_buffer_size(4 * 1024)
     }
 
     /// Write enough filler bytes to push the active memtable past
@@ -3301,7 +3631,7 @@ mod tests {
         let payload = vec![0u8; 512];
         for i in 0..32 {
             let key = format!("__flush_{}_{:04}", tag, i);
-            db.put(key.as_bytes(), &payload).unwrap();
+            crate::through_stalls(|| db.put(key.as_bytes(), &payload)).unwrap();
         }
     }
 
@@ -3309,7 +3639,7 @@ mod tests {
         let payload = vec![0u8; 512];
         for i in 0..32 {
             let key = format!("{prefix}_{i:04}");
-            db.put(key.as_bytes(), &payload).unwrap();
+            crate::through_stalls(|| db.put(key.as_bytes(), &payload)).unwrap();
         }
     }
 
@@ -3353,17 +3683,15 @@ mod tests {
         batch.put(b"b", b"2");
         db.write(batch).unwrap();
 
-        // Records begin after the file stamp; the type byte is the fifth
-        // byte of the first record.
-        let stamp = crate::engine::wal::WAL_STAMP_LEN;
+        // One group record after the stamp holds both operations, so
+        // replay restores the batch whole or not at all.
+        use crate::engine::wal_frame::{HEADER_LEN, KIND_GROUP, STAMP_LEN};
         let wal = std::fs::read(first_wal_path(&dir)).unwrap();
-        assert!(wal.len() >= stamp + 5);
         assert_eq!(&wal[0..4], b"REGO", "the log must carry its stamp");
-        assert_eq!(
-            wal[stamp + 4],
-            0x05,
-            "multi-op WriteBatch must use RECORD_BATCH"
-        );
+        assert_eq!(wal[STAMP_LEN + 4], KIND_GROUP);
+        let len = u32::from_le_bytes(wal[STAMP_LEN..STAMP_LEN + 4].try_into().unwrap()) as usize;
+        assert_eq!(STAMP_LEN + HEADER_LEN + len, wal.len(), "one record");
+        assert!(len > 2 * 4, "the record holds both operations");
     }
 
     #[test]
@@ -3515,9 +3843,9 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let db = Db::open(dir.path(), tiny_flush_opts()).unwrap();
 
-        db.put(b"flushed", b"old").unwrap();
+        crate::through_stalls(|| db.put(b"flushed", b"old")).unwrap();
         force_flush(&db, "drop-all-wal-floor");
-        db.put(b"unflushed", b"old").unwrap();
+        crate::through_stalls(|| db.put(b"unflushed", b"old")).unwrap();
         db.drop_all().unwrap();
         drop(db);
 
@@ -3540,10 +3868,10 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let db = Db::open(dir.path(), tiny_flush_opts()).unwrap();
 
-        db.put(b"key", b"v1").unwrap();
+        crate::through_stalls(|| db.put(b"key", b"v1")).unwrap();
         let snap = db.snapshot();
 
-        db.put(b"key", b"v2").unwrap();
+        crate::through_stalls(|| db.put(b"key", b"v2")).unwrap();
         force_flush(&db, "snap");
 
         assert_eq!(snap.get(b"key").unwrap(), Some(b"v1".to_vec()));
@@ -3555,10 +3883,10 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let db = Db::open(dir.path(), tiny_flush_opts()).unwrap();
 
-        db.put(b"key", b"v1").unwrap();
+        crate::through_stalls(|| db.put(b"key", b"v1")).unwrap();
         force_flush(&db, "a");
 
-        db.delete(b"key").unwrap();
+        crate::through_stalls(|| db.delete(b"key")).unwrap();
         force_flush(&db, "b");
 
         assert_eq!(db.get(b"key").unwrap(), None);
@@ -3760,13 +4088,13 @@ mod tests {
 
         for i in 0..10 {
             let k = format!("old{:02}", i);
-            db.put(k.as_bytes(), b"old").unwrap();
+            crate::through_stalls(|| db.put(k.as_bytes(), b"old")).unwrap();
         }
         force_flush(&db, "to-l0");
 
         for i in 0..5 {
             let k = format!("new{:02}", i);
-            db.put(k.as_bytes(), b"new").unwrap();
+            crate::through_stalls(|| db.put(k.as_bytes(), b"new")).unwrap();
         }
 
         let items = collect_iter(&db);
@@ -3786,11 +4114,11 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let db = Db::open(dir.path(), tiny_flush_opts()).unwrap();
 
-        db.put(b"kept", b"v1").unwrap();
-        db.put(b"gone", b"v1").unwrap();
+        crate::through_stalls(|| db.put(b"kept", b"v1")).unwrap();
+        crate::through_stalls(|| db.put(b"gone", b"v1")).unwrap();
         force_flush(&db, "a");
 
-        db.delete(b"gone").unwrap();
+        crate::through_stalls(|| db.delete(b"gone")).unwrap();
 
         let items = collect_iter(&db);
         let keys: Vec<_> = items.iter().map(|(k, _)| k.clone()).collect();
@@ -3803,9 +4131,9 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let db = Db::open(dir.path(), tiny_flush_opts()).unwrap();
 
-        db.put(b"k", b"v1").unwrap();
+        crate::through_stalls(|| db.put(b"k", b"v1")).unwrap();
         force_flush(&db, "a");
-        db.put(b"k", b"v2").unwrap();
+        crate::through_stalls(|| db.put(b"k", b"v2")).unwrap();
 
         let mut it = db.iter();
         it.seek(b"k");
@@ -3871,7 +4199,10 @@ mod tests {
         const N: usize = 10_000;
         for i in 0..N {
             let k = format!("key_{:06}", i);
-            db.put(k.as_bytes(), b"v").unwrap();
+            // Ten thousand writes into a 4 KiB buffer can outrun the
+            // worker's compactions and meet the L0 stop, which a write
+            // reports rather than waits out; this test is about the scan.
+            through_stalls(|| db.put(k.as_bytes(), b"v")).unwrap();
         }
 
         let mut it = db.iter();
@@ -3909,10 +4240,10 @@ mod tests {
         let db = Db::open(dir.path(), tiny_flush_opts()).unwrap();
 
         for v in 0..10 {
-            db.put(b"k", format!("v{}", v).as_bytes()).unwrap();
+            crate::through_stalls(|| db.put(b"k", format!("v{}", v).as_bytes())).unwrap();
         }
 
-        db.compact_range(None, None).unwrap();
+        db.compact_range(None, None).wait().unwrap();
 
         let versions = all_versions_of(&db, b"k");
         assert_eq!(
@@ -3932,17 +4263,17 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let db = Db::open(dir.path(), tiny_flush_opts()).unwrap();
 
-        db.put(b"k", b"v1").unwrap();
-        db.put(b"k", b"v2").unwrap();
-        db.put(b"k", b"v3").unwrap();
+        crate::through_stalls(|| db.put(b"k", b"v1")).unwrap();
+        crate::through_stalls(|| db.put(b"k", b"v2")).unwrap();
+        crate::through_stalls(|| db.put(b"k", b"v3")).unwrap();
         let snap = db.snapshot();
         // `snap` now pins seq=3 - the snapshot sees v3.
 
         for v in 4..10 {
-            db.put(b"k", format!("v{}", v).as_bytes()).unwrap();
+            crate::through_stalls(|| db.put(b"k", format!("v{}", v).as_bytes())).unwrap();
         }
 
-        db.compact_range(None, None).unwrap();
+        db.compact_range(None, None).wait().unwrap();
 
         assert_eq!(snap.get(b"k").unwrap(), Some(b"v3".to_vec()));
         assert_eq!(db.get(b"k").unwrap(), Some(b"v9".to_vec()));
@@ -3957,7 +4288,7 @@ mod tests {
         let db = Db::open(dir.path(), tiny_flush_opts()).unwrap();
 
         for v in 0..5 {
-            db.put(b"k", format!("v{}", v).as_bytes()).unwrap();
+            crate::through_stalls(|| db.put(b"k", format!("v{}", v).as_bytes())).unwrap();
         }
 
         {
@@ -3968,10 +4299,10 @@ mod tests {
         assert_eq!(db.engine.oldest_live_seq(), u64::MAX);
 
         for v in 5..10 {
-            db.put(b"k", format!("v{}", v).as_bytes()).unwrap();
+            crate::through_stalls(|| db.put(b"k", format!("v{}", v).as_bytes())).unwrap();
         }
 
-        db.compact_range(None, None).unwrap();
+        db.compact_range(None, None).wait().unwrap();
 
         let versions = all_versions_of(&db, b"k");
         assert_eq!(versions.len(), 1);
@@ -3986,16 +4317,16 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let db = Db::open(dir.path(), tiny_flush_opts()).unwrap();
 
-        db.put(b"k", b"v1").unwrap();
-        db.put(b"k", b"v2").unwrap();
+        crate::through_stalls(|| db.put(b"k", b"v1")).unwrap();
+        crate::through_stalls(|| db.put(b"k", b"v2")).unwrap();
         let old_snap = db.snapshot(); // pins seq 2
-        db.put(b"k", b"v3").unwrap();
-        db.put(b"k", b"v4").unwrap();
+        crate::through_stalls(|| db.put(b"k", b"v3")).unwrap();
+        crate::through_stalls(|| db.put(b"k", b"v4")).unwrap();
         let new_snap = db.snapshot(); // pins seq 4
-        db.put(b"k", b"v5").unwrap();
-        db.put(b"k", b"v6").unwrap();
+        crate::through_stalls(|| db.put(b"k", b"v5")).unwrap();
+        crate::through_stalls(|| db.put(b"k", b"v6")).unwrap();
 
-        db.compact_range(None, None).unwrap();
+        db.compact_range(None, None).wait().unwrap();
 
         // Both snapshots must still return their respective versions.
         assert_eq!(old_snap.get(b"k").unwrap(), Some(b"v2".to_vec()));
@@ -4006,19 +4337,23 @@ mod tests {
     #[test]
     fn test_gc_preserves_tombstone_hiding_older_entries() {
         // A tombstone newer than any live snapshot still needs to
-        // survive compaction - it's the newest version and reads
-        // must resolve to "deleted".
+        // survive compaction while it hides an older version that
+        // survives with it: here one a snapshot below it keeps, which
+        // reads must still resolve to "deleted" at the head. With
+        // nothing left beneath it, it retires (E27).
         let dir = TempDir::new().unwrap();
         let db = Db::open(dir.path(), tiny_flush_opts()).unwrap();
 
         for v in 0..5 {
-            db.put(b"k", format!("v{}", v).as_bytes()).unwrap();
+            crate::through_stalls(|| db.put(b"k", format!("v{}", v).as_bytes())).unwrap();
         }
-        db.delete(b"k").unwrap();
+        let before = db.snapshot();
+        crate::through_stalls(|| db.delete(b"k")).unwrap();
 
-        db.compact_range(None, None).unwrap();
+        db.compact_range(None, None).wait().unwrap();
 
         assert_eq!(db.get(b"k").unwrap(), None);
+        assert_eq!(before.get(b"k").unwrap(), Some(b"v4".to_vec()));
 
         // The newest surviving version is a tombstone - look for it
         // on disk.
@@ -4035,11 +4370,11 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let db = Db::open(dir.path(), tiny_flush_opts()).unwrap();
 
-        db.put(b"k", b"old").unwrap();
+        crate::through_stalls(|| db.put(b"k", b"old")).unwrap();
         let snap = db.snapshot();
-        db.delete_range(b"a", b"z").unwrap();
+        crate::through_stalls(|| db.delete_range(b"a", b"z")).unwrap();
 
-        db.compact_range(None, None).unwrap();
+        db.compact_range(None, None).wait().unwrap();
 
         assert_eq!(snap.get(b"k").unwrap(), Some(b"old".to_vec()));
         assert_eq!(db.get(b"k").unwrap(), None);
@@ -4055,15 +4390,17 @@ mod tests {
 
         for i in 0..200 {
             for v in 0..3 {
-                db.put(
-                    format!("k{:03}", i).as_bytes(),
-                    format!("v{}_{}", i, v).as_bytes(),
-                )
+                crate::through_stalls(|| {
+                    db.put(
+                        format!("k{:03}", i).as_bytes(),
+                        format!("v{}_{}", i, v).as_bytes(),
+                    )
+                })
                 .unwrap();
             }
         }
 
-        db.compact_range(None, None).unwrap();
+        db.compact_range(None, None).wait().unwrap();
 
         for i in 0..200 {
             let k = format!("k{:03}", i);
@@ -4090,7 +4427,7 @@ mod tests {
     fn test_compact_range_empty_db() {
         let (db, _dir) = open_tmp();
         // No data, no files. compact_range is a no-op and must succeed.
-        db.compact_range(None, None).unwrap();
+        db.compact_range(None, None).wait().unwrap();
         assert_eq!(total_file_count(&db), 0);
     }
 
@@ -4101,10 +4438,10 @@ mod tests {
 
         for i in 0..500 {
             let k = format!("k{:04}", i);
-            db.put(k.as_bytes(), format!("v{}", i).as_bytes()).unwrap();
+            crate::through_stalls(|| db.put(k.as_bytes(), format!("v{}", i).as_bytes())).unwrap();
         }
 
-        db.compact_range(None, None).unwrap();
+        db.compact_range(None, None).wait().unwrap();
 
         // Every key is still readable after the compaction.
         for i in 0..500 {
@@ -4128,7 +4465,7 @@ mod tests {
         }
         assert!(!db.engine.active_memtable_is_empty());
 
-        db.compact_range(None, None).unwrap();
+        db.compact_range(None, None).wait().unwrap();
 
         assert!(db.engine.active_memtable_is_empty());
         // And data is still readable through the SSTable path.
@@ -4147,10 +4484,10 @@ mod tests {
 
         for i in 0..200 {
             let k = format!("k{:04}", i);
-            db.put(k.as_bytes(), b"v").unwrap();
+            crate::through_stalls(|| db.put(k.as_bytes(), b"v")).unwrap();
         }
 
-        db.compact_range(None, None).unwrap();
+        db.compact_range(None, None).wait().unwrap();
 
         assert_eq!(level_file_count(&db, 0), 0);
         // Some higher level must hold the data.
@@ -4164,17 +4501,17 @@ mod tests {
 
         // Three disjoint ranges: low (a*), mid (m*), high (z*).
         for i in 0..100 {
-            db.put(format!("a{:03}", i).as_bytes(), b"a").unwrap();
+            crate::through_stalls(|| db.put(format!("a{:03}", i).as_bytes(), b"a")).unwrap();
         }
         for i in 0..100 {
-            db.put(format!("m{:03}", i).as_bytes(), b"m").unwrap();
+            crate::through_stalls(|| db.put(format!("m{:03}", i).as_bytes(), b"m")).unwrap();
         }
         for i in 0..100 {
-            db.put(format!("z{:03}", i).as_bytes(), b"z").unwrap();
+            crate::through_stalls(|| db.put(format!("z{:03}", i).as_bytes(), b"z")).unwrap();
         }
 
         // Only compact the mid range.
-        db.compact_range(Some(b"m"), Some(b"n")).unwrap();
+        db.compact_range(Some(b"m"), Some(b"n")).wait().unwrap();
 
         // Every key must still be readable regardless of the range.
         for i in 0..100 {
@@ -4196,23 +4533,21 @@ mod tests {
     #[test]
     fn test_compact_range_bounded_compacts_default_cf_files() {
         let dir = TempDir::new().unwrap();
-        let opts = Options {
-            write_buffer_size: 4 * 1024,
-            l0_compaction_trigger: 1_000,
-            ..Options::default()
-        };
+        let opts = Options::default()
+            .write_buffer_size(4 * 1024)
+            .l0_compaction_trigger(1_000);
         let db = Db::open(dir.path(), opts).unwrap();
         let payload = vec![0u8; 512];
 
         for i in 0..32 {
-            db.put(format!("m{i:04}").as_bytes(), &payload).unwrap();
+            crate::through_stalls(|| db.put(format!("m{i:04}").as_bytes(), &payload)).unwrap();
         }
         force_flush_with_prefix(&db, "m_flush");
 
         let l0_before = level_file_count(&db, 0);
         assert!(l0_before > 0);
 
-        db.compact_range(Some(b"m"), Some(b"n")).unwrap();
+        db.compact_range(Some(b"m"), Some(b"n")).wait().unwrap();
 
         assert_eq!(level_file_count(&db, 0), 0);
         assert!(total_file_count(&db) > 0);
@@ -4230,14 +4565,14 @@ mod tests {
 
         for i in 0..200 {
             let k = format!("k{:03}", i);
-            db.put(k.as_bytes(), b"v1").unwrap();
+            crate::through_stalls(|| db.put(k.as_bytes(), b"v1")).unwrap();
         }
         for i in 0..200 {
             let k = format!("k{:03}", i);
-            db.put(k.as_bytes(), b"v2").unwrap();
+            crate::through_stalls(|| db.put(k.as_bytes(), b"v2")).unwrap();
         }
 
-        db.compact_range(None, None).unwrap();
+        db.compact_range(None, None).wait().unwrap();
 
         for i in 0..200 {
             let k = format!("k{:03}", i);
@@ -4256,10 +4591,10 @@ mod tests {
         const N: usize = 2_000;
         for i in 0..N {
             let k = format!("key_{:05}", i);
-            db.put(k.as_bytes(), b"v").unwrap();
+            crate::through_stalls(|| db.put(k.as_bytes(), b"v")).unwrap();
         }
 
-        db.compact_range(None, None).unwrap();
+        db.compact_range(None, None).wait().unwrap();
 
         // After the foreground compaction, every key is still there.
         for i in 0..N {
@@ -4276,10 +4611,10 @@ mod tests {
 
         for i in 0..300 {
             let k = format!("k{:04}", i);
-            db.put(k.as_bytes(), b"v").unwrap();
+            crate::through_stalls(|| db.put(k.as_bytes(), b"v")).unwrap();
         }
 
-        db.compact_range(None, None).unwrap();
+        db.compact_range(None, None).wait().unwrap();
 
         let mut it = db.iter();
         it.seek_to_first();
@@ -4303,15 +4638,15 @@ mod tests {
 
         for i in 0..50 {
             let k = format!("k{:02}", i);
-            db.put(k.as_bytes(), b"v").unwrap();
+            crate::through_stalls(|| db.put(k.as_bytes(), b"v")).unwrap();
         }
         // Delete half of them.
         for i in (0..50).step_by(2) {
             let k = format!("k{:02}", i);
-            db.delete(k.as_bytes()).unwrap();
+            crate::through_stalls(|| db.delete(k.as_bytes())).unwrap();
         }
 
-        db.compact_range(None, None).unwrap();
+        db.compact_range(None, None).wait().unwrap();
 
         for i in 0..50 {
             let k = format!("k{:02}", i);
@@ -4329,14 +4664,14 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let db = Db::open(dir.path(), tiny_flush_opts()).unwrap();
 
-        db.put(b"b", b"old").unwrap();
+        crate::through_stalls(|| db.put(b"b", b"old")).unwrap();
         force_flush_with_prefix(&db, "__old_flush");
-        db.compact_range(None, None).unwrap();
+        db.compact_range(None, None).wait().unwrap();
 
-        db.delete_range(b"a", b"z").unwrap();
-        db.put(b"m", b"new").unwrap();
+        crate::through_stalls(|| db.delete_range(b"a", b"z")).unwrap();
+        crate::through_stalls(|| db.put(b"m", b"new")).unwrap();
         force_flush_with_prefix(&db, "zz_new_flush");
-        db.compact_range(None, None).unwrap();
+        db.compact_range(None, None).wait().unwrap();
 
         assert_eq!(db.get(b"b").unwrap(), None);
         assert_eq!(db.get(b"m").unwrap(), Some(b"new".to_vec()));
@@ -4347,17 +4682,21 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let db = Db::open(dir.path(), tiny_flush_opts()).unwrap();
 
-        db.put(b"b", b"old-left").unwrap();
-        db.put(b"y", b"old-right").unwrap();
-        db.compact_range(None, None).unwrap();
+        crate::through_stalls(|| db.put(b"b", b"old-left")).unwrap();
+        crate::through_stalls(|| db.put(b"y", b"old-right")).unwrap();
+        db.compact_range(None, None).wait().unwrap();
 
-        db.delete_range(b"a", b"z").unwrap();
-        db.put(b"m", b"new").unwrap();
-        db.compact_range(None, None).unwrap();
+        // A snapshot older than the tombstone holds it at the bottom level,
+        // where it would otherwise retire (E27), so the pass writes it out.
+        let before = db.snapshot();
+        crate::through_stalls(|| db.delete_range(b"a", b"z")).unwrap();
+        crate::through_stalls(|| db.put(b"m", b"new")).unwrap();
+        db.compact_range(None, None).wait().unwrap();
 
         assert_eq!(db.get(b"b").unwrap(), None);
         assert_eq!(db.get(b"m").unwrap(), Some(b"new".to_vec()));
         assert_eq!(db.get(b"y").unwrap(), None);
+        assert_eq!(before.get(b"b").unwrap(), Some(b"old-left".to_vec()));
 
         let version = db.engine.current_version();
         let rt_only_files = version
@@ -4486,10 +4825,10 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let db = Db::open(dir.path(), tiny_flush_opts()).unwrap();
 
-        db.put(b"keep", b"v").unwrap();
-        db.put(b"gone", b"v").unwrap();
+        crate::through_stalls(|| db.put(b"keep", b"v")).unwrap();
+        crate::through_stalls(|| db.put(b"gone", b"v")).unwrap();
         force_flush(&db, "x");
-        db.delete(b"gone").unwrap();
+        crate::through_stalls(|| db.delete(b"gone")).unwrap();
 
         let keys: &[&[u8]] = &[b"keep", b"gone"];
         let results = db.multi_get(keys).unwrap();
@@ -4501,12 +4840,12 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let db = Db::open(dir.path(), tiny_flush_opts()).unwrap();
 
-        db.put(b"from_l0_1", b"v1").unwrap();
-        db.put(b"from_l0_2", b"v2").unwrap();
+        crate::through_stalls(|| db.put(b"from_l0_1", b"v1")).unwrap();
+        crate::through_stalls(|| db.put(b"from_l0_2", b"v2")).unwrap();
         force_flush(&db, "x");
 
-        db.put(b"from_mem_1", b"v3").unwrap();
-        db.put(b"from_mem_2", b"v4").unwrap();
+        crate::through_stalls(|| db.put(b"from_mem_1", b"v3")).unwrap();
+        crate::through_stalls(|| db.put(b"from_mem_2", b"v4")).unwrap();
 
         let keys: &[&[u8]] = &[b"from_mem_1", b"from_l0_1", b"from_mem_2", b"from_l0_2"];
         let results = db.multi_get(keys).unwrap();
@@ -4550,12 +4889,12 @@ mod tests {
 
         for i in 0..500 {
             let k = format!("k{:04}", i);
-            db.put(k.as_bytes(), format!("v{}", i).as_bytes()).unwrap();
+            crate::through_stalls(|| db.put(k.as_bytes(), format!("v{}", i).as_bytes())).unwrap();
         }
         // Delete some.
         for i in (0..500).step_by(7) {
             let k = format!("k{:04}", i);
-            db.delete(k.as_bytes()).unwrap();
+            crate::through_stalls(|| db.delete(k.as_bytes())).unwrap();
         }
 
         // Snapshot so individual gets and multi_get see the same thing.
@@ -4583,7 +4922,7 @@ mod tests {
         const N: usize = 2_000;
         for i in 0..N {
             let k = format!("key_{:05}", i);
-            db.put(k.as_bytes(), b"v").unwrap();
+            crate::through_stalls(|| db.put(k.as_bytes(), b"v")).unwrap();
         }
 
         let keys_owned: Vec<String> = (0..N).map(|i| format!("key_{:05}", i)).collect();
@@ -4603,11 +4942,11 @@ mod tests {
         for i in 0..30 {
             let key = format!("k{:02}", i);
             let value = format!("v{:02}", i);
-            db.put(key.as_bytes(), value.as_bytes()).unwrap();
+            crate::through_stalls(|| db.put(key.as_bytes(), value.as_bytes())).unwrap();
         }
         force_flush(&db, "base");
-        db.delete_range(b"k10", b"k20").unwrap();
-        db.compact_range(None, None).unwrap();
+        crate::through_stalls(|| db.delete_range(b"k10", b"k20")).unwrap();
+        db.compact_range(None, None).wait().unwrap();
 
         let version = db.engine.current_version();
         assert!(
@@ -4713,12 +5052,12 @@ mod tests {
 
         for i in 0..20 {
             let k = format!("k{:02}", i);
-            db.put(k.as_bytes(), b"v").unwrap();
+            crate::through_stalls(|| db.put(k.as_bytes(), b"v")).unwrap();
         }
         force_flush(&db, "a");
         for i in 20..30 {
             let k = format!("k{:02}", i);
-            db.put(k.as_bytes(), b"v").unwrap();
+            crate::through_stalls(|| db.put(k.as_bytes(), b"v")).unwrap();
         }
 
         let items = collect_reverse(&db);
@@ -4738,10 +5077,10 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let db = Db::open(dir.path(), tiny_flush_opts()).unwrap();
 
-        db.put(b"keep", b"v").unwrap();
-        db.put(b"gone", b"v").unwrap();
+        crate::through_stalls(|| db.put(b"keep", b"v")).unwrap();
+        crate::through_stalls(|| db.put(b"gone", b"v")).unwrap();
         force_flush(&db, "a");
-        db.delete(b"gone").unwrap();
+        crate::through_stalls(|| db.delete(b"gone")).unwrap();
 
         let items = collect_reverse(&db);
         let keys: Vec<_> = items.iter().map(|(k, _)| k.clone()).collect();
@@ -4816,7 +5155,10 @@ mod tests {
         const N: usize = 10_000;
         for i in 0..N {
             let k = format!("key_{:06}", i);
-            db.put(k.as_bytes(), b"v").unwrap();
+            // Ten thousand writes into a 4 KiB buffer can outrun the
+            // worker's compactions and meet the L0 stop, which a write
+            // reports rather than waits out; this test is about the scan.
+            through_stalls(|| db.put(k.as_bytes(), b"v")).unwrap();
         }
 
         let mut it = db.iter();
@@ -4852,16 +5194,14 @@ mod tests {
         // then reopens and runs `seek_for_prev` with a target larger
         // than every key.
         let dir = TempDir::new().unwrap();
-        let opts = Options {
-            block_size: 128,
-            write_buffer_size: 64 * 1024,
-            ..Options::default()
-        };
+        let opts = Options::default()
+            .block_size(128)
+            .write_buffer_size(64 * 1024);
         {
             let db = Db::open(dir.path(), opts.clone()).unwrap();
             for i in 0..60u32 {
                 let k = format!("k{:03}", i);
-                db.put(k.as_bytes(), b"v").unwrap();
+                crate::through_stalls(|| db.put(k.as_bytes(), b"v")).unwrap();
             }
             db.close().unwrap();
         }
@@ -4885,11 +5225,11 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let db = Db::open(dir.path(), tiny_flush_opts()).unwrap();
 
-        db.put(b"a", b"a1").unwrap();
-        db.put(b"b", b"b1").unwrap();
-        db.put(b"c", b"c1").unwrap();
+        crate::through_stalls(|| db.put(b"a", b"a1")).unwrap();
+        crate::through_stalls(|| db.put(b"b", b"b1")).unwrap();
+        crate::through_stalls(|| db.put(b"c", b"c1")).unwrap();
         force_flush(&db, "x");
-        db.delete(b"b").unwrap();
+        crate::through_stalls(|| db.delete(b"b")).unwrap();
 
         let mut it = db.iter();
         it.seek_for_prev(b"b");
@@ -4909,7 +5249,7 @@ mod tests {
 
         for i in 0..20 {
             let k = format!("pin{:03}", i);
-            db.put(k.as_bytes(), b"v").unwrap();
+            crate::through_stalls(|| db.put(k.as_bytes(), b"v")).unwrap();
         }
         force_flush(&db, "pinned");
 
@@ -5012,9 +5352,9 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let db = Db::open(dir.path(), tiny_flush_opts()).unwrap();
         for i in 0..20 {
-            db.put(format!("key_{:02}", i).as_bytes(), b"v").unwrap();
+            crate::through_stalls(|| db.put(format!("key_{:02}", i).as_bytes(), b"v")).unwrap();
         }
-        db.delete_range(b"key_05", b"key_15").unwrap();
+        crate::through_stalls(|| db.delete_range(b"key_05", b"key_15")).unwrap();
         force_flush(&db, "rt");
         for i in 0..20 {
             let key = format!("key_{:02}", i);
@@ -5032,14 +5372,14 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let db = Db::open(dir.path(), tiny_flush_opts()).unwrap();
         for i in 0..30 {
-            db.put(format!("key_{:02}", i).as_bytes(), b"v").unwrap();
+            crate::through_stalls(|| db.put(format!("key_{:02}", i).as_bytes(), b"v")).unwrap();
         }
-        db.delete_range(b"key_10", b"key_20").unwrap();
+        crate::through_stalls(|| db.delete_range(b"key_10", b"key_20")).unwrap();
         // Force several flushes + a manual compaction down to L1+.
         for tag in 0..6 {
             force_flush(&db, &format!("c{}", tag));
         }
-        db.compact_range(None, None).unwrap();
+        db.compact_range(None, None).wait().unwrap();
 
         for i in 0..30 {
             let key = format!("key_{:02}", i);
@@ -5209,11 +5549,9 @@ mod tests {
     // ── compression codecs ──────────────────────────────────────────────────
 
     fn compression_opts(codec: CompressionType) -> Options {
-        Options {
-            write_buffer_size: 4 * 1024,
-            compression: codec,
-            ..Options::default()
-        }
+        Options::default()
+            .write_buffer_size(4 * 1024)
+            .compression(codec)
     }
 
     fn write_and_read_back(opts: Options) {
@@ -5223,7 +5561,7 @@ mod tests {
             let db = Db::open(dir.path(), opts.clone()).unwrap();
             for i in 0..200 {
                 let key = format!("key_{:04}", i);
-                db.put(key.as_bytes(), &payload).unwrap();
+                crate::through_stalls(|| db.put(key.as_bytes(), &payload)).unwrap();
             }
             // Force a flush so reads must go through the SSTable codec path.
             force_flush(&db, "comp");
@@ -5270,26 +5608,24 @@ mod tests {
         // database must hold blocks compressed with both codecs and
         // still read back correctly.
         let dir = TempDir::new().unwrap();
-        let opts = Options {
-            write_buffer_size: 4 * 1024,
-            compression: CompressionType::Lz4,
-            compression_per_level: Some(vec![
+        let opts = Options::default()
+            .write_buffer_size(4 * 1024)
+            .compression(CompressionType::Lz4)
+            .compression_per_level(Some(vec![
                 CompressionType::Snappy, // L0
                 CompressionType::Lz4,    // L1
                 CompressionType::None,   // L2 (unused here, just to exercise the slot)
-            ]),
-            ..Options::default()
-        };
+            ]));
         let payload: Vec<u8> = (0..256).map(|i| (i % 17) as u8).collect();
         {
             let db = Db::open(dir.path(), opts.clone()).unwrap();
             for i in 0..300 {
                 let key = format!("k_{:04}", i);
-                db.put(key.as_bytes(), &payload).unwrap();
+                crate::through_stalls(|| db.put(key.as_bytes(), &payload)).unwrap();
             }
             force_flush(&db, "mix");
             // Push everything down to L1 with the manual compaction path.
-            db.compact_range(None, None).unwrap();
+            db.compact_range(None, None).wait().unwrap();
             for i in 0..300 {
                 let key = format!("k_{:04}", i);
                 assert_eq!(
@@ -5315,18 +5651,16 @@ mod tests {
     fn test_compression_per_level_falls_back_to_default() {
         // Override only L0; L1+ should fall back to `compression`.
         let dir = TempDir::new().unwrap();
-        let opts = Options {
-            write_buffer_size: 4 * 1024,
-            compression: CompressionType::Snappy,
-            compression_per_level: Some(vec![CompressionType::None]),
-            ..Options::default()
-        };
+        let opts = Options::default()
+            .write_buffer_size(4 * 1024)
+            .compression(CompressionType::Snappy)
+            .compression_per_level(Some(vec![CompressionType::None]));
         let db = Db::open(dir.path(), opts).unwrap();
         for i in 0..50 {
-            db.put(format!("k_{i:03}").as_bytes(), b"v").unwrap();
+            crate::through_stalls(|| db.put(format!("k_{i:03}").as_bytes(), b"v")).unwrap();
         }
         force_flush(&db, "fb");
-        db.compact_range(None, None).unwrap();
+        db.compact_range(None, None).wait().unwrap();
         for i in 0..50 {
             assert_eq!(
                 db.get(format!("k_{i:03}").as_bytes()).unwrap(),
@@ -5403,21 +5737,19 @@ mod tests {
         let filter = Arc::new(DropOddKeysFilter {
             calls: AtomicUsize::new(0),
         });
-        let opts = Options {
-            write_buffer_size: 4 * 1024,
-            compaction_filter: Some(filter.clone()),
-            ..Options::default()
-        };
+        let opts = Options::default()
+            .write_buffer_size(4 * 1024)
+            .compaction_filter(Some(filter.clone()));
         let db = Db::open(dir.path(), opts).unwrap();
         // 20 keys: k0..k9 written twice so compaction has work. Use
         // longer payloads so the tiny write buffer triggers flushes.
         let payload = vec![b'v'; 512];
         for _round in 0..4 {
             for i in 0..10 {
-                db.put(format!("k{i}").as_bytes(), &payload).unwrap();
+                crate::through_stalls(|| db.put(format!("k{i}").as_bytes(), &payload)).unwrap();
             }
         }
-        db.compact_range(None, None).unwrap();
+        db.compact_range(None, None).wait().unwrap();
 
         // After compaction, odd-suffix keys are gone.
         for i in 0..10 {
@@ -5437,19 +5769,17 @@ mod tests {
     #[test]
     fn test_compaction_filter_rewrites_values() {
         let dir = TempDir::new().unwrap();
-        let opts = Options {
-            write_buffer_size: 4 * 1024,
-            compaction_filter: Some(Arc::new(UppercaseValuesFilter)),
-            ..Options::default()
-        };
+        let opts = Options::default()
+            .write_buffer_size(4 * 1024)
+            .compaction_filter(Some(Arc::new(UppercaseValuesFilter)));
         let db = Db::open(dir.path(), opts).unwrap();
         for i in 0..20 {
-            db.put(format!("k{i:02}").as_bytes(), b"hello world")
+            crate::through_stalls(|| db.put(format!("k{i:02}").as_bytes(), b"hello world"))
                 .unwrap();
         }
         // Force enough flushes + manual compaction to run the filter.
         force_flush(&db, "filter");
-        db.compact_range(None, None).unwrap();
+        db.compact_range(None, None).wait().unwrap();
 
         for i in 0..20 {
             assert_eq!(
@@ -5462,21 +5792,19 @@ mod tests {
     #[test]
     fn test_compaction_filter_runs_in_every_snapshot_stripe() {
         let dir = TempDir::new().unwrap();
-        let opts = Options {
-            write_buffer_size: 4 * 1024,
-            compaction_filter: Some(Arc::new(UppercaseValuesFilter)),
-            ..Options::default()
-        };
+        let opts = Options::default()
+            .write_buffer_size(4 * 1024)
+            .compaction_filter(Some(Arc::new(UppercaseValuesFilter)));
         let db = Db::open(dir.path(), opts).unwrap();
         for i in 0..20 {
-            db.put(format!("k{i:02}").as_bytes(), b"hello").unwrap();
+            crate::through_stalls(|| db.put(format!("k{i:02}").as_bytes(), b"hello")).unwrap();
         }
         let snap = db.snapshot();
         for i in 0..20 {
-            db.put(format!("k{i:02}").as_bytes(), b"world").unwrap();
+            crate::through_stalls(|| db.put(format!("k{i:02}").as_bytes(), b"world")).unwrap();
         }
         force_flush(&db, "snap_filter");
-        db.compact_range(None, None).unwrap();
+        db.compact_range(None, None).wait().unwrap();
 
         // Compaction keeps one version per side of the snapshot, and
         // the filter runs on both: the snapshot reads its own version,
@@ -5491,23 +5819,21 @@ mod tests {
     #[test]
     fn test_compaction_filter_drops_range_tombstones() {
         let dir = TempDir::new().unwrap();
-        let opts = Options {
-            write_buffer_size: 4 * 1024,
-            compaction_filter: Some(Arc::new(DropRangeTombstonesFilter)),
-            ..Options::default()
-        };
+        let opts = Options::default()
+            .write_buffer_size(4 * 1024)
+            .compaction_filter(Some(Arc::new(DropRangeTombstonesFilter)));
         let db = Db::open(dir.path(), opts).unwrap();
         for c in b'a'..=b'f' {
-            db.put(&[c], &[c]).unwrap();
+            crate::through_stalls(|| db.put(&[c], &[c])).unwrap();
         }
-        db.delete_range(b"b", b"e").unwrap();
+        crate::through_stalls(|| db.delete_range(b"b", b"e")).unwrap();
         // Before compaction, the range-delete is honored - no snapshot
         // pinning, so the read path sees the memtable RT directly.
         for c in b'b'..=b'd' {
             assert_eq!(db.get(&[c]).unwrap(), None);
         }
         force_flush(&db, "drop_rt");
-        db.compact_range(None, None).unwrap();
+        db.compact_range(None, None).wait().unwrap();
 
         // After compaction the filter dropped the RT, so the original
         // values come back (they were never actually overwritten).
@@ -5522,11 +5848,9 @@ mod tests {
     }
 
     fn prefix_opts() -> Options {
-        Options {
-            write_buffer_size: 4 * 1024,
-            prefix_extractor: Some(std::sync::Arc::new(FixedLengthPrefix(10))),
-            ..Options::default()
-        }
+        Options::default()
+            .write_buffer_size(4 * 1024)
+            .prefix_extractor(Some(std::sync::Arc::new(FixedLengthPrefix(10))))
     }
 
     #[test]
@@ -5559,7 +5883,7 @@ mod tests {
         let db = Db::open(dir.path(), prefix_opts()).unwrap();
         for i in 0..200 {
             let key = format!("tenant_001:k{:04}", i);
-            db.put(key.as_bytes(), b"v").unwrap();
+            crate::through_stalls(|| db.put(key.as_bytes(), b"v")).unwrap();
         }
         force_flush(&db, "p");
 
@@ -5574,19 +5898,17 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let db = Db::open(
             dir.path(),
-            Options {
-                write_buffer_size: 4 * 1024,
-                l0_compaction_trigger: 1_000,
-                bloom_bits_per_key: 64,
-                prefix_extractor: Some(Arc::new(FixedLengthPrefix(8))),
-                statistics: Some(stats.clone()),
-                ..Options::default()
-            },
+            Options::default()
+                .write_buffer_size(4 * 1024)
+                .l0_compaction_trigger(1_000)
+                .bloom_bits_per_key(64)
+                .prefix_extractor(Some(Arc::new(FixedLengthPrefix(8))))
+                .statistics(Some(stats.clone())),
         )
         .unwrap();
 
-        db.put(b"aaaa:item", b"v").unwrap();
-        db.put(b"zzzz:item", b"v").unwrap();
+        crate::through_stalls(|| db.put(b"aaaa:item", b"v")).unwrap();
+        crate::through_stalls(|| db.put(b"zzzz:item", b"v")).unwrap();
         force_flush(&db, "long_prefix_probe");
 
         stats.reset();
@@ -5607,13 +5929,13 @@ mod tests {
         let db = Db::open(dir.path(), prefix_opts()).unwrap();
 
         // First generation → flushed to L0.
-        db.put(b"tenant_001:a", b"1a").unwrap();
-        db.put(b"tenant_002:a", b"2a").unwrap();
+        crate::through_stalls(|| db.put(b"tenant_001:a", b"1a")).unwrap();
+        crate::through_stalls(|| db.put(b"tenant_002:a", b"2a")).unwrap();
         force_flush(&db, "p1");
 
         // Second generation → stays in memtable at iteration time.
-        db.put(b"tenant_001:b", b"1b").unwrap();
-        db.put(b"tenant_002:b", b"2b").unwrap();
+        crate::through_stalls(|| db.put(b"tenant_001:b", b"1b")).unwrap();
+        crate::through_stalls(|| db.put(b"tenant_002:b", b"2b")).unwrap();
 
         let mut it = db.iter();
         it.seek_prefix(b"tenant_001");
@@ -5634,13 +5956,13 @@ mod tests {
         let db = Db::open(dir.path(), prefix_opts()).unwrap();
 
         for i in 0..50 {
-            db.put(format!("tenant_001:{:04}", i).as_bytes(), b"v")
+            crate::through_stalls(|| db.put(format!("tenant_001:{:04}", i).as_bytes(), b"v"))
                 .unwrap();
-            db.put(format!("tenant_002:{:04}", i).as_bytes(), b"v")
+            crate::through_stalls(|| db.put(format!("tenant_002:{:04}", i).as_bytes(), b"v"))
                 .unwrap();
         }
         force_flush(&db, "c1");
-        db.compact_range(None, None).unwrap();
+        db.compact_range(None, None).wait().unwrap();
 
         let mut it = db.iter();
         it.seek_prefix(b"tenant_002");
@@ -5667,21 +5989,14 @@ mod tests {
         // files.
         let dir = TempDir::new().unwrap();
         {
-            let db = Db::open(
-                dir.path(),
-                Options {
-                    write_buffer_size: 4 * 1024,
-                    ..Options::default()
-                },
-            )
-            .unwrap();
-            db.put(b"tenant_001:old", b"old").unwrap();
+            let db = Db::open(dir.path(), Options::default().write_buffer_size(4 * 1024)).unwrap();
+            crate::through_stalls(|| db.put(b"tenant_001:old", b"old")).unwrap();
             force_flush(&db, "a");
         }
 
         let db = Db::open(dir.path(), prefix_opts()).unwrap();
-        db.put(b"tenant_001:new", b"new").unwrap();
-        db.put(b"tenant_002:new", b"new").unwrap();
+        crate::through_stalls(|| db.put(b"tenant_001:new", b"new")).unwrap();
+        crate::through_stalls(|| db.put(b"tenant_002:new", b"new")).unwrap();
         force_flush(&db, "b");
 
         let mut it = db.iter();
@@ -5703,7 +6018,7 @@ mod tests {
         for i in 0..10 {
             db.put(format!("k{i}").as_bytes(), b"v").unwrap();
         }
-        db.compact_range(None, None).unwrap();
+        db.compact_range(None, None).wait().unwrap();
         for i in 0..10 {
             assert_eq!(
                 db.get(format!("k{i}").as_bytes()).unwrap(),
@@ -5730,10 +6045,7 @@ mod tests {
         // already survives a clean close - this test's real content
         // is that the sync flag doesn't break the normal code path.)
         let dir = TempDir::new().unwrap();
-        let opts = Options {
-            durability: DurabilityMode::Eventual,
-            ..Options::default()
-        };
+        let opts = Options::default().durability(DurabilityMode::Eventual);
         {
             let db = Db::open(dir.path(), opts.clone()).unwrap();
             db.put_opt(&WriteOptions::sync(), b"critical", b"payload")
@@ -5929,11 +6241,9 @@ mod tests {
     }
 
     fn counter_opts() -> Options {
-        Options {
-            write_buffer_size: 4 * 1024,
-            merge_operator: Some(Arc::new(CounterMerge)),
-            ..Options::default()
-        }
+        Options::default()
+            .write_buffer_size(4 * 1024)
+            .merge_operator(Some(Arc::new(CounterMerge)))
     }
 
     fn encode_i64(n: i64) -> Vec<u8> {
@@ -5944,7 +6254,7 @@ mod tests {
     fn test_merge_counter_basic_chain_of_one() {
         let dir = TempDir::new().unwrap();
         let db = Db::open(dir.path(), counter_opts()).unwrap();
-        db.merge(b"counter", &encode_i64(5)).unwrap();
+        crate::through_stalls(|| db.merge(b"counter", &encode_i64(5))).unwrap();
         assert_eq!(db.get(b"counter").unwrap(), Some(encode_i64(5)));
     }
 
@@ -5952,8 +6262,8 @@ mod tests {
     fn test_merge_counter_chain_of_two() {
         let dir = TempDir::new().unwrap();
         let db = Db::open(dir.path(), counter_opts()).unwrap();
-        db.put(b"counter", &encode_i64(10)).unwrap();
-        db.merge(b"counter", &encode_i64(3)).unwrap();
+        crate::through_stalls(|| db.put(b"counter", &encode_i64(10))).unwrap();
+        crate::through_stalls(|| db.merge(b"counter", &encode_i64(3))).unwrap();
         assert_eq!(db.get(b"counter").unwrap(), Some(encode_i64(13)));
     }
 
@@ -5961,9 +6271,9 @@ mod tests {
     fn test_merge_counter_chain_of_ten() {
         let dir = TempDir::new().unwrap();
         let db = Db::open(dir.path(), counter_opts()).unwrap();
-        db.put(b"counter", &encode_i64(100)).unwrap();
+        crate::through_stalls(|| db.put(b"counter", &encode_i64(100))).unwrap();
         for i in 1..=10 {
-            db.merge(b"counter", &encode_i64(i)).unwrap();
+            crate::through_stalls(|| db.merge(b"counter", &encode_i64(i))).unwrap();
         }
         // 100 + (1+2+...+10) = 155
         assert_eq!(db.get(b"counter").unwrap(), Some(encode_i64(155)));
@@ -5974,7 +6284,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let db = Db::open(dir.path(), counter_opts()).unwrap();
         for _ in 0..1000 {
-            db.merge(b"counter", &encode_i64(1)).unwrap();
+            crate::through_stalls(|| db.merge(b"counter", &encode_i64(1))).unwrap();
         }
         assert_eq!(db.get(b"counter").unwrap(), Some(encode_i64(1000)));
     }
@@ -5984,8 +6294,8 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let db = Db::open(dir.path(), counter_opts()).unwrap();
         // No put - counter starts at 0 (base=None).
-        db.merge(b"counter", &encode_i64(7)).unwrap();
-        db.merge(b"counter", &encode_i64(5)).unwrap();
+        crate::through_stalls(|| db.merge(b"counter", &encode_i64(7))).unwrap();
+        crate::through_stalls(|| db.merge(b"counter", &encode_i64(5))).unwrap();
         assert_eq!(db.get(b"counter").unwrap(), Some(encode_i64(12)));
     }
 
@@ -5993,7 +6303,7 @@ mod tests {
     fn test_merge_failure_surfaces_key() {
         let dir = TempDir::new().unwrap();
         let db = Db::open(dir.path(), counter_opts()).unwrap();
-        db.merge(b"counter", b"not an i64").unwrap();
+        crate::through_stalls(|| db.merge(b"counter", b"not an i64")).unwrap();
 
         let err = db.get(b"counter").unwrap_err();
         match err {
@@ -6006,9 +6316,9 @@ mod tests {
     fn test_merge_snapshot_isolation() {
         let dir = TempDir::new().unwrap();
         let db = Db::open(dir.path(), counter_opts()).unwrap();
-        db.put(b"counter", &encode_i64(10)).unwrap();
+        crate::through_stalls(|| db.put(b"counter", &encode_i64(10))).unwrap();
         let snap = db.snapshot();
-        db.merge(b"counter", &encode_i64(5)).unwrap();
+        crate::through_stalls(|| db.merge(b"counter", &encode_i64(5))).unwrap();
         // Live read sees 15; snapshot still sees 10.
         assert_eq!(db.get(b"counter").unwrap(), Some(encode_i64(15)));
         assert_eq!(snap.get(b"counter").unwrap(), Some(encode_i64(10)));
@@ -6018,9 +6328,9 @@ mod tests {
     fn test_merge_survives_flush() {
         let dir = TempDir::new().unwrap();
         let db = Db::open(dir.path(), counter_opts()).unwrap();
-        db.put(b"counter", &encode_i64(0)).unwrap();
+        crate::through_stalls(|| db.put(b"counter", &encode_i64(0))).unwrap();
         for i in 1..=20 {
-            db.merge(b"counter", &encode_i64(i)).unwrap();
+            crate::through_stalls(|| db.merge(b"counter", &encode_i64(i))).unwrap();
         }
         // Push past the tiny write buffer so the chain crosses a
         // flush boundary (memtable → L0).
@@ -6033,14 +6343,14 @@ mod tests {
     fn test_merge_survives_compaction_and_collapses() {
         let dir = TempDir::new().unwrap();
         let db = Db::open(dir.path(), counter_opts()).unwrap();
-        db.put(b"counter", &encode_i64(0)).unwrap();
+        crate::through_stalls(|| db.put(b"counter", &encode_i64(0))).unwrap();
         for i in 1..=50 {
-            db.merge(b"counter", &encode_i64(i)).unwrap();
+            crate::through_stalls(|| db.merge(b"counter", &encode_i64(i))).unwrap();
         }
         for tag in 0..4 {
             force_flush(&db, &format!("c{tag}"));
         }
-        db.compact_range(None, None).unwrap();
+        db.compact_range(None, None).wait().unwrap();
         // Sum 1..=50 = 1275
         assert_eq!(db.get(b"counter").unwrap(), Some(encode_i64(1275)));
     }
@@ -6050,12 +6360,12 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let db = Db::open(dir.path(), counter_opts()).unwrap();
         // Value=10, then two merges, then delete, then two more merges.
-        db.put(b"k", &encode_i64(10)).unwrap();
-        db.merge(b"k", &encode_i64(5)).unwrap();
-        db.merge(b"k", &encode_i64(3)).unwrap();
-        db.delete(b"k").unwrap();
-        db.merge(b"k", &encode_i64(7)).unwrap();
-        db.merge(b"k", &encode_i64(1)).unwrap();
+        crate::through_stalls(|| db.put(b"k", &encode_i64(10))).unwrap();
+        crate::through_stalls(|| db.merge(b"k", &encode_i64(5))).unwrap();
+        crate::through_stalls(|| db.merge(b"k", &encode_i64(3))).unwrap();
+        crate::through_stalls(|| db.delete(b"k")).unwrap();
+        crate::through_stalls(|| db.merge(b"k", &encode_i64(7))).unwrap();
+        crate::through_stalls(|| db.merge(b"k", &encode_i64(1))).unwrap();
         // Reads layer the two latest merges on top of the deletion
         // (which resets the base to None → 0): 0 + 7 + 1 = 8.
         assert_eq!(db.get(b"k").unwrap(), Some(encode_i64(8)));
@@ -6065,10 +6375,10 @@ mod tests {
     fn test_merge_range_tombstone_interaction() {
         let dir = TempDir::new().unwrap();
         let db = Db::open(dir.path(), counter_opts()).unwrap();
-        db.put(b"k", &encode_i64(10)).unwrap();
-        db.merge(b"k", &encode_i64(5)).unwrap();
-        db.delete_range(b"j", b"l").unwrap(); // hides the base
-        db.merge(b"k", &encode_i64(7)).unwrap();
+        crate::through_stalls(|| db.put(b"k", &encode_i64(10))).unwrap();
+        crate::through_stalls(|| db.merge(b"k", &encode_i64(5))).unwrap();
+        crate::through_stalls(|| db.delete_range(b"j", b"l")).unwrap(); // hides the base
+        crate::through_stalls(|| db.merge(b"k", &encode_i64(7))).unwrap();
         // After the RT, only the latest merge (7) applies to a None base.
         assert_eq!(db.get(b"k").unwrap(), Some(encode_i64(7)));
     }
@@ -6082,7 +6392,7 @@ mod tests {
         batch.merge(b"a", &encode_i64(2));
         batch.merge(b"a", &encode_i64(3));
         batch.put(b"b", &encode_i64(100));
-        db.write(batch).unwrap();
+        crate::through_stalls(|| db.write(batch.clone())).unwrap();
         assert_eq!(db.get(b"a").unwrap(), Some(encode_i64(6)));
         assert_eq!(db.get(b"b").unwrap(), Some(encode_i64(100)));
     }
@@ -6090,10 +6400,7 @@ mod tests {
     #[test]
     fn test_merge_append_operator() {
         let dir = TempDir::new().unwrap();
-        let opts = Options {
-            merge_operator: Some(Arc::new(AppendMerge)),
-            ..Options::default()
-        };
+        let opts = Options::default().merge_operator(Some(Arc::new(AppendMerge)));
         let db = Db::open(dir.path(), opts).unwrap();
         db.put(b"s", b"hello").unwrap();
         db.merge(b"s", b" ").unwrap();
@@ -6105,11 +6412,11 @@ mod tests {
     fn test_merge_iterator_sees_collapsed_value() {
         let dir = TempDir::new().unwrap();
         let db = Db::open(dir.path(), counter_opts()).unwrap();
-        db.put(b"a", &encode_i64(0)).unwrap();
-        db.merge(b"a", &encode_i64(5)).unwrap();
-        db.put(b"b", &encode_i64(100)).unwrap();
-        db.merge(b"b", &encode_i64(10)).unwrap();
-        db.merge(b"b", &encode_i64(2)).unwrap();
+        crate::through_stalls(|| db.put(b"a", &encode_i64(0))).unwrap();
+        crate::through_stalls(|| db.merge(b"a", &encode_i64(5))).unwrap();
+        crate::through_stalls(|| db.put(b"b", &encode_i64(100))).unwrap();
+        crate::through_stalls(|| db.merge(b"b", &encode_i64(10))).unwrap();
+        crate::through_stalls(|| db.merge(b"b", &encode_i64(2))).unwrap();
 
         let pairs = db.scan(None, None).unwrap();
         assert_eq!(
@@ -6125,11 +6432,11 @@ mod tests {
     fn test_merge_iterator_reverse() {
         let dir = TempDir::new().unwrap();
         let db = Db::open(dir.path(), counter_opts()).unwrap();
-        db.put(b"a", &encode_i64(0)).unwrap();
-        db.merge(b"a", &encode_i64(1)).unwrap();
-        db.put(b"b", &encode_i64(0)).unwrap();
-        db.merge(b"b", &encode_i64(2)).unwrap();
-        db.merge(b"b", &encode_i64(3)).unwrap();
+        crate::through_stalls(|| db.put(b"a", &encode_i64(0))).unwrap();
+        crate::through_stalls(|| db.merge(b"a", &encode_i64(1))).unwrap();
+        crate::through_stalls(|| db.put(b"b", &encode_i64(0))).unwrap();
+        crate::through_stalls(|| db.merge(b"b", &encode_i64(2))).unwrap();
+        crate::through_stalls(|| db.merge(b"b", &encode_i64(3))).unwrap();
 
         let mut iter = db.iter();
         iter.seek_to_last();
@@ -6152,9 +6459,9 @@ mod tests {
         let dir = TempDir::new().unwrap();
         {
             let db = Db::open(dir.path(), counter_opts()).unwrap();
-            db.put(b"counter", &encode_i64(0)).unwrap();
-            db.merge(b"counter", &encode_i64(7)).unwrap();
-            db.merge(b"counter", &encode_i64(3)).unwrap();
+            crate::through_stalls(|| db.put(b"counter", &encode_i64(0))).unwrap();
+            crate::through_stalls(|| db.merge(b"counter", &encode_i64(7))).unwrap();
+            crate::through_stalls(|| db.merge(b"counter", &encode_i64(3))).unwrap();
             // No close - memtable flush didn't happen; WAL must
             // survive the chain.
         }
@@ -6535,6 +6842,7 @@ mod tests {
 
         assert!(
             db.ingest_external_files(&[path], IngestOptions::default())
+                .wait()
                 .is_err()
         );
         let live = db.create_column_family("tmp").unwrap();
@@ -6812,15 +7120,13 @@ mod tests {
         // zero-filled payload compresses to near-nothing and would
         // undercut the accuracy window we're checking.
         let dir = TempDir::new().unwrap();
-        let opts = Options {
-            write_buffer_size: 4 * 1024,
-            compression: CompressionType::None,
-            ..Options::default()
-        };
+        let opts = Options::default()
+            .write_buffer_size(4 * 1024)
+            .compression(CompressionType::None);
         let db = Db::open(dir.path(), opts).unwrap();
         let payload: Vec<u8> = (0..256).map(|i| (i % 251) as u8).collect();
         for i in 0..100 {
-            db.put(format!("k_{i:04}").as_bytes(), &payload).unwrap();
+            crate::through_stalls(|| db.put(format!("k_{i:04}").as_bytes(), &payload)).unwrap();
         }
         force_flush(&db, "sizes");
         let sizes = db.get_approximate_sizes(&[Range::new(b"k_0000", b"k_9999")]);
@@ -6844,7 +7150,7 @@ mod tests {
         let db = Db::open(dir.path(), tiny_flush_opts()).unwrap();
         let payload = vec![0u8; 256];
         for i in 0..200 {
-            db.put(format!("k_{i:04}").as_bytes(), &payload).unwrap();
+            crate::through_stalls(|| db.put(format!("k_{i:04}").as_bytes(), &payload)).unwrap();
         }
         force_flush(&db, "multi");
         let ranges = vec![
@@ -6933,16 +7239,20 @@ mod tests {
         // Seed enough filler to push the tiny 4KB buffer over
         // on the next write.
         for i in 0..16 {
-            db.put_cf(&cf_a, format!("fill_a_{i:02}").as_bytes(), &[0u8; 256])
-                .unwrap();
-            db.put_cf(&cf_b, format!("fill_b_{i:02}").as_bytes(), &[0u8; 256])
-                .unwrap();
+            crate::through_stalls(|| {
+                db.put_cf(&cf_a, format!("fill_a_{i:02}").as_bytes(), &[0u8; 256])
+            })
+            .unwrap();
+            crate::through_stalls(|| {
+                db.put_cf(&cf_b, format!("fill_b_{i:02}").as_bytes(), &[0u8; 256])
+            })
+            .unwrap();
         }
 
         let mut batch = WriteBatch::new();
         batch.put_cf(&cf_a, b"pivot", b"A_PIVOT");
         batch.put_cf(&cf_b, b"pivot", b"B_PIVOT");
-        db.write(batch).unwrap();
+        crate::through_stalls(|| db.write(batch.clone())).unwrap();
         force_flush(&db, "atomic");
 
         assert_eq!(
@@ -6965,7 +7275,7 @@ mod tests {
         let cf_empty = db.create_column_family("empty").unwrap();
 
         for i in 0..50 {
-            db.put_cf(&cf_populated, format!("k{i:02}").as_bytes(), b"v")
+            crate::through_stalls(|| db.put_cf(&cf_populated, format!("k{i:02}").as_bytes(), b"v"))
                 .unwrap();
         }
         force_flush(&db, "empty_mix");
@@ -6980,7 +7290,7 @@ mod tests {
         assert_eq!(db.get_cf(&cf_empty, b"anything").unwrap(), None);
 
         // The empty CF still accepts new writes after the flush.
-        db.put_cf(&cf_empty, b"new", b"fresh").unwrap();
+        crate::through_stalls(|| db.put_cf(&cf_empty, b"new", b"fresh")).unwrap();
         assert_eq!(
             db.get_cf(&cf_empty, b"new").unwrap(),
             Some(b"fresh".to_vec())
@@ -6992,10 +7302,7 @@ mod tests {
         // The flag is a no-op for API parity - both values must
         // open cleanly and produce the same atomic behavior.
         let dir = TempDir::new().unwrap();
-        let opts = Options {
-            atomic_flush: true,
-            ..Options::default()
-        };
+        let opts = Options::default().atomic_flush(true);
         let db = Db::open(dir.path(), opts).unwrap();
         let cf = db.create_column_family("cf1").unwrap();
         db.put_cf(&cf, b"k", b"v").unwrap();
@@ -7078,11 +7385,9 @@ mod tests {
     fn test_listener_fires_on_flush() {
         let listener = Arc::new(CountingListener::default());
         let dir = TempDir::new().unwrap();
-        let opts = Options {
-            write_buffer_size: 4 * 1024,
-            listeners: vec![listener.clone() as Arc<dyn EventListener>],
-            ..Options::default()
-        };
+        let opts = Options::default()
+            .write_buffer_size(4 * 1024)
+            .listeners(vec![listener.clone() as Arc<dyn EventListener>]);
         let db = Db::open(dir.path(), opts).unwrap();
         force_flush(&db, "listener");
 
@@ -7105,20 +7410,18 @@ mod tests {
     fn test_listener_fires_on_compaction() {
         let listener = Arc::new(CountingListener::default());
         let dir = TempDir::new().unwrap();
-        let opts = Options {
-            write_buffer_size: 4 * 1024,
-            listeners: vec![listener.clone() as Arc<dyn EventListener>],
-            ..Options::default()
-        };
+        let opts = Options::default()
+            .write_buffer_size(4 * 1024)
+            .listeners(vec![listener.clone() as Arc<dyn EventListener>]);
         let db = Db::open(dir.path(), opts).unwrap();
         // Drive enough writes to generate L0 files, then manually
         // compact the range so the compaction callbacks fire on
         // the calling thread.
         for i in 0..400 {
-            db.put(format!("k_{i:04}").as_bytes(), b"v").unwrap();
+            crate::through_stalls(|| db.put(format!("k_{i:04}").as_bytes(), b"v")).unwrap();
         }
         force_flush(&db, "listener");
-        db.compact_range(None, None).unwrap();
+        db.compact_range(None, None).wait().unwrap();
 
         let begin = listener.compaction_begin.load(AtomicOrdering::Relaxed);
         let complete = listener.compaction_completed.load(AtomicOrdering::Relaxed);
@@ -7144,10 +7447,7 @@ mod tests {
     fn test_listener_fires_on_ingest() {
         let listener = Arc::new(CountingListener::default());
         let dir = TempDir::new().unwrap();
-        let opts = Options {
-            listeners: vec![listener.clone() as Arc<dyn EventListener>],
-            ..Options::default()
-        };
+        let opts = Options::default().listeners(vec![listener.clone() as Arc<dyn EventListener>]);
         let db = Db::open(dir.path(), opts.clone()).unwrap();
 
         let sst_path = dir.path().join("ingest.sst");
@@ -7159,6 +7459,7 @@ mod tests {
             w.finish().unwrap();
         }
         db.ingest_external_files(&[sst_path], IngestOptions::default())
+            .wait()
             .unwrap();
 
         assert_eq!(
@@ -7179,14 +7480,12 @@ mod tests {
         let a = Arc::new(CountingListener::default());
         let b = Arc::new(CountingListener::default());
         let dir = TempDir::new().unwrap();
-        let opts = Options {
-            write_buffer_size: 4 * 1024,
-            listeners: vec![
+        let opts = Options::default()
+            .write_buffer_size(4 * 1024)
+            .listeners(vec![
                 a.clone() as Arc<dyn EventListener>,
                 b.clone() as Arc<dyn EventListener>,
-            ],
-            ..Options::default()
-        };
+            ]);
         let db = Db::open(dir.path(), opts).unwrap();
         force_flush(&db, "multi");
 
@@ -7201,7 +7500,7 @@ mod tests {
         let (db, _dir) = open_tmp();
         db.put(b"k", b"v").unwrap();
         force_flush(&db, "none");
-        db.compact_range(None, None).unwrap();
+        db.compact_range(None, None).wait().unwrap();
     }
 
     #[test]
@@ -7216,23 +7515,21 @@ mod tests {
                 *self.captured.lock() = Some(info.clone());
             }
         }
-        use crate::sync::Mutex;
+        use crate::sync::internal::Mutex;
 
         let listener = Arc::new(CaptureListener {
             captured: Mutex::new(None),
         });
         let dir = TempDir::new().unwrap();
-        let opts = Options {
-            write_buffer_size: 4 * 1024,
-            listeners: vec![listener.clone() as Arc<dyn EventListener>],
-            ..Options::default()
-        };
+        let opts = Options::default()
+            .write_buffer_size(4 * 1024)
+            .listeners(vec![listener.clone() as Arc<dyn EventListener>]);
         let db = Db::open(dir.path(), opts).unwrap();
         for i in 0..400 {
-            db.put(format!("k_{i:04}").as_bytes(), b"v").unwrap();
+            crate::through_stalls(|| db.put(format!("k_{i:04}").as_bytes(), b"v")).unwrap();
         }
         force_flush(&db, "capture");
-        db.compact_range(None, None).unwrap();
+        db.compact_range(None, None).wait().unwrap();
 
         let captured = listener.captured.lock().clone();
         let info = captured.expect("compaction_completed must have fired");
@@ -7247,18 +7544,13 @@ mod tests {
     // ── statistics ──────────────────────────────────────────────────────
 
     fn stats_opts(stats: Arc<Statistics>) -> Options {
-        Options {
-            statistics: Some(stats),
-            ..Options::default()
-        }
+        Options::default().statistics(Some(stats))
     }
 
     fn tiny_flush_stats_opts(stats: Arc<Statistics>) -> Options {
-        Options {
-            write_buffer_size: 4 * 1024,
-            statistics: Some(stats),
-            ..Options::default()
-        }
+        Options::default()
+            .write_buffer_size(4 * 1024)
+            .statistics(Some(stats))
     }
 
     #[test]
@@ -7313,11 +7605,11 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let db = Db::open(dir.path(), tiny_flush_stats_opts(stats.clone())).unwrap();
         for i in 0..200 {
-            db.put(format!("k_{i:05}").as_bytes(), b"value").unwrap();
+            crate::through_stalls(|| db.put(format!("k_{i:05}").as_bytes(), b"value")).unwrap();
         }
         force_flush(&db, "cache");
         // Drain any pending compaction before measuring.
-        db.compact_range(None, None).unwrap();
+        db.compact_range(None, None).wait().unwrap();
         stats.reset();
         // Read the same few keys twice: the first read is a
         // miss + add, the second is a hit.
@@ -7349,10 +7641,10 @@ mod tests {
         let db = Db::open(dir.path(), tiny_flush_stats_opts(stats.clone())).unwrap();
         for i in 0..200 {
             let even = i * 2;
-            db.put(format!("k_{even:05}").as_bytes(), b"v").unwrap();
+            crate::through_stalls(|| db.put(format!("k_{even:05}").as_bytes(), b"v")).unwrap();
         }
         force_flush(&db, "bloom");
-        db.compact_range(None, None).unwrap();
+        db.compact_range(None, None).wait().unwrap();
         stats.reset();
         // Query 100 absent (odd-suffix) keys inside the range.
         // With ~10 bits/key the false-positive rate is ~1%, so
@@ -7374,10 +7666,10 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let db = Db::open(dir.path(), tiny_flush_stats_opts(stats.clone())).unwrap();
         for i in 0..100 {
-            db.put(format!("k_{i:04}").as_bytes(), b"v").unwrap();
+            crate::through_stalls(|| db.put(format!("k_{i:04}").as_bytes(), b"v")).unwrap();
         }
         force_flush(&db, "bloom_pos");
-        db.compact_range(None, None).unwrap();
+        db.compact_range(None, None).wait().unwrap();
         stats.reset();
         for i in 0..100 {
             db.get(format!("k_{i:04}").as_bytes()).unwrap();
@@ -7395,10 +7687,10 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let db = Db::open(dir.path(), tiny_flush_stats_opts(stats.clone())).unwrap();
         for i in 0..200 {
-            db.put(format!("k_{i:04}").as_bytes(), b"v").unwrap();
+            crate::through_stalls(|| db.put(format!("k_{i:04}").as_bytes(), b"v")).unwrap();
         }
         force_flush(&db, "fcstats");
-        db.compact_range(None, None).unwrap();
+        db.compact_range(None, None).wait().unwrap();
         assert!(stats.get_ticker(Ticker::FlushCount) >= 1);
         assert!(stats.get_ticker(Ticker::FlushBytesWritten) > 0);
         assert!(stats.get_ticker(Ticker::CompactionCount) >= 1);
@@ -7417,11 +7709,9 @@ mod tests {
     fn test_stats_wal_counters() {
         let stats = Arc::new(Statistics::new());
         let dir = TempDir::new().unwrap();
-        let opts = Options {
-            statistics: Some(stats.clone()),
-            durability: DurabilityMode::Immediate,
-            ..Options::default()
-        };
+        let opts = Options::default()
+            .statistics(Some(stats.clone()))
+            .durability(DurabilityMode::Immediate);
         let db = Db::open(dir.path(), opts).unwrap();
         db.put(b"k", b"v").unwrap();
         db.put(b"k2", b"v2").unwrap();
@@ -7527,7 +7817,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let db = Db::open(dir.path(), tiny_flush_opts()).unwrap();
         for i in 0..200 {
-            db.put(format!("k_{i:04}").as_bytes(), b"v").unwrap();
+            crate::through_stalls(|| db.put(format!("k_{i:04}").as_bytes(), b"v")).unwrap();
         }
         force_flush(&db, "props");
         // At this point we expect some L0 files.
@@ -7535,7 +7825,7 @@ mod tests {
         assert!(l0_before > 0 || db.get_int_property("regolith.num-files-at-level1").unwrap() > 0);
 
         // Drain everything to the deepest level.
-        db.compact_range(None, None).unwrap();
+        db.compact_range(None, None).wait().unwrap();
         assert_eq!(
             db.get_int_property("regolith.num-files-at-level0"),
             Some(0),
@@ -7552,7 +7842,7 @@ mod tests {
             Some(0)
         );
         for i in 0..100 {
-            db.put(format!("k_{i:04}").as_bytes(), b"v").unwrap();
+            crate::through_stalls(|| db.put(format!("k_{i:04}").as_bytes(), b"v")).unwrap();
         }
         force_flush(&db, "size");
         let size = db
@@ -7595,10 +7885,10 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let db = Db::open(dir.path(), tiny_flush_opts()).unwrap();
         for i in 0..100 {
-            db.put(format!("k_{i:04}").as_bytes(), b"v").unwrap();
+            crate::through_stalls(|| db.put(format!("k_{i:04}").as_bytes(), b"v")).unwrap();
         }
         force_flush(&db, "estimate");
-        db.compact_range(None, None).unwrap();
+        db.compact_range(None, None).wait().unwrap();
         let estimate = db.get_int_property("regolith.estimate-num-keys").unwrap();
         // Exact count per SST includes the flush filler + the 100
         // writes; the property is a lower bound, so > 50 is a
@@ -7634,10 +7924,7 @@ mod tests {
     #[test]
     fn test_property_stats_string_includes_level_header_and_counters() {
         let stats = Arc::new(Statistics::new());
-        let opts = Options {
-            statistics: Some(stats),
-            ..Options::default()
-        };
+        let opts = Options::default().statistics(Some(stats));
         let dir = TempDir::new().unwrap();
         let db = Db::open(dir.path(), opts).unwrap();
         db.put(b"k", b"v").unwrap();
@@ -7660,7 +7947,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let db = Db::open(dir.path(), tiny_flush_opts()).unwrap();
         for i in 0..50 {
-            db.put(format!("k_{i:03}").as_bytes(), b"v").unwrap();
+            crate::through_stalls(|| db.put(format!("k_{i:03}").as_bytes(), b"v")).unwrap();
         }
         force_flush(&db, "ssts");
         let text = db.get_property("regolith.sstables").unwrap();
@@ -7677,7 +7964,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let db = Db::open(dir.path(), tiny_flush_opts()).unwrap();
         for i in 0..20 {
-            db.put(format!("k_{i:03}").as_bytes(), b"v").unwrap();
+            crate::through_stalls(|| db.put(format!("k_{i:03}").as_bytes(), b"v")).unwrap();
         }
         force_flush(&db, "lvl");
         let text = db.get_property("regolith.levelstats").unwrap();
@@ -7720,13 +8007,11 @@ mod tests {
         // files that trigger multiple concurrent L1+ compactions.
         // Every key must still read back its latest value after
         // the dust settles.
-        let opts = Options {
-            write_buffer_size: 4 * 1024,
-            max_background_compactions: 4,
-            l0_compaction_trigger: 2,
-            target_file_size: 8 * 1024,
-            ..Options::default()
-        };
+        let opts = Options::default()
+            .write_buffer_size(4 * 1024)
+            .max_background_compactions(4)
+            .l0_compaction_trigger(2)
+            .target_file_size(8 * 1024);
         let dir = TempDir::new().unwrap();
         let db = Db::open(dir.path(), opts).unwrap();
 
@@ -7734,21 +8019,21 @@ mod tests {
         for i in 0..2048 {
             let k = format!("k{i:06}");
             let v = format!("v{i}");
-            db.put(k.as_bytes(), v.as_bytes()).unwrap();
+            crate::through_stalls(|| db.put(k.as_bytes(), v.as_bytes())).unwrap();
             expected.insert(k, v);
         }
         // Overwrite a window to exercise dedup across workers.
         for i in 100..300 {
             let k = format!("k{i:06}");
             let v = format!("v{i}-new");
-            db.put(k.as_bytes(), v.as_bytes()).unwrap();
+            crate::through_stalls(|| db.put(k.as_bytes(), v.as_bytes())).unwrap();
             expected.insert(k, v);
         }
 
         // Give background workers time to process L0 files.
         // Use a generous sleep so slow CI runners don't flake.
         std::thread::sleep(std::time::Duration::from_millis(500));
-        db.compact_range(None, None).unwrap();
+        db.compact_range(None, None).wait().unwrap();
 
         for (k, v) in &expected {
             assert_eq!(
@@ -7764,18 +8049,16 @@ mod tests {
         // max_background_compactions=1 must behave identically to
         // the default (which is also 1). Sanity check that the
         // RwLock path doesn't break the single-worker case.
-        let opts = Options {
-            write_buffer_size: 4 * 1024,
-            max_background_compactions: 1,
-            ..Options::default()
-        };
+        let opts = Options::default()
+            .write_buffer_size(4 * 1024)
+            .max_background_compactions(1);
         let dir = TempDir::new().unwrap();
         let db = Db::open(dir.path(), opts).unwrap();
         for i in 0..500 {
             let k = format!("k{i:04}");
-            db.put(k.as_bytes(), b"v").unwrap();
+            crate::through_stalls(|| db.put(k.as_bytes(), b"v")).unwrap();
         }
-        db.compact_range(None, None).unwrap();
+        db.compact_range(None, None).wait().unwrap();
         for i in 0..500 {
             let k = format!("k{i:04}");
             assert_eq!(db.get(k.as_bytes()).unwrap(), Some(b"v".to_vec()));
@@ -7786,21 +8069,19 @@ mod tests {
     fn test_partitioned_index_reads_are_correct() {
         // Enable partitioned index with a tiny metadata_block_size
         // so the test actually exercises the two-level path.
-        let opts = Options {
-            write_buffer_size: 4 * 1024,
-            partitioned_index: true,
-            metadata_block_size: 128,
-            ..Options::default()
-        };
+        let opts = Options::default()
+            .write_buffer_size(4 * 1024)
+            .partitioned_index(true)
+            .metadata_block_size(128);
         let dir = TempDir::new().unwrap();
         let db = Db::open(dir.path(), opts).unwrap();
 
         for i in 0..500 {
             let k = format!("k{i:04}");
             let v = format!("v{i}");
-            db.put(k.as_bytes(), v.as_bytes()).unwrap();
+            crate::through_stalls(|| db.put(k.as_bytes(), v.as_bytes())).unwrap();
         }
-        db.compact_range(None, None).unwrap();
+        db.compact_range(None, None).wait().unwrap();
 
         for i in 0..500 {
             let k = format!("k{i:04}");
@@ -7819,19 +8100,17 @@ mod tests {
         // Scans must produce identical results.
         let write_and_scan = |partitioned: bool| -> Vec<(Vec<u8>, Vec<u8>)> {
             let dir = TempDir::new().unwrap();
-            let opts = Options {
-                write_buffer_size: 4 * 1024,
-                partitioned_index: partitioned,
-                metadata_block_size: 128,
-                ..Options::default()
-            };
+            let opts = Options::default()
+                .write_buffer_size(4 * 1024)
+                .partitioned_index(partitioned)
+                .metadata_block_size(128);
             let db = Db::open(dir.path(), opts).unwrap();
             for i in 0..200 {
                 let k = format!("k{i:04}");
                 let v = format!("v{i}");
-                db.put(k.as_bytes(), v.as_bytes()).unwrap();
+                crate::through_stalls(|| db.put(k.as_bytes(), v.as_bytes())).unwrap();
             }
-            db.compact_range(None, None).unwrap();
+            db.compact_range(None, None).wait().unwrap();
             db.scan(None, None).unwrap()
         };
         let flat = write_and_scan(false);
@@ -7842,19 +8121,17 @@ mod tests {
     #[test]
     fn test_partitioned_index_survives_reopen() {
         let dir = TempDir::new().unwrap();
-        let opts = Options {
-            write_buffer_size: 4 * 1024,
-            partitioned_index: true,
-            metadata_block_size: 128,
-            ..Options::default()
-        };
+        let opts = Options::default()
+            .write_buffer_size(4 * 1024)
+            .partitioned_index(true)
+            .metadata_block_size(128);
         {
             let db = Db::open(dir.path(), opts.clone()).unwrap();
             for i in 0..200 {
                 let k = format!("k{i:04}");
-                db.put(k.as_bytes(), b"v").unwrap();
+                crate::through_stalls(|| db.put(k.as_bytes(), b"v")).unwrap();
             }
-            db.compact_range(None, None).unwrap();
+            db.compact_range(None, None).wait().unwrap();
         }
         // Reopen - the V2 SSTables must still be readable.
         let db = Db::open(dir.path(), opts).unwrap();
@@ -7871,37 +8148,30 @@ mod tests {
         // file types must work correctly.
         let dir = TempDir::new().unwrap();
         {
-            let opts = Options {
-                write_buffer_size: 4 * 1024,
-                partitioned_index: false,
-                ..Options::default()
-            };
+            let opts = Options::default()
+                .write_buffer_size(4 * 1024)
+                .partitioned_index(false);
             let db = Db::open(dir.path(), opts).unwrap();
             for i in 0..100 {
                 let k = format!("k{i:04}");
-                db.put(k.as_bytes(), b"v1").unwrap();
+                crate::through_stalls(|| db.put(k.as_bytes(), b"v1")).unwrap();
             }
-            db.compact_range(None, None).unwrap();
+            db.compact_range(None, None).wait().unwrap();
         }
         {
-            let opts = Options {
-                write_buffer_size: 4 * 1024,
-                partitioned_index: true,
-                metadata_block_size: 128,
-                ..Options::default()
-            };
+            let opts = Options::default()
+                .write_buffer_size(4 * 1024)
+                .partitioned_index(true)
+                .metadata_block_size(128);
             let db = Db::open(dir.path(), opts).unwrap();
             for i in 100..200 {
                 let k = format!("k{i:04}");
-                db.put(k.as_bytes(), b"v2").unwrap();
+                crate::through_stalls(|| db.put(k.as_bytes(), b"v2")).unwrap();
             }
             // Don't compact - leave V1 files at lower levels and
             // V2 files in L0/L1.
         }
-        let opts = Options {
-            partitioned_index: true,
-            ..Options::default()
-        };
+        let opts = Options::default().partitioned_index(true);
         let db = Db::open(dir.path(), opts).unwrap();
         for i in 0..100 {
             let k = format!("k{i:04}");
@@ -7918,12 +8188,10 @@ mod tests {
         // A compaction large enough to span multiple output files;
         // read everything back and confirm the streaming path keeps
         // the latest version for every user key.
-        let opts = Options {
-            write_buffer_size: 4 * 1024,
-            max_subcompactions: 4,
-            target_file_size: 8 * 1024,
-            ..Options::default()
-        };
+        let opts = Options::default()
+            .write_buffer_size(4 * 1024)
+            .max_subcompactions(4)
+            .target_file_size(8 * 1024);
         let dir = TempDir::new().unwrap();
         let db = Db::open(dir.path(), opts).unwrap();
 
@@ -7931,16 +8199,16 @@ mod tests {
             .map(|i| (format!("k{i:06}"), format!("v{i}")))
             .collect();
         for (k, v) in &expected {
-            db.put(k.as_bytes(), v.as_bytes()).unwrap();
+            crate::through_stalls(|| db.put(k.as_bytes(), v.as_bytes())).unwrap();
         }
         // Overwrite a window to exercise dedup across input files.
         for i in 100..200 {
             let k = format!("k{i:06}");
             let v = format!("v{i}-new");
-            db.put(k.as_bytes(), v.as_bytes()).unwrap();
+            crate::through_stalls(|| db.put(k.as_bytes(), v.as_bytes())).unwrap();
         }
 
-        db.compact_range(None, None).unwrap();
+        db.compact_range(None, None).wait().unwrap();
 
         for (k, v) in &expected {
             let i: usize = k[1..].parse().unwrap();
@@ -7962,19 +8230,17 @@ mod tests {
         // max_subcompactions is accepted for API compatibility, but
         // the streaming compaction path writes from the compaction
         // worker thread.
-        let opts = Options {
-            write_buffer_size: 4 * 1024,
-            max_subcompactions: 1,
-            target_file_size: 8 * 1024,
-            ..Options::default()
-        };
+        let opts = Options::default()
+            .write_buffer_size(4 * 1024)
+            .max_subcompactions(1)
+            .target_file_size(8 * 1024);
         let dir = TempDir::new().unwrap();
         let db = Db::open(dir.path(), opts).unwrap();
         for i in 0..256 {
             let k = format!("k{i:04}");
-            db.put(k.as_bytes(), b"v").unwrap();
+            crate::through_stalls(|| db.put(k.as_bytes(), b"v")).unwrap();
         }
-        db.compact_range(None, None).unwrap();
+        db.compact_range(None, None).wait().unwrap();
         for i in 0..256 {
             let k = format!("k{i:04}");
             assert_eq!(db.get(k.as_bytes()).unwrap(), Some(b"v".to_vec()));
@@ -7986,18 +8252,16 @@ mod tests {
         // The compatibility knob should not change correctness even
         // though output writing is now part of the bounded-memory
         // streaming path.
-        let opts = Options {
-            write_buffer_size: 4 * 1024,
-            max_subcompactions: 8,
-            ..Options::default()
-        };
+        let opts = Options::default()
+            .write_buffer_size(4 * 1024)
+            .max_subcompactions(8);
         let dir = TempDir::new().unwrap();
         let db = Db::open(dir.path(), opts).unwrap();
         for i in 0..32 {
             let k = format!("k{i:02}");
-            db.put(k.as_bytes(), b"v").unwrap();
+            crate::through_stalls(|| db.put(k.as_bytes(), b"v")).unwrap();
         }
-        db.compact_range(None, None).unwrap();
+        db.compact_range(None, None).wait().unwrap();
         for i in 0..32 {
             let k = format!("k{i:02}");
             assert_eq!(db.get(k.as_bytes()).unwrap(), Some(b"v".to_vec()));
@@ -8056,26 +8320,24 @@ mod tests {
         // platforms it's a no-op. Either way, the output SSTs
         // contain the same data as the leveled baseline, so
         // readers must see identical values afterward.
-        let opts = Options {
-            write_buffer_size: 4 * 1024,
-            evict_compaction_data_from_page_cache: true,
-            ..Options::default()
-        };
+        let opts = Options::default()
+            .write_buffer_size(4 * 1024)
+            .evict_compaction_data_from_page_cache(true);
         let dir = TempDir::new().unwrap();
         let db = Db::open(dir.path(), opts).unwrap();
 
         for i in 0..128 {
             let k = format!("k{i:04}");
             let v = format!("v{i}");
-            db.put(k.as_bytes(), v.as_bytes()).unwrap();
+            crate::through_stalls(|| db.put(k.as_bytes(), v.as_bytes())).unwrap();
         }
         // Overwrite a few so dedup runs through the hint path.
         for i in 0..32 {
             let k = format!("k{i:04}");
             let v = format!("v{i}-new");
-            db.put(k.as_bytes(), v.as_bytes()).unwrap();
+            crate::through_stalls(|| db.put(k.as_bytes(), v.as_bytes())).unwrap();
         }
-        db.compact_range(None, None).unwrap();
+        db.compact_range(None, None).wait().unwrap();
 
         for i in 0..128 {
             let k = format!("k{i:04}");
@@ -8097,28 +8359,26 @@ mod tests {
         // Write a batch under Universal, force a full merge via
         // compact_range, and verify every key is still readable
         // with the most recent value.
-        let opts = Options {
-            write_buffer_size: 4 * 1024,
-            compaction_style: CompactionStyle::Universal,
-            ..Options::default()
-        };
+        let opts = Options::default()
+            .write_buffer_size(4 * 1024)
+            .compaction_style(CompactionStyle::Universal);
         let dir = TempDir::new().unwrap();
         let db = Db::open(dir.path(), opts).unwrap();
 
         for i in 0..64 {
             let k = format!("k{i:04}");
             let v = format!("v{i}");
-            db.put(k.as_bytes(), v.as_bytes()).unwrap();
+            crate::through_stalls(|| db.put(k.as_bytes(), v.as_bytes())).unwrap();
         }
         // Overwrite the first 16 keys so dedup has to pick the
         // newest version during the merge.
         for i in 0..16 {
             let k = format!("k{i:04}");
             let v = format!("v{i}-updated");
-            db.put(k.as_bytes(), v.as_bytes()).unwrap();
+            crate::through_stalls(|| db.put(k.as_bytes(), v.as_bytes())).unwrap();
         }
 
-        db.compact_range(None, None).unwrap();
+        db.compact_range(None, None).wait().unwrap();
         std::thread::sleep(std::time::Duration::from_millis(100));
 
         for i in 0..64 {
@@ -8140,19 +8400,17 @@ mod tests {
     fn test_universal_compaction_never_creates_l1_files() {
         // Every Universal merge output should stay at L0 - the
         // level-size push-down rule must not fire for this style.
-        let opts = Options {
-            write_buffer_size: 4 * 1024,
-            l0_compaction_trigger: 1,
-            compaction_style: CompactionStyle::Universal,
-            ..Options::default()
-        };
+        let opts = Options::default()
+            .write_buffer_size(4 * 1024)
+            .l0_compaction_trigger(1)
+            .compaction_style(CompactionStyle::Universal);
         let dir = TempDir::new().unwrap();
         let db = Db::open(dir.path(), opts).unwrap();
         for i in 0..64 {
             let k = format!("k{i:04}");
-            db.put(k.as_bytes(), &vec![0xCC; 256]).unwrap();
+            crate::through_stalls(|| db.put(k.as_bytes(), &vec![0xCC; 256])).unwrap();
         }
-        db.compact_range(None, None).unwrap();
+        db.compact_range(None, None).wait().unwrap();
         std::thread::sleep(std::time::Duration::from_millis(100));
 
         let l1 = db.get_int_property("regolith.num-files-at-level1").unwrap();
@@ -8169,21 +8427,19 @@ mod tests {
         // After a full universal compact_range, we expect the
         // output to be a single L0 file (min cardinality). This
         // exercises the compact_range full-merge path.
-        let opts = Options {
-            write_buffer_size: 4 * 1024,
-            compaction_style: CompactionStyle::Universal,
-            ..Options::default()
-        };
+        let opts = Options::default()
+            .write_buffer_size(4 * 1024)
+            .compaction_style(CompactionStyle::Universal);
         let dir = TempDir::new().unwrap();
         let db = Db::open(dir.path(), opts).unwrap();
         for i in 0..32 {
             let k = format!("k{i:04}");
-            db.put(k.as_bytes(), &vec![0xAA; 512]).unwrap();
+            crate::through_stalls(|| db.put(k.as_bytes(), &vec![0xAA; 512])).unwrap();
         }
         // Give the background scheduler a moment to potentially
         // kick off work, then force-merge synchronously.
         std::thread::sleep(std::time::Duration::from_millis(50));
-        db.compact_range(None, None).unwrap();
+        db.compact_range(None, None).wait().unwrap();
         std::thread::sleep(std::time::Duration::from_millis(100));
 
         let l0 = db.get_int_property("regolith.num-files-at-level0").unwrap();
@@ -8198,14 +8454,12 @@ mod tests {
         // Tiny memtable + tight FIFO cap: sustained writes should
         // produce many L0 files, and after each flush the oldest
         // ones should be unlinked so the total stays bounded.
-        let opts = Options {
-            write_buffer_size: 4 * 1024,
-            compaction_style: CompactionStyle::Fifo,
-            fifo_compaction_options: FifoCompactionOptions {
+        let opts = Options::default()
+            .write_buffer_size(4 * 1024)
+            .compaction_style(CompactionStyle::Fifo)
+            .fifo_compaction_options(FifoCompactionOptions {
                 max_table_files_size: 32 * 1024,
-            },
-            ..Options::default()
-        };
+            });
         let dir = TempDir::new().unwrap();
         let db = Db::open(dir.path(), opts).unwrap();
 
@@ -8215,7 +8469,7 @@ mod tests {
         let payload = vec![0xEEu8; 256];
         for i in 0..256 {
             let k = format!("k{i:06}");
-            db.put(k.as_bytes(), &payload).unwrap();
+            crate::through_stalls(|| db.put(k.as_bytes(), &payload)).unwrap();
         }
 
         // Give the background compaction thread a moment to
@@ -8224,8 +8478,8 @@ mod tests {
 
         // Force any remaining flushes through and run one more
         // FIFO pass via compact_range (which acquires the
-        // compaction lock and drains pending work).
-        db.compact_range(None, None).unwrap();
+        // compaction gate and drains pending work).
+        db.compact_range(None, None).wait().unwrap();
         std::thread::sleep(std::time::Duration::from_millis(100));
 
         let total = db
@@ -8249,22 +8503,20 @@ mod tests {
         // A single oversized file must not be deleted - FIFO
         // refuses to drop the last surviving SST because that
         // would wipe the database.
-        let opts = Options {
-            write_buffer_size: 4 * 1024,
-            compaction_style: CompactionStyle::Fifo,
-            fifo_compaction_options: FifoCompactionOptions {
+        let opts = Options::default()
+            .write_buffer_size(4 * 1024)
+            .compaction_style(CompactionStyle::Fifo)
+            .fifo_compaction_options(FifoCompactionOptions {
                 max_table_files_size: 1, // 1 byte cap: always over limit
-            },
-            ..Options::default()
-        };
+            });
         let dir = TempDir::new().unwrap();
         let db = Db::open(dir.path(), opts).unwrap();
         for i in 0..32 {
             let k = format!("k{i:04}");
-            db.put(k.as_bytes(), &vec![0xAA; 512]).unwrap();
+            crate::through_stalls(|| db.put(k.as_bytes(), &vec![0xAA; 512])).unwrap();
         }
         std::thread::sleep(std::time::Duration::from_millis(200));
-        db.compact_range(None, None).unwrap();
+        db.compact_range(None, None).wait().unwrap();
         std::thread::sleep(std::time::Duration::from_millis(100));
 
         let l0 = db.get_int_property("regolith.num-files-at-level0").unwrap();
@@ -8279,20 +8531,18 @@ mod tests {
         // Under FIFO, the background scheduler should never
         // promote files from L0 to L1. The `l0_compaction_trigger`
         // knob is a level-style knob and must have no effect.
-        let opts = Options {
-            write_buffer_size: 4 * 1024,
-            l0_compaction_trigger: 2,
-            compaction_style: CompactionStyle::Fifo,
-            fifo_compaction_options: FifoCompactionOptions {
+        let opts = Options::default()
+            .write_buffer_size(4 * 1024)
+            .l0_compaction_trigger(2)
+            .compaction_style(CompactionStyle::Fifo)
+            .fifo_compaction_options(FifoCompactionOptions {
                 max_table_files_size: 10 * 1024 * 1024,
-            },
-            ..Options::default()
-        };
+            });
         let dir = TempDir::new().unwrap();
         let db = Db::open(dir.path(), opts).unwrap();
         for i in 0..64 {
             let k = format!("k{i:04}");
-            db.put(k.as_bytes(), &vec![0xBB; 256]).unwrap();
+            crate::through_stalls(|| db.put(k.as_bytes(), &vec![0xBB; 256])).unwrap();
         }
         std::thread::sleep(std::time::Duration::from_millis(200));
 
@@ -8346,16 +8596,13 @@ mod tests {
         // Tiny write_buffer so writes between drains roll
         // memtables and produce L0 files. The tailing iter must
         // pick up those new SSTs on the next refresh.
-        let opts = Options {
-            write_buffer_size: 4 * 1024,
-            ..Options::default()
-        };
+        let opts = Options::default().write_buffer_size(4 * 1024);
         let dir = TempDir::new().unwrap();
         let db = Db::open(dir.path(), opts).unwrap();
 
         for i in 0..16 {
             let k = format!("log/{i:04}");
-            db.put(k.as_bytes(), &vec![0xAA; 256]).unwrap();
+            crate::through_stalls(|| db.put(k.as_bytes(), &vec![0xAA; 256])).unwrap();
         }
 
         let mut tail = db.iter_tailing();
@@ -8370,10 +8617,10 @@ mod tests {
         // Force a flush and a compaction - the existing tail
         // iter is no longer pinned to anything visible, but a
         // refresh + new writes should still work.
-        db.compact_range(None, None).unwrap();
+        db.compact_range(None, None).wait().unwrap();
         for i in 16..32 {
             let k = format!("log/{i:04}");
-            db.put(k.as_bytes(), &vec![0xBB; 256]).unwrap();
+            crate::through_stalls(|| db.put(k.as_bytes(), &vec![0xBB; 256])).unwrap();
         }
 
         tail.refresh();
@@ -8455,21 +8702,19 @@ mod tests {
         // `regolith.block-cache-usage` property must report a
         // positive number once at least one read has happened
         // against a file that isn't entirely in the memtable.
-        let opts = Options {
-            write_buffer_size: 4 * 1024,
-            block_cache_size: 1024 * 1024,
-            ..Options::default()
-        };
+        let opts = Options::default()
+            .write_buffer_size(4 * 1024)
+            .block_cache_size(1024 * 1024);
         let dir = TempDir::new().unwrap();
         let db = Db::open(dir.path(), opts).unwrap();
 
         let payload = vec![0xABu8; 256];
         for i in 0..200 {
             let k = format!("k{i:04}");
-            db.put(k.as_bytes(), &payload).unwrap();
+            crate::through_stalls(|| db.put(k.as_bytes(), &payload)).unwrap();
         }
         // Force a flush so the reads below have to touch SST blocks.
-        db.compact_range(None, None).unwrap();
+        db.compact_range(None, None).wait().unwrap();
 
         // Read a few keys to populate the block cache.
         for i in 0..50 {
@@ -8505,18 +8750,13 @@ mod tests {
         // few KB and nothing meaningful would be throttled). A
         // 16 MB buffer keeps everything in the memtable until
         // compact_range triggers a flush + compaction, both of
-        // which the limiter throttles.
-        let limiter = Arc::new(TokenBucketRateLimiter::new(
-            100_000,
-            Duration::from_millis(50),
-            5_000,
-        ));
-        let opts = Options {
-            write_buffer_size: 16 * 1024 * 1024,
-            compression: CompressionType::None,
-            rate_limiter: Some(limiter.clone() as Arc<dyn RateLimiter>),
-            ..Options::default()
-        };
+        // which the limiter throttles: the job runs on the worker,
+        // the only thread the limiter applies to.
+        let limiter = Arc::new(TokenBucketRateLimiter::new(100_000, 5_000));
+        let opts = Options::default()
+            .write_buffer_size(16 * 1024 * 1024)
+            .compression(CompressionType::None)
+            .rate_limiter(Some(limiter.clone() as Arc<dyn RateLimiter>));
 
         let dir = TempDir::new().unwrap();
         let db = Db::open(dir.path(), opts).unwrap();
@@ -8532,15 +8772,14 @@ mod tests {
         }
 
         let start = Instant::now();
-        db.compact_range(None, None).unwrap();
+        db.compact_range(None, None).wait().unwrap();
         let elapsed = start.elapsed();
 
         // With ~10 KB of uncompressed output flushed + compacted at
         // 100 KB/s past a 5 KB burst, we expect the critical path
-        // to block for at least one refill period (~50 ms) and in
-        // practice several. Assert a conservative floor to confirm
-        // the limiter was actually consulted without flaking on
-        // CI variance.
+        // to block for at least 50 ms and in practice more. Assert a
+        // conservative floor to confirm the limiter was actually
+        // consulted without flaking on CI variance.
         assert!(
             elapsed >= Duration::from_millis(100),
             "compaction with 100KB/s limiter finished in {elapsed:?}, expected >= 100ms"
@@ -8554,25 +8793,50 @@ mod tests {
         assert_eq!(limiter.get_total_bytes_through(Priority::High), 0);
     }
 
+    /// Wait, with a deadline and a bounded backoff, until the background
+    /// has written L0 up to `files` tables, a count at which the caller's
+    /// options stall writes, and a write meets that stall.
+    ///
+    /// The table count alone runs ahead of the stall: a flush publishes its
+    /// table first and refreshes the level writers check after it, so a
+    /// write between the two is still admitted.
+    pub(crate) fn wait_for_l0_files(db: &Db, files: u64) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        let mut pause = std::time::Duration::from_millis(1);
+        while db
+            .get_int_property("regolith.num-files-at-level0")
+            .unwrap_or(0)
+            < files
+            || db.engine.admit_write(true).is_ok()
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the background never wrote L0 up to {files} tables and stalled writes"
+            );
+            std::thread::sleep(pause);
+            pause = (pause * 2).min(std::time::Duration::from_millis(50));
+        }
+    }
+
+    /// A slowdown never delays a write: no sleep, so no stall time is
+    /// charged, and every write under it lands.
     #[test]
-    fn test_write_stall_slowdown_accumulates_micros() {
+    fn a_slowdown_never_delays_a_write() {
         use std::sync::Arc;
 
         let stats = Arc::new(Statistics::new());
-        let opts = Options {
+        let opts = Options::default()
             // Tiny memtable so every handful of puts rolls an L0 file.
-            write_buffer_size: 4 * 1024,
+            .write_buffer_size(4 * 1024)
             // Disable automatic compaction so L0 can't drain on us.
-            l0_compaction_trigger: 1000,
+            .l0_compaction_trigger(1000)
             // Slow down once L0 has 2 files, never stop (high trigger).
-            level0_slowdown_writes_trigger: 2,
-            level0_stop_writes_trigger: 10_000,
+            .level0_slowdown_writes_trigger(2)
+            .level0_stop_writes_trigger(10_000)
             // Disable the memtable-count trigger for this test so we
             // isolate the L0 slowdown path.
-            max_write_buffer_number: 0,
-            statistics: Some(stats.clone()),
-            ..Options::default()
-        };
+            .max_write_buffer_number(0)
+            .statistics(Some(stats.clone()));
         let dir = TempDir::new().unwrap();
         let db = Db::open(dir.path(), opts).unwrap();
 
@@ -8581,37 +8845,48 @@ mod tests {
         // memtable rolls, and after the 2nd flush L0 hits the
         // slowdown trigger.
         let payload = vec![0xCDu8; 600];
-        for i in 0..128 {
+        for i in 0..64 {
             let k = format!("k{i:04}");
-            db.put(k.as_bytes(), &payload).unwrap();
+            crate::through_stalls(|| db.put(k.as_bytes(), &payload)).unwrap();
         }
-
-        let stall = stats.get_ticker(Ticker::WriteStallMicros);
+        // The worker writes the sealed memtables out off the commit path;
+        // the writes after that run under the slowdown.
+        wait_for_l0_files(&db, 2);
         assert!(
-            stall > 0,
-            "expected WriteStallMicros > 0 after crossing slowdown trigger, got {stall}"
+            db.engine.stall_signal().classify().is_some(),
+            "precondition: the slowdown holds"
         );
+        for i in 64..128 {
+            let k = format!("k{i:04}");
+            crate::through_stalls(|| db.put(k.as_bytes(), &payload)).unwrap();
+        }
+        assert_eq!(
+            stats.get_ticker(Ticker::WriteStallMicros),
+            0,
+            "a slowdown sleeps for nothing, so it charges nothing"
+        );
+        assert_eq!(db.get(b"k0127").unwrap(), Some(payload));
     }
 
     #[test]
     fn test_write_stall_no_slowdown_returns_busy() {
-        let opts = Options {
-            write_buffer_size: 4 * 1024,
-            l0_compaction_trigger: 1000,
-            level0_slowdown_writes_trigger: 2,
-            level0_stop_writes_trigger: 10_000,
-            max_write_buffer_number: 0,
-            ..Options::default()
-        };
+        let opts = Options::default()
+            .write_buffer_size(4 * 1024)
+            .l0_compaction_trigger(1000)
+            .level0_slowdown_writes_trigger(2)
+            .level0_stop_writes_trigger(10_000)
+            .max_write_buffer_number(0);
         let dir = TempDir::new().unwrap();
         let db = Db::open(dir.path(), opts).unwrap();
 
-        // Build up L0 past the slowdown trigger.
+        // Build up L0 past the slowdown trigger. The worker writes the
+        // sealed memtables out off the commit path.
         let payload = vec![0xEFu8; 600];
         for i in 0..64 {
             let k = format!("k{i:04}");
-            db.put(k.as_bytes(), &payload).unwrap();
+            crate::through_stalls(|| db.put(k.as_bytes(), &payload)).unwrap();
         }
+        wait_for_l0_files(&db, 2);
 
         // A write with `no_slowdown` must now return Busy rather
         // than sleep or block.
@@ -8626,68 +8901,58 @@ mod tests {
         );
     }
 
+    /// A write a stop stopped returns at once with a wait, applies nothing,
+    /// and the wait completes when a compaction clears the stop; the write
+    /// run again lands.
     #[test]
-    fn test_write_stall_stop_unblocks_after_compaction() {
+    fn a_stopped_write_returns_a_wait_the_clearing_compaction_completes() {
         use std::sync::Arc;
-        use std::thread;
-        use std::time::{Duration, Instant};
 
         // Stop writes entirely once L0 hits 2 files.
-        let opts = Options {
-            write_buffer_size: 4 * 1024,
-            l0_compaction_trigger: 1000,
-            level0_slowdown_writes_trigger: 0,
-            level0_stop_writes_trigger: 2,
-            max_write_buffer_number: 0,
-            ..Options::default()
-        };
+        let opts = Options::default()
+            .write_buffer_size(4 * 1024)
+            .l0_compaction_trigger(1000)
+            .level0_slowdown_writes_trigger(0)
+            .level0_stop_writes_trigger(2)
+            .max_write_buffer_number(0);
         let dir = TempDir::new().unwrap();
         let db = Arc::new(Db::open(dir.path(), opts).unwrap());
 
-        // Fill L0 to the stop trigger. Writes go through until the
-        // snapshot after the flush shows L0 >= 2; from then on the
-        // next write would block, so we time it carefully with a
-        // spawned thread.
+        // Fill L0 to the stop trigger. Writes go through until two
+        // memtables are sealed; the worker writes them out to L0, and
+        // from then on the next write would block, so we time it
+        // carefully with a spawned thread.
         let payload = vec![0x12u8; 600];
+        let l0 = || {
+            db.get_int_property("regolith.num-files-at-level0")
+                .unwrap_or(0)
+        };
         for i in 0..32 {
             let k = format!("fill{i:04}");
-            db.put(k.as_bytes(), &payload).unwrap();
-            if db
-                .get_int_property("regolith.num-files-at-level0")
-                .unwrap_or(0)
-                >= 2
-            {
+            crate::through_stalls(|| db.put(k.as_bytes(), &payload)).unwrap();
+            if l0() + db.engine.frozen_memtables() as u64 >= 2 {
                 break;
             }
         }
-        let l0 = db
-            .get_int_property("regolith.num-files-at-level0")
-            .unwrap_or(0);
-        assert!(l0 >= 2, "precondition: need L0 >= 2, got {l0}");
+        wait_for_l0_files(&db, 2);
 
-        let db_writer = db.clone();
-        let blocked = thread::spawn(move || {
-            let start = Instant::now();
-            db_writer.put(b"stopkey", b"stopval").unwrap();
-            start.elapsed()
-        });
+        let stall = match db.put(b"stopkey", b"stopval") {
+            Err(Error::WouldBlock(WouldBlock::Stall(stall))) => stall,
+            other => panic!("a stopped write must return its wait, got {other:?}"),
+        };
+        assert_eq!(stall.queue(), None, "this thread has no queue");
+        assert!(!stall.is_ready());
+        assert_eq!(db.get(b"stopkey").unwrap(), None, "it applied nothing");
 
-        // Give the writer time to fully enter the stall loop.
-        thread::sleep(Duration::from_millis(50));
-        assert!(!blocked.is_finished(), "writer should be blocked on stall");
-
-        // compact_range empties L0 and fires stall_signal.notify_all
-        // from the compaction loop after the pass. The writer should
-        // wake promptly.
-        db.compact_range(None, None).unwrap();
-
-        let waited = blocked.join().unwrap();
+        // compact_range empties L0; the pass that does refreshes the stall
+        // and lands its unit, which completes the wait directly.
+        db.compact_range(None, None).wait().unwrap();
         assert!(
-            waited < Duration::from_secs(5),
-            "blocked writer took too long to unblock: {waited:?}"
+            stall.is_ready(),
+            "the clearing compaction completed the wait"
         );
 
-        // The key we wrote while stalled is readable afterwards.
+        crate::through_stalls(|| db.put(b"stopkey", b"stopval")).unwrap();
         assert_eq!(db.get(b"stopkey").unwrap(), Some(b"stopval".to_vec()));
     }
 
@@ -8699,21 +8964,18 @@ mod tests {
         // branch.
         use std::time::Instant;
 
-        let opts = Options {
-            write_buffer_size: 64 * 1024,
-            ..Options::default()
-        };
+        let opts = Options::default().write_buffer_size(64 * 1024);
         let dir = TempDir::new().unwrap();
         let db = Db::open(dir.path(), opts).unwrap();
 
         let payload = vec![0xABu8; 1024];
         for i in 0..256 {
             let k = format!("k{i:06}");
-            db.put(k.as_bytes(), &payload).unwrap();
+            crate::through_stalls(|| db.put(k.as_bytes(), &payload)).unwrap();
         }
 
         let start = Instant::now();
-        db.compact_range(None, None).unwrap();
+        db.compact_range(None, None).wait().unwrap();
         assert!(
             start.elapsed() < std::time::Duration::from_secs(5),
             "unthrottled compaction took unreasonably long: {:?}",

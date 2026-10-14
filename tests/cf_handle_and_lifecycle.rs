@@ -20,14 +20,12 @@ use std::time::{Duration, Instant};
 use regolith::{CompactionOutcome, Db, Error, Options, WriteBatch};
 
 fn small() -> Options {
-    Options {
-        write_buffer_size: 64 * 1024,
-        block_size: 4 * 1024,
-        block_cache_size: 0,
-        target_file_size: 128 * 1024,
-        l0_compaction_trigger: 2,
-        ..Options::default()
-    }
+    Options::default()
+        .write_buffer_size(64 * 1024)
+        .block_size(4 * 1024)
+        .block_cache_size(0)
+        .target_file_size(128 * 1024)
+        .l0_compaction_trigger(2)
 }
 
 #[test]
@@ -36,7 +34,7 @@ fn a_dropped_cf_handle_is_an_error_on_the_iterator_paths_too() {
     let db = Db::open(dir.path(), small()).unwrap();
 
     let cf = db.create_column_family("things").unwrap();
-    db.put_cf(&cf, b"a", b"1").unwrap();
+    regolith::through_stalls(|| db.put_cf(&cf, b"a", b"1")).unwrap();
     db.drop_column_family(cf.clone()).unwrap();
 
     // The rest of the CF surface already reports this.
@@ -71,7 +69,7 @@ fn a_dropped_cf_handle_is_an_error_on_the_iterator_paths_too() {
 
     // A live handle is unaffected, and reports clean.
     let live = db.create_column_family("live").unwrap();
-    db.put_cf(&live, b"k", b"v").unwrap();
+    regolith::through_stalls(|| db.put_cf(&live, b"k", b"v")).unwrap();
     let mut ok = db.iter_cf(&live);
     ok.seek_to_first();
     assert!(ok.valid());
@@ -85,10 +83,7 @@ fn drop_all_is_not_undone_by_a_compaction_that_was_already_running() {
     // than hoped for.
     for round in 0..8 {
         let dir = tempfile::tempdir().unwrap();
-        let opts = Options {
-            max_background_compactions: 4,
-            ..small()
-        };
+        let opts = small().max_background_compactions(4);
         let db = Db::open(dir.path(), opts.clone()).unwrap();
 
         let value = [b'v'; 128];
@@ -96,10 +91,11 @@ fn drop_all_is_not_undone_by_a_compaction_that_was_already_running() {
         for i in 0..20_000u64 {
             batch.put(&i.to_be_bytes(), &value);
             if batch.buffered_bytes() >= 64 * 1024 {
-                db.write(std::mem::take(&mut batch)).unwrap();
+                let full = std::mem::take(&mut batch);
+                regolith::through_stalls(|| db.write(full.clone())).unwrap();
             }
         }
-        db.write(batch).unwrap();
+        regolith::through_stalls(|| db.write(batch.clone())).unwrap();
 
         db.drop_all().unwrap();
 
@@ -139,10 +135,7 @@ fn close_returns_while_an_ingest_holds_the_compaction_gate() {
     // assertion is simply that this returns.
     for round in 0..6 {
         let dir = tempfile::tempdir().unwrap();
-        let opts = Options {
-            max_background_compactions: 4,
-            ..small()
-        };
+        let opts = small().max_background_compactions(4);
         let db = Arc::new(Db::open(dir.path(), opts).unwrap());
 
         let value = [b'v'; 128];
@@ -150,10 +143,11 @@ fn close_returns_while_an_ingest_holds_the_compaction_gate() {
         for i in 0..8_000u64 {
             batch.put(&i.to_be_bytes(), &value);
             if batch.buffered_bytes() >= 32 * 1024 {
-                db.write(std::mem::take(&mut batch)).unwrap();
+                let full = std::mem::take(&mut batch);
+                regolith::through_stalls(|| db.write(full.clone())).unwrap();
             }
         }
-        db.write(batch).unwrap();
+        regolith::through_stalls(|| db.write(batch.clone())).unwrap();
 
         let writer = {
             let db = Arc::clone(&db);
@@ -161,7 +155,9 @@ fn close_returns_while_an_ingest_holds_the_compaction_gate() {
                 // Keep the engine busy so workers are live and contending
                 // when the close lands.
                 for i in 0..4_000u64 {
-                    if db.put(&(1_000_000 + i).to_be_bytes(), b"x").is_err() {
+                    if regolith::through_stalls(|| db.put(&(1_000_000 + i).to_be_bytes(), b"x"))
+                        .is_err()
+                    {
                         break;
                     }
                 }
@@ -207,7 +203,7 @@ fn a_drop_that_returned_is_seen_by_every_batch_that_starts_after_it() {
                 batch.put(format!("d{i}").as_bytes(), b"v");
                 batch.put_cf(&hot, format!("h{i}").as_bytes(), b"v");
                 batch.put(format!("e{i}").as_bytes(), b"v");
-                let r = db.write(batch);
+                let r = regolith::through_stalls(|| db.write(batch.clone()));
                 if r.is_ok() {
                     ok_count += 1;
                     if ok_count == 64 && !sent {

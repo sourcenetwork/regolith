@@ -19,10 +19,7 @@ impl MergeOperator for Concat {
 }
 
 fn opts() -> Options {
-    Options {
-        merge_operator: Some(Arc::new(Concat)),
-        ..Options::default()
-    }
+    Options::default().merge_operator(Some(Arc::new(Concat)))
 }
 
 #[test]
@@ -77,7 +74,7 @@ fn repro_c_after_flush() {
     let dir = TempDir::new().unwrap();
     let db = Db::open(dir.path(), opts()).unwrap();
     db.merge(b"k0001", b"abc").unwrap();
-    db.compact_range(None, None).unwrap();
+    db.compact_range(None, None).wait().unwrap();
 
     let mut it = db.iter();
     it.seek_for_prev(b"k0001");

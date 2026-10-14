@@ -17,6 +17,7 @@ use std::time::{Duration, Instant};
 
 use regolith::{
     IsolationLevel, OptimisticTransactionDb, Transaction, TransactionDb, TransactionError,
+    TxnOptions,
 };
 
 const COUNTER_KEY: &[u8] = b"txn/counter";
@@ -36,15 +37,15 @@ const MAX_ATTEMPTS: u32 = 10_000;
 /// written once against this local one and neither flavor gets its own
 /// subtly different copy of the loop.
 trait TxnDb: Sync {
-    fn begin(&self) -> Transaction<'_>;
+    fn begin(&self) -> Transaction;
     fn read(&self, key: &[u8]) -> Option<Vec<u8>>;
 }
 
 macro_rules! impl_txn_db {
     ($flavor:ty) => {
         impl TxnDb for $flavor {
-            fn begin(&self) -> Transaction<'_> {
-                self.begin_transaction()
+            fn begin(&self) -> Transaction {
+                self.begin(&TxnOptions::new())
             }
 
             fn read(&self, key: &[u8]) -> Option<Vec<u8>> {
@@ -115,7 +116,7 @@ struct Attempts {
     commits: u64,
     conflicts: u64,
     busy: u64,
-    io_errors: u64,
+    engine_errors: u64,
     other_errors: u64,
     abandoned: u64,
 }
@@ -125,7 +126,7 @@ impl Attempts {
         self.commits += o.commits;
         self.conflicts += o.conflicts;
         self.busy += o.busy;
-        self.io_errors += o.io_errors;
+        self.engine_errors += o.engine_errors;
         self.other_errors += o.other_errors;
         self.abandoned += o.abandoned;
     }
@@ -134,18 +135,18 @@ impl Attempts {
         match e {
             TransactionError::Conflict { .. } => self.conflicts += 1,
             TransactionError::Busy(_) => self.busy += 1,
-            TransactionError::Io(_) => self.io_errors += 1,
+            TransactionError::Engine(_) => self.engine_errors += 1,
             _ => self.other_errors += 1,
         }
     }
 
     fn json(&self) -> String {
         format!(
-            "{{\"commits\":{},\"conflicts\":{},\"busy\":{},\"io_errors\":{},\"other_errors\":{},\"abandoned\":{}}}",
+            "{{\"commits\":{},\"conflicts\":{},\"busy\":{},\"engine_errors\":{},\"other_errors\":{},\"abandoned\":{}}}",
             self.commits,
             self.conflicts,
             self.busy,
-            self.io_errors,
+            self.engine_errors,
             self.other_errors,
             self.abandoned
         )
@@ -192,7 +193,7 @@ fn bump(db: &dyn TxnDb, key: &[u8]) -> Attempts {
             continue;
         }
         match tx.commit() {
-            Ok(()) => {
+            Ok(_) => {
                 acc.commits += 1;
                 return acc;
             }
@@ -206,14 +207,21 @@ fn bump(db: &dyn TxnDb, key: &[u8]) -> Attempts {
     acc
 }
 
-fn fan_out(threads: usize, body: impl Fn(usize) -> Attempts + Sync) -> Attempts {
+/// Run `body` on `threads` threads from a common start, and return what they
+/// did with the wall time from that start until the last one is done.
+fn fan_out(threads: usize, body: impl Fn(usize) -> Attempts + Sync) -> (Attempts, Duration) {
+    let line = common::start::StartLine::new(threads);
     std::thread::scope(|scope| {
         let handles: Vec<_> = (0..threads)
             .map(|t| {
-                let body = &body;
-                scope.spawn(move || body(t))
+                let (body, line) = (&body, &line);
+                scope.spawn(move || {
+                    line.wait();
+                    body(t)
+                })
             })
             .collect();
+        let start = line.start();
         let mut total = Attempts::default();
         for h in handles {
             total.add(
@@ -221,7 +229,7 @@ fn fan_out(threads: usize, body: impl Fn(usize) -> Attempts + Sync) -> Attempts 
                     .unwrap_or_else(|_| panic!("worker thread panicked")),
             );
         }
-        total
+        (total, start.elapsed())
     })
 }
 
@@ -247,7 +255,7 @@ impl Race {
 }
 
 fn counter_race(db: &dyn TxnDb) -> Race {
-    let attempts = fan_out(RACE_THREADS, |_| {
+    let (attempts, _) = fan_out(RACE_THREADS, |_| {
         let mut acc = Attempts::default();
         for _ in 0..RACE_INCREMENTS {
             acc.add(bump(db, COUNTER_KEY));
@@ -330,15 +338,14 @@ fn hot_key(n: u64) -> Vec<u8> {
 /// Every thread walks the same small key set from a different starting
 /// offset, so each round has all eight threads overlapping.
 fn contended_rate(db: &dyn TxnDb, per_thread: u64) -> (f64, Attempts) {
-    let start = Instant::now();
-    let attempts = fan_out(CONTENDED_THREADS, |t| {
+    let (attempts, elapsed) = fan_out(CONTENDED_THREADS, |t| {
         let mut acc = Attempts::default();
         for i in 0..per_thread {
             acc.add(bump(db, &hot_key(t as u64 + i)));
         }
         acc
     });
-    (rate(attempts.commits, start.elapsed()), attempts)
+    (rate(attempts.commits, elapsed), attempts)
 }
 
 struct Timing {

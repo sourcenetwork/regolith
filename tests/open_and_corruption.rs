@@ -19,19 +19,20 @@ use std::time::{Duration, Instant};
 use regolith::{Db, DurabilityMode, Options, RateLimiter};
 use tempfile::TempDir;
 
+mod common;
+
 fn opts() -> Options {
-    Options {
-        write_buffer_size: 4 * 1024,
-        ..Options::default()
-    }
+    Options::default().write_buffer_size(4 * 1024)
 }
 
 fn fill(db: &Db, n: usize) {
     for i in 0..n {
-        db.put(
-            format!("key_{i:06}").as_bytes(),
-            format!("val_{i:06}").as_bytes(),
-        )
+        regolith::through_stalls(|| {
+            db.put(
+                format!("key_{i:06}").as_bytes(),
+                format!("val_{i:06}").as_bytes(),
+            )
+        })
         .unwrap();
     }
 }
@@ -55,7 +56,7 @@ fn seeded_db(keys: usize) -> TempDir {
     let dir = TempDir::new().unwrap();
     let db = Db::open(dir.path(), opts()).unwrap();
     fill(&db, keys);
-    db.compact_range(None, None).unwrap();
+    db.compact_range(None, None).wait().unwrap();
     db.close().unwrap();
     dir
 }
@@ -140,7 +141,7 @@ fn a_failed_open_leaves_no_stale_lock_file() {
     fs::remove_file(dir.path().join("sst")).unwrap();
     // The next open must succeed: nothing may be left holding the lock.
     let db = Db::open(dir.path(), Options::default()).unwrap();
-    db.put(b"k", b"v").unwrap();
+    regolith::through_stalls(|| db.put(b"k", b"v")).unwrap();
     assert_eq!(db.get(b"k").unwrap(), Some(b"v".to_vec()));
 }
 
@@ -188,11 +189,9 @@ fn wal_only_copy(keys: usize) -> TempDir {
     let live = TempDir::new().unwrap();
     let db = Db::open(
         live.path(),
-        Options {
-            write_buffer_size: 8 * 1024 * 1024,
-            durability: DurabilityMode::Immediate,
-            ..Options::default()
-        },
+        Options::default()
+            .write_buffer_size(8 * 1024 * 1024)
+            .durability(DurabilityMode::Immediate),
     )
     .unwrap();
     fill(&db, keys);
@@ -299,41 +298,29 @@ fn vm_peak_kib() -> u64 {
 
 #[test]
 fn a_wal_claiming_a_huge_record_does_not_allocate_it() {
-    // The real record is captured while the database is still open: a
-    // clean close flushes the memtable and leaves the WAL empty, and this
-    // test needs a whole record to sit *after* the damage. That placement
-    // is what makes a bogus length corruption rather than the short
-    // trailing record every crash leaves behind, which replay is required
-    // to accept as the end of the log.
+    // The log is captured while the database is still open, with two
+    // synced records: the second proves the first durable, so a bogus
+    // length on the first is corruption rather than the short trailing
+    // record every crash leaves behind, which replay is required to
+    // accept as the end of the log.
     let dir = TempDir::new().unwrap();
-    let record = {
-        let db = Db::open(
-            dir.path(),
-            Options {
-                durability: DurabilityMode::Immediate,
-                ..opts()
-            },
-        )
-        .unwrap();
-        db.put(b"k", b"v").unwrap();
+    let (wal, mut bytes) = {
+        let db = Db::open(dir.path(), opts().durability(DurabilityMode::Immediate)).unwrap();
+        regolith::through_stalls(|| db.put(b"k", b"v")).unwrap();
+        regolith::through_stalls(|| db.put(b"k2", b"v2")).unwrap();
         let wal = files_with_ext(&dir.path().join("wal"), "log")
             .pop()
             .expect("a wal file");
         let bytes = fs::read(&wal).unwrap();
-        db.close().unwrap();
-        bytes
+        drop(db);
+        (wal, bytes)
     };
-    assert!(!record.is_empty(), "the put must have reached the WAL");
+    let first = common::wal_format::record_bounds(&bytes)[0];
 
-    let wal = files_with_ext(&dir.path().join("wal"), "log")
-        .pop()
-        .expect("a wal file");
-    // A record header claiming u32::MAX bytes of payload, with a whole
-    // record behind it: replay must reject it against the file size
-    // rather than reserving 4 GiB for it.
-    let mut bytes = u32::MAX.to_le_bytes().to_vec();
-    bytes.push(0x01);
-    bytes.extend_from_slice(&record);
+    // The first record's header claims u32::MAX bytes of payload, with a
+    // whole record behind it: replay must reject it without reserving
+    // 4 GiB for it.
+    bytes[first..first + 4].copy_from_slice(&u32::MAX.to_le_bytes());
     fs::write(&wal, &bytes).unwrap();
 
     let before = vm_peak_kib();
@@ -353,7 +340,7 @@ fn wal_single_byte_flips_do_not_panic() {
     {
         let db = Db::open(template.path(), opts()).unwrap();
         for i in 0..40 {
-            db.put(format!("k{i:03}").as_bytes(), b"value").unwrap();
+            regolith::through_stalls(|| db.put(format!("k{i:03}").as_bytes(), b"value")).unwrap();
         }
         db.close().unwrap();
     }
@@ -463,9 +450,13 @@ fn a_truncated_sstable_does_not_panic() {
 // ---- public constructors and shutdown ----
 
 #[test]
-fn a_zero_refill_period_rate_limiter_does_not_panic() {
-    let limiter = regolith::TokenBucketRateLimiter::new(1024, Duration::ZERO, 4096);
+fn a_rate_limiter_serves_a_high_priority_request_at_once() {
+    let limiter = regolith::TokenBucketRateLimiter::new(1024, 4096);
     limiter.request(128, regolith::Priority::High);
+    assert_eq!(
+        limiter.get_total_bytes_through(regolith::Priority::High),
+        128
+    );
 }
 
 #[test]
@@ -474,13 +465,10 @@ fn close_does_not_wait_out_a_condvar_timeout_per_worker() {
         let dir = TempDir::new().unwrap();
         let db = Db::open(
             dir.path(),
-            Options {
-                max_background_compactions: workers,
-                ..Options::default()
-            },
+            Options::default().max_background_compactions(workers),
         )
         .unwrap();
-        db.put(b"k", b"v").unwrap();
+        regolith::through_stalls(|| db.put(b"k", b"v")).unwrap();
         let started = Instant::now();
         drop(db);
         let elapsed = started.elapsed();

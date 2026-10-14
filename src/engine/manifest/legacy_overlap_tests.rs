@@ -40,11 +40,14 @@ fn table(
         largest_key: summary.largest_user_key,
         file_size: std::fs::metadata(path).unwrap().len(),
         num_entries: summary.num_entries,
+        global_seq: None,
+        // A 0.1.x table: recorded without deletion counts.
+        deletions: None,
     }
 }
 
 /// Original single-edit frames, not the batch encoding used for the repair.
-fn manifest(dir: &Path, records: &[ManifestRecord]) -> Vec<u8> {
+pub(super) fn manifest(dir: &Path, records: &[ManifestRecord]) -> Vec<u8> {
     let mut bytes = VersionSet::encode_stamp().to_vec();
     for record in records {
         let mut payload = Vec::new();
@@ -62,7 +65,7 @@ pub(super) fn fixture() -> (TempDir, Vec<u8>) {
     fixture_with_ingest_seq(20)
 }
 
-fn fixture_with_ingest_seq(ingest_seq: u64) -> (TempDir, Vec<u8>) {
+pub(super) fn fixture_with_ingest_seq(ingest_seq: u64) -> (TempDir, Vec<u8>) {
     let dir = TempDir::new().unwrap();
     let sst_dir = dir.path().join("sst");
     std::fs::create_dir_all(&sst_dir).unwrap();
@@ -109,11 +112,19 @@ fn fixture_with_ingest_seq(ingest_seq: u64) -> (TempDir, Vec<u8>) {
     (dir, bytes)
 }
 
-fn ids(version: &Version, level: usize) -> Vec<u64> {
+pub(super) fn ids(version: &Version, level: usize) -> Vec<u64> {
     version.levels[level]
         .iter()
         .map(|f| f.meta.file_id)
         .collect()
+}
+
+/// How many tables the open that returned `vs` moved, with the move
+/// recorded in the manifest the way the engine's first edit records it.
+pub(super) fn record_move(vs: &mut VersionSet) -> u64 {
+    let tables = vs.take_demotion().map_or(0, |demotion| demotion.tables);
+    vs.apply(&[]).unwrap();
+    tables
 }
 
 pub(super) fn assert_layout(version: &Version) {
@@ -131,15 +142,15 @@ pub(super) fn assert_layout(version: &Version) {
 fn legacy_overlap_demotes_the_whole_prefix_and_preserves_table_age() {
     let (dir, _) = fixture();
     let sst_dir = dir.path().join("sst");
-    let vs = VersionSet::open(dir.path(), &sst_dir).expect("legacy overlap must be repairable");
+    let mut vs = VersionSet::open(dir.path(), &sst_dir).expect("legacy overlap must be repairable");
     assert_layout(&vs.current());
-    assert_eq!(vs.tables_demoted_at_open(), 3);
+    assert_eq!(record_move(&mut vs), 3);
     drop(vs);
 
     let repaired = std::fs::read(dir.path().join("MANIFEST")).unwrap();
     let mut vs = VersionSet::open(dir.path(), &sst_dir).unwrap();
     assert_layout(&vs.current());
-    assert_eq!(vs.tables_demoted_at_open(), 0);
+    assert_eq!(record_move(&mut vs), 0);
     assert_eq!(std::fs::read(vs.manifest_path()).unwrap(), repaired);
     vs.compact_manifest().unwrap();
     drop(vs);
@@ -149,20 +160,21 @@ fn legacy_overlap_demotes_the_whole_prefix_and_preserves_table_age() {
 #[test]
 fn read_only_open_repairs_the_view_without_modifying_the_manifest() {
     let (dir, bytes) = fixture();
-    let vs = VersionSet::open_read_only(
+    let mut vs = VersionSet::open_read_only(
         &crate::env::std_env(),
         dir.path(),
         &dir.path().join("sst"),
         MetadataPolicy::Pinned,
+        None,
     )
     .unwrap();
     assert_layout(&vs.current());
-    assert_eq!(vs.tables_demoted_at_open(), 3);
+    assert_eq!(vs.take_demotion().map(|demotion| demotion.tables), Some(3));
     assert_eq!(std::fs::read(vs.manifest_path()).unwrap(), bytes);
     drop(vs);
     let db = Db::open_read_only(dir.path(), options()).unwrap();
     assert_eq!(
-        db.get_int_property("regolith.recovery.tables_demoted"),
+        db.get_int_property("regolith.manifest.tables_demoted"),
         Some(3)
     );
     assert_eq!(db.get(b"k").unwrap().as_deref(), Some(b"new".as_slice()));
@@ -170,7 +182,7 @@ fn read_only_open_repairs_the_view_without_modifying_the_manifest() {
     assert_eq!(std::fs::read(dir.path().join("MANIFEST")).unwrap(), bytes);
 }
 
-fn options() -> Options {
+pub(super) fn options() -> Options {
     Options {
         max_background_compactions: 0,
         ..Options::default()
@@ -215,7 +227,7 @@ fn a_newer_demoted_range_tombstone_hides_an_older_shallow_point() {
     assert_eq!(db.get(b"k").unwrap().as_deref(), Some(b"latest".as_slice()));
     assert_eq!(snapshot.get(b"k").unwrap(), None);
     db.flush().unwrap();
-    db.compact_range(None, None).unwrap();
+    db.compact_range(None, None).wait().unwrap();
     assert_eq!(snapshot.get(b"k").unwrap(), None);
     assert_eq!(db.get(b"k").unwrap().as_deref(), Some(b"latest".as_slice()));
     drop(snapshot);
@@ -230,7 +242,7 @@ fn repaired_reads_snapshots_and_compaction_keep_the_newest_values() {
     let (dir, _) = fixture();
     let db = Db::open(dir.path(), options()).unwrap();
     assert_eq!(
-        db.get_int_property("regolith.recovery.tables_demoted"),
+        db.get_int_property("regolith.manifest.tables_demoted"),
         Some(3)
     );
     assert_eq!(db.get(b"k").unwrap().as_deref(), Some(b"new".as_slice()));
@@ -248,7 +260,7 @@ fn repaired_reads_snapshots_and_compaction_keep_the_newest_values() {
     db.put(b"k", b"latest").unwrap();
     db.delete(b"z").unwrap();
     db.flush().unwrap();
-    db.compact_range(None, None).unwrap();
+    db.compact_range(None, None).wait().unwrap();
     assert_eq!(
         snapshot.get(b"k").unwrap().as_deref(),
         Some(b"new".as_slice())
@@ -264,7 +276,7 @@ fn repaired_reads_snapshots_and_compaction_keep_the_newest_values() {
     drop(db);
     let db = Db::open(dir.path(), options()).unwrap();
     assert_eq!(
-        db.get_int_property("regolith.recovery.tables_demoted"),
+        db.get_int_property("regolith.manifest.tables_demoted"),
         Some(0)
     );
     assert_eq!(db.get(b"k").unwrap().as_deref(), Some(b"latest".as_slice()));
@@ -276,16 +288,16 @@ fn repaired_reads_snapshots_and_compaction_keep_the_newest_values() {
 fn a_torn_repair_batch_is_replayed_whole_or_repaired_again() {
     let (dir, legacy) = fixture();
     let sst_dir = dir.path().join("sst");
-    drop(VersionSet::open(dir.path(), &sst_dir).unwrap());
+    record_move(&mut VersionSet::open(dir.path(), &sst_dir).unwrap());
     let repaired = std::fs::read(dir.path().join("MANIFEST")).unwrap();
     assert!(repaired.starts_with(&legacy));
     assert!(repaired.len() > legacy.len());
     for cut in legacy.len()..=repaired.len() {
         std::fs::write(dir.path().join("MANIFEST"), &repaired[..cut]).unwrap();
-        let vs = VersionSet::open(dir.path(), &sst_dir).unwrap();
+        let mut vs = VersionSet::open(dir.path(), &sst_dir).unwrap();
         assert_layout(&vs.current());
         assert_eq!(
-            vs.tables_demoted_at_open(),
+            record_move(&mut vs),
             if cut == repaired.len() { 0 } else { 3 }
         );
         assert_eq!(
@@ -327,11 +339,11 @@ fn all_levels_through_the_deepest_overlap_are_demoted() {
         bytes.extend_from_slice(&checksum::manifest_record(len, &payload).to_le_bytes());
     }
     std::fs::write(dir.path().join("MANIFEST"), bytes).unwrap();
-    let vs = VersionSet::open(dir.path(), &sst_dir).unwrap();
+    let mut vs = VersionSet::open(dir.path(), &sst_dir).unwrap();
     assert_eq!(ids(&vs.current(), 0), [130, 131, 77, 8, 3, 10, 90]);
     assert!(vs.current().levels[1..=4].iter().all(Vec::is_empty));
     assert_eq!(ids(&vs.current(), 5), [140]);
-    assert_eq!(vs.tables_demoted_at_open(), 6);
+    assert_eq!(record_move(&mut vs), 6);
     assert_eq!(vs.current().next_file_id, 141);
 }
 
@@ -343,6 +355,7 @@ fn checkpoint_and_backup_preserve_the_repaired_layout() {
     crate::Checkpoint::new(&db)
         .unwrap()
         .create(checkpoint.path())
+        .wait()
         .unwrap();
     let checked = Db::open(checkpoint.path(), options()).unwrap();
     assert_eq!(
@@ -351,14 +364,14 @@ fn checkpoint_and_backup_preserve_the_repaired_layout() {
     );
     assert_eq!(checked.get(b"r").unwrap(), None);
     assert_eq!(
-        checked.get_int_property("regolith.recovery.tables_demoted"),
+        checked.get_int_property("regolith.manifest.tables_demoted"),
         Some(0)
     );
     let backup_dir = TempDir::new().unwrap();
     let mut backups = crate::BackupEngine::open(backup_dir.path()).unwrap();
     let backup = backups.create_backup(&db).unwrap();
     let restore_dir = TempDir::new().unwrap();
-    backups.restore(backup, restore_dir.path()).unwrap();
+    backups.restore(backup, restore_dir.path(), None).unwrap();
     let restored = Db::open(restore_dir.path(), options()).unwrap();
     assert_eq!(
         restored.get(b"k").unwrap().as_deref(),
@@ -370,7 +383,7 @@ fn checkpoint_and_backup_preserve_the_repaired_layout() {
     );
     assert_eq!(restored.get(b"r").unwrap(), None);
     assert_eq!(
-        restored.get_int_property("regolith.recovery.tables_demoted"),
+        restored.get_int_property("regolith.manifest.tables_demoted"),
         Some(0)
     );
 }

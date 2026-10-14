@@ -7,15 +7,13 @@
 //! These tests sweep the entry points rather than the three the original
 //! gate names, and pair each no-work call with a loaded control so a
 //! rejection that happens for the wrong reason is visible.
+#![cfg(not(target_arch = "wasm32"))]
 
 use regolith::{Db, Error, Options, WriteBatch, WriteOptions};
 use tempfile::TempDir;
 
 fn opts() -> Options {
-    Options {
-        write_buffer_size: 64 * 1024,
-        ..Options::default()
-    }
+    Options::default().write_buffer_size(64 * 1024)
 }
 
 fn assert_read_only(what: &str, got: regolith::Result<()>) {
@@ -41,7 +39,7 @@ fn every_no_work_write_is_refused_by_a_read_only_handle() {
     let dir = TempDir::new().expect("tempdir");
     let db = Db::open(dir.path(), opts()).expect("open");
     for i in 0..20u32 {
-        db.put(&i.to_be_bytes(), b"v").expect("put");
+        regolith::through_stalls(|| db.put(&i.to_be_bytes(), b"v")).expect("put");
     }
     db.close().expect("close");
     drop(db);
@@ -66,7 +64,7 @@ fn every_no_work_write_is_refused_by_a_read_only_handle() {
     );
     assert_read_only(
         "ingest_external_files(empty list)",
-        ro.ingest_external_files(&[], Default::default()),
+        ro.ingest_external_files(&[], Default::default()).wait(),
     );
 
     // Loaded controls: the same entry points with real work must refuse
@@ -78,7 +76,7 @@ fn every_no_work_write_is_refused_by_a_read_only_handle() {
     assert_read_only("put", ro.put(b"a", b"b"));
     assert_read_only("delete", ro.delete(b"a"));
     assert_read_only("drop_all", ro.drop_all());
-    assert_read_only("compact_range", ro.compact_range(None, None));
+    assert_read_only("compact_range", ro.compact_range(None, None).wait());
 
     // The handle still reads.
     assert_eq!(
@@ -94,7 +92,7 @@ fn every_no_work_write_is_refused_by_a_read_only_handle() {
 fn every_no_work_write_is_refused_by_a_closed_handle() {
     let dir = TempDir::new().expect("tempdir");
     let db = Db::open(dir.path(), opts()).expect("open");
-    db.put(b"k", b"v").expect("put");
+    regolith::through_stalls(|| db.put(b"k", b"v")).expect("put");
     let cf = db.default_cf();
     db.close().expect("close");
 
@@ -114,13 +112,13 @@ fn every_no_work_write_is_refused_by_a_closed_handle() {
     );
     assert_closed(
         "ingest_external_files(empty list)",
-        db.ingest_external_files(&[], Default::default()),
+        db.ingest_external_files(&[], Default::default()).wait(),
     );
 
     // A closed read-only handle must report Closed, not ReadOnly.
     let dir2 = TempDir::new().expect("tempdir");
     let seed = Db::open(dir2.path(), opts()).expect("open");
-    seed.put(b"k", b"v").expect("put");
+    regolith::through_stalls(|| seed.put(b"k", b"v")).expect("put");
     seed.close().expect("close");
     drop(seed);
     let ro = Db::open_read_only(dir2.path(), opts()).expect("open_read_only");

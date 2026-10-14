@@ -3,10 +3,10 @@
 //! [`BackupEngine`] keeps a directory of backups that deduplicate
 //! SSTable files across generations. Files are keyed in a `shared/`
 //! subdirectory by an xxh3-based content id, and each backup's
-//! manifest lists the `(level, file_id, content id, meta)` tuples that
+//! metadata lists the `(level, file_id, content id, meta)` tuples that
 //! reconstruct its version. Backing up an unchanged database a
-//! second time adds only the per-backup manifest, not the data.
-//! The content id and manifest checksum are fast accidental-corruption
+//! second time adds only the per-backup metadata, not the data.
+//! The content id and the metadata checksum are fast accidental-corruption
 //! guards, not adversarial tamper protection.
 //!
 //! On-disk layout:
@@ -14,7 +14,7 @@
 //! ```text
 //! backup_dir/
 //!   meta/
-//!     000001.backup       # per-backup manifest
+//!     000001.backup       # per-backup metadata
 //!     000002.backup
 //!   shared/
 //!     <32-hex>.sst        # content-hashed SST files
@@ -25,19 +25,36 @@
 //! Restores stream bytes back out of `shared/` into a fresh
 //! target directory and write a new MANIFEST reflecting the
 //! captured version.
+//!
+//! # Encrypted databases
+//!
+//! A backup of a database encrypted at rest ([`crate::Options::key_provider`])
+//! seals its metadata through the database's own key provider: the tables
+//! are copied as they are, already sealed, and the `.backup` file seals each
+//! table's key range and placement under the provider's current key, naming
+//! that key so a backup taken before a rotation restores after it. A restore
+//! takes a provider, refuses without one as the open does, and seals the
+//! MANIFEST it writes. Only what `shared/` shows anyway stays readable
+//! without a key: each table's content id and size, how many there are, and
+//! when the backup was taken. The `.backup` format is described in
+//! `src/backup/format.rs`; the rules are checked in
+//! `proofs/tla/BackupSeal.tla` and `proofs/lean/Regolith/BackupSeal.lean`.
+
+mod collect;
+mod format;
+mod listing;
+
+pub use listing::Backups;
 
 use std::io::{self};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-// The module's own tests inspect and corrupt the backup directory
-// directly, which is the one thing that has to bypass the environment.
-#[cfg(test)]
-use std::fs;
-
+use crate::engine::seal::Keyring;
 use crate::engine::{CheckpointSnapshot, checksum};
 use crate::env::{Env, ReadFileCursor, WriteMode};
-use crate::{Db, Error, Result};
+use crate::{Db, Error, KeyProvider, Result};
+use format::{BackupFileEntry, BackupManifest, Listing};
 
 /// Opaque identifier for a single backup generation. Monotonically
 /// increasing within a backup directory.
@@ -63,42 +80,49 @@ pub struct BackupInfo {
     pub bytes: u64,
 }
 
+/// A backup [`BackupEngine::list_backups`] found but could not read.
+///
+/// Its metadata file is in the repository, but what the backup holds cannot
+/// be read: the file is damaged, was written by a version of regolith this
+/// build does not read, or the disk failed the read. [`BackupEngine::restore`]
+/// refuses it for the same reason.
+///
+/// While it is in the repository no shared file is removed, because nothing
+/// can tell which ones it needs: [`BackupEngine::delete_backup`] and
+/// [`BackupEngine::purge_old_backups`] still delete the backups they are
+/// asked to, then fail naming it. Deleting it removes it like any other
+/// backup.
+#[derive(Debug, thiserror::Error)]
+#[error("backup {id} cannot be read: {reason}")]
+#[non_exhaustive]
+pub struct UnreadableBackup {
+    /// The backup's id, from its metadata file's name.
+    pub id: BackupId,
+    /// Why its metadata could not be read: [`Error::Corruption`] for a
+    /// damaged file or a version this build does not read, [`Error::Io`]
+    /// when the read itself failed.
+    #[source]
+    pub reason: Error,
+}
+
 /// Content-addressed backup repository for one or more databases.
 ///
-/// Multiple [`BackupEngine`] instances should not share a backup
-/// directory - there is no cross-process locking. A single process
+/// Multiple [`BackupEngine`] instances must not share a backup directory:
+/// there is no cross-process locking, and a delete or purge in one removes
+/// every shared file no finished backup lists, including the tables another
+/// one's unfinished backup has copied and not yet listed. A single process
 /// may reuse one instance for many backups.
+///
+/// The engine holds no key. A backup of an encrypted database is sealed
+/// through that database's provider ([`BackupEngine::create_backup`]), a
+/// restore is given one ([`BackupEngine::restore`]), and listing, deleting
+/// and purging read only what every backup keeps unsealed.
 pub struct BackupEngine {
     root: PathBuf,
     meta_dir: PathBuf,
     shared_dir: PathBuf,
     env: Arc<dyn Env>,
 }
-
-#[derive(Debug, Clone)]
-struct BackupFileEntry {
-    level: u32,
-    file_id: u64,
-    file_size: u64,
-    hash: u128,
-    smallest_key: Vec<u8>,
-    largest_key: Vec<u8>,
-    num_entries: u64,
-}
-
-#[derive(Debug, Clone)]
-struct BackupManifest {
-    created_at_unix: u64,
-    files: Vec<BackupFileEntry>,
-    next_file_id: u64,
-    last_seq: u64,
-}
-
-/// Identifier at the head of a backup manifest: `REGOMBKP`.
-const BACKUP_MANIFEST_MAGIC: [u8; 8] = *b"REGOMBKP";
-
-/// On-disk backup manifest version.
-const BACKUP_MANIFEST_VERSION: u32 = 2;
 
 impl BackupEngine {
     /// Open or create a backup repository at `backup_dir` on the
@@ -136,22 +160,47 @@ impl BackupEngine {
 
     /// Create a new backup of `db`, deduping against any files
     /// already present in the shared pool.
+    ///
+    /// On a database encrypted at rest the tables are copied as they are,
+    /// sealed, and the backup's metadata is sealed under the database
+    /// provider's current key, which it names. A current key the provider
+    /// does not provide refuses with [`Error::UnknownKey`] before anything
+    /// is copied. A backup of a database without a provider is written in
+    /// plaintext, as it always was.
+    ///
+    /// The metadata is written last, after every table it lists is durable
+    /// in `shared/`, so a crash part way leaves no backup and at most some
+    /// unlisted shared files, which a later backup of the same tables
+    /// reuses and a later delete or purge removes.
+    ///
+    /// # Errors
+    ///
+    /// Fails with [`Error::Corruption`] when `meta/` already holds the
+    /// largest backup id there is, since no backup can follow it.
     pub fn create_backup(&mut self, db: &Db) -> Result<BackupId> {
-        let id = BackupId(self.next_backup_id()?);
+        let id = self.next_backup_id()?;
         // A backup records when it was taken. Without a wall clock
         // there is no honest value to write, so the call fails here
         // rather than stamping every backup with the epoch.
         let created_at_unix = self.env.unix_secs().ok_or_else(|| {
             Error::invalid_argument("creating a backup needs a wall clock, and this Env has none")
         })?;
+        // Resolved before the first copy, so a current key the provider
+        // cannot provide refuses with nothing written, as the open does.
+        let sealer = db
+            .engine()
+            .keyring()
+            .map(|ring| ring.current())
+            .transpose()
+            .map_err(Error::from)?;
 
         // Take the snapshot in a limited scope so its held
-        // compaction lock is released before we touch the backup
+        // compaction gate is released before we touch the backup
         // metadata directory. `checkpoint_capture` holds the
-        // engine's compaction lock, which pins the captured file
+        // engine's compaction gate, which pins the captured file
         // set against concurrent unlink while we hash + copy.
         let (files, next_file_id, last_seq) = {
-            let snapshot = db.engine().checkpoint_capture().map_err(Error::from)?;
+            let snapshot = db.engine().checkpoint_capture_here().map_err(Error::from)?;
 
             let mut files = Vec::new();
             for (level_idx, level) in snapshot.version.levels.iter().enumerate() {
@@ -172,6 +221,8 @@ impl BackupEngine {
                         smallest_key: file.meta.smallest_key.clone(),
                         largest_key: file.meta.largest_key.clone(),
                         num_entries: file.meta.num_entries,
+                        global_seq: file.meta.global_seq,
+                        seal_key: file.reader.seal_key(),
                     });
                 }
             }
@@ -180,7 +231,7 @@ impl BackupEngine {
                 snapshot.version.next_file_id,
                 snapshot.version.last_seq,
             )
-            // snapshot drops here, releasing the compaction lock.
+            // snapshot drops here, releasing the compaction gate.
         };
 
         let manifest = BackupManifest {
@@ -188,51 +239,113 @@ impl BackupEngine {
             files,
             next_file_id,
             last_seq,
+            sealed_under: sealer.as_ref().map(|s| s.id()),
+            // The database is open, so this build checked it at its open.
+            range_deletes_checked: true,
         };
-        let bytes = encode_manifest(&manifest);
-        let manifest_path = self.meta_dir.join(backup_filename(id.0));
-        atomic_write(&*self.env, &manifest_path, &bytes).map_err(Error::from)?;
+        let bytes = format::encode(&manifest, id, sealer.as_ref()).map_err(Error::from)?;
+        atomic_write(&*self.env, &self.meta_path(id), &bytes).map_err(Error::from)?;
         Ok(id)
     }
 
-    /// Return a summary of every backup currently stored. Ordered
-    /// by backup id (creation order).
-    pub fn list_backups(&self) -> Vec<BackupInfo> {
-        let mut out = Vec::new();
-        let Ok(entries) = self.env.read_dir(&self.meta_dir) else {
-            return out;
-        };
-        let mut ids: Vec<u64> = entries
-            .iter()
-            .filter_map(|e| parse_backup_id(&e.file_name()))
-            .collect();
-        ids.sort_unstable();
-        for id in ids {
-            let path = self.meta_dir.join(backup_filename(id));
-            let Ok(bytes) = self.env.read(&path) else {
-                continue;
-            };
-            let Ok(manifest) = decode_manifest(&bytes) else {
-                continue;
-            };
-            let bytes_sum: u64 = manifest.files.iter().map(|f| f.file_size).sum();
-            out.push(BackupInfo {
-                id: BackupId(id),
-                created_at_unix: manifest.created_at_unix,
-                file_count: manifest.files.len(),
-                bytes: bytes_sum,
-            });
-        }
-        out
+    /// Every backup in the repository, in id order (creation order), each
+    /// exactly once, streamed: an `Ok` item holds `Ok` with the backup's
+    /// summary when its metadata reads, `Err` with its id and the reason
+    /// when it does not ([`UnreadableBackup`]). No backup is left out, so
+    /// the listing's length is the number of backups the repository holds,
+    /// readable or not.
+    ///
+    /// The listing walks `meta/` a page of ids at a time ([`Backups`]), so
+    /// it holds one page and one backup's listing however many backups the
+    /// repository keeps. It owns what it reads, so the engine may delete
+    /// what it lists while it lists it.
+    ///
+    /// A backup is a file in `meta/` named as [`BackupEngine::create_backup`]
+    /// names one. Anything else there is not a backup: the staging file a
+    /// backup cut short by a crash left, for one, never became one.
+    ///
+    /// Needs no key: a sealed backup keeps its listing readable, so a backup
+    /// of an encrypted database lists as `Ok` without its provider. Reads
+    /// every backup's metadata, one file at a time.
+    ///
+    /// # Errors
+    ///
+    /// An `Err` item says a walk of the `meta/` directory itself failed, and
+    /// ends the listing: the backups after it cannot be accounted for, and
+    /// the listing says so rather than end as if there were none.
+    pub fn list_backups(&self) -> Backups {
+        Backups::new(Arc::clone(&self.env), self.meta_dir.clone())
     }
 
     /// Restore `backup_id` into `target_dir`. The target directory
     /// is created if it does not exist and must be empty (or
-    /// contain only empty `sst/`/`wal/` subdirectories). The
-    /// resulting directory opens cleanly as a new [`Db`].
-    pub fn restore<P: AsRef<Path>>(&self, backup_id: BackupId, target_dir: P) -> Result<()> {
-        let manifest = self.read_manifest(backup_id)?;
+    /// contain only empty `sst/`/`wal/` subdirectories, or what an
+    /// unfinished restore left). The resulting directory opens cleanly
+    /// as a new [`Db`], with `key_provider` when one is given.
+    ///
+    /// A target that already holds a MANIFEST is a database, and refuses
+    /// with [`Error::InvalidArgument`]: restoring over it would replace
+    /// tables its MANIFEST still names.
+    ///
+    /// `key_provider` is the provider the restored database is to be opened
+    /// with, and a backup of an encrypted database needs one:
+    ///
+    /// - without a provider, a sealed backup refuses with
+    ///   [`Error::KeyProviderRequired`];
+    /// - a key the backup's metadata or one of its tables names, or a
+    ///   current key, that the provider does not provide refuses with
+    ///   [`Error::UnknownKey`];
+    /// - metadata that does not verify under the key it names (a wrong
+    ///   key, or a changed or moved byte) refuses with
+    ///   [`Error::Corruption`], and so does a table whose footer does not
+    ///   verify under the key it names: the provider has that key, but not
+    ///   the bytes that sealed the table.
+    ///
+    /// Each of these refusals comes before anything is written: the target
+    /// is left as it was. With a provider the MANIFEST the restore writes is
+    /// sealed under the provider's current key, whatever key the backup was
+    /// taken under; without one it is plaintext, as an unencrypted backup's
+    /// metadata is.
+    ///
+    /// The MANIFEST is written last, once every table is durable in the
+    /// target, so a restore that does not return `Ok` (an error, or a
+    /// crash) leaves a directory that is not yet a database. Run the
+    /// restore again into it before opening it.
+    ///
+    /// A backup does not carry the tables' deletion counts: the restored
+    /// database counts them again in the background once it is opened (see
+    /// [`CompactionStyle`](crate::CompactionStyle)).
+    pub fn restore<P: AsRef<Path>>(
+        &self,
+        backup_id: BackupId,
+        target_dir: P,
+        key_provider: Option<Arc<dyn KeyProvider>>,
+    ) -> Result<()> {
         let target_dir = target_dir.as_ref();
+        let manifest_path = target_dir.join("MANIFEST");
+        if self.env.exists(&manifest_path) {
+            return Err(Error::invalid_argument(format!(
+                "{} already holds a database; restore into an empty directory",
+                target_dir.display()
+            )));
+        }
+        let keyring = key_provider.map(|provider| Arc::new(Keyring::new(provider)));
+        let manifest = self.read_manifest(backup_id, keyring.as_deref())?;
+        // Every key the restored database needs, checked before the first
+        // write as the open checks its own: the current key the MANIFEST is
+        // sealed under, and the key each table names. A table's key is
+        // checked against the table itself, by its footer's tag, so bytes
+        // that are present but not the ones that sealed it refuse here and
+        // not at the restored database's open.
+        if let Some(ring) = &keyring {
+            ring.current().map_err(Error::from)?;
+            for f in manifest.files.iter().filter(|f| f.seal_key.is_some()) {
+                let src = self.shared_dir.join(shared_filename(f.hash));
+                crate::engine::sstable::authenticate_footer(&*self.env, &src, Some(ring))
+                    .map_err(Error::from)?;
+            }
+        }
+
         let target_sst = target_dir.join("sst");
         let target_wal = target_dir.join("wal");
         self.env.create_dir_all(&target_sst).map_err(Error::from)?;
@@ -249,85 +362,149 @@ impl BackupEngine {
             copy_file_atomic(&*self.env, &src, &dst).map_err(Error::from)?;
         }
 
-        let manifest_bytes = encode_engine_manifest(&manifest);
-        let manifest_path = target_dir.join("MANIFEST");
+        let manifest_bytes =
+            encode_engine_manifest(&manifest, keyring.as_ref()).map_err(Error::from)?;
         atomic_write(&*self.env, &manifest_path, &manifest_bytes).map_err(Error::from)?;
         Ok(())
     }
 
-    /// Delete `backup_id`. Shared files whose reference count drops
-    /// to zero are removed from disk.
+    /// Delete `backup_id`, then remove every shared file no remaining backup
+    /// lists.
+    ///
+    /// Needs no key, and nothing from the deleted backup's own metadata: a
+    /// backup that cannot be read ([`UnreadableBackup`]) is deleted like any
+    /// other, and the shared files only it listed go with it. Deleting a
+    /// backup that is not there deletes nothing and still removes the
+    /// shared files no backup lists, such as those a backup cut short by a
+    /// crash copied and never listed.
+    ///
+    /// The deletion is durable before any shared file is removed, so a
+    /// power cut never leaves a backup that lists a removed file. That holds
+    /// for a call run again after one that failed to make its deletion
+    /// durable, too: every collection syncs `meta/` first.
+    ///
+    /// The collection sweeps `shared/` a batch of tables at a time and, for
+    /// each batch, reads every remaining listing one at a time: it holds one
+    /// batch of candidates and one listing, however many backups and tables
+    /// the repository keeps.
+    ///
+    /// # Errors
+    ///
+    /// Every remaining backup's listing is read, sealed or not. When one
+    /// cannot be read, `backup_id` is deleted all the same but no shared
+    /// file is removed from then on, since leaving that listing out could
+    /// remove a file the backup needs; the error names that backup. Delete
+    /// or repair it, and the next delete or purge removes them. A walk of
+    /// `meta/` that breaks part way stops the collection the same way.
     pub fn delete_backup(&mut self, backup_id: BackupId) -> Result<()> {
-        let path = self.meta_dir.join(backup_filename(backup_id.0));
-        if !self.env.exists(&path) {
-            return Ok(());
-        }
-        let manifest = self.read_manifest(backup_id)?;
-        crate::env::remove_file_and_sync_parent(&*self.env, &path).map_err(Error::from)?;
-        self.gc_shared(&manifest)?;
-        Ok(())
+        self.remove_backups([Ok(backup_id)])?;
+        self.collect_shared()
     }
 
-    /// Delete every backup except the `keep` most recent.
+    /// Delete every backup except the `keep` most recent, by id, oldest
+    /// first, then remove every shared file no remaining backup lists.
+    ///
+    /// Every backup counts, readable or not: one that cannot be read
+    /// ([`UnreadableBackup`]) is deleted when it is among the oldest and
+    /// kept when it is among the `keep` most recent, as
+    /// [`BackupEngine::list_backups`] lists it. Needs no key.
+    ///
+    /// One walk of `meta/` counts the backups, and a second walks their ids
+    /// in order, a page at a time, deleting the oldest: the purge holds a
+    /// page of ids whatever `keep` is and however many backups there are.
+    ///
+    /// # Errors
+    ///
+    /// Fails before deleting anything when the `meta/` directory cannot be
+    /// read. A walk of `meta/` that breaks part way stops the purge: the
+    /// backups deleted so far each had `keep` newer ones, and no shared file
+    /// is removed. When a remaining backup cannot be read, the backups to
+    /// delete are deleted all the same but no shared file is removed, as
+    /// [`BackupEngine::delete_backup`] does, and the error names it.
     pub fn purge_old_backups(&mut self, keep: usize) -> Result<()> {
-        let infos = self.list_backups();
-        if infos.len() <= keep {
-            return Ok(());
-        }
-        let to_remove = infos.len() - keep;
-        for info in infos.into_iter().take(to_remove) {
-            self.delete_backup(info.id)?;
-        }
-        Ok(())
+        let mut total = 0usize;
+        self.each_backup_id(|_| total += 1)?;
+        let ids = listing::Ids::new(Arc::clone(&self.env), self.meta_dir.clone());
+        self.remove_backups(ids.take(total.saturating_sub(keep)))?;
+        self.collect_shared()
     }
 
-    fn gc_shared(&self, removed: &BackupManifest) -> Result<()> {
-        let mut still_referenced = std::collections::HashSet::new();
-        let Ok(entries) = self.env.read_dir(&self.meta_dir) else {
-            return Ok(());
-        };
-        for entry in entries {
-            if parse_backup_id(&entry.file_name()).is_none() {
-                continue;
-            }
-            if let Ok(bytes) = self.env.read(&entry.path)
-                && let Ok(m) = decode_manifest(&bytes)
-            {
-                for f in m.files {
-                    still_referenced.insert(f.hash);
-                }
-            }
-        }
-        for f in &removed.files {
-            if !still_referenced.contains(&f.hash) {
-                let p = self.shared_dir.join(shared_filename(f.hash));
-                match crate::env::remove_file_and_sync_parent(&*self.env, &p) {
-                    Ok(()) => {}
-                    Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-                    Err(e) => return Err(Error::from(e)),
-                }
+    /// Remove the metadata of every backup in `ids`, oldest first. A walk
+    /// that breaks stops the removals there, and the error is returned.
+    ///
+    /// Nothing is synced here: the collection that follows syncs `meta/`
+    /// before it removes any shared file ([`BackupEngine::collect_shared`]),
+    /// which makes these removals durable, and any an earlier call made
+    /// whose own sync failed.
+    fn remove_backups(&self, ids: impl IntoIterator<Item = io::Result<BackupId>>) -> Result<()> {
+        for id in ids {
+            match self.env.remove_file(&self.meta_path(id?)) {
+                Ok(()) => {}
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => return Err(Error::from(e)),
             }
         }
         Ok(())
     }
 
-    fn read_manifest(&self, id: BackupId) -> Result<BackupManifest> {
-        let path = self.meta_dir.join(backup_filename(id.0));
-        let bytes = self.env.read(&path).map_err(Error::from)?;
-        decode_manifest(&bytes).map_err(Error::from)
-    }
-
-    fn next_backup_id(&self) -> Result<u64> {
-        let mut max_id = 0u64;
+    /// Call `f` with the id of every backup in `meta/`, in the order one
+    /// walk meets them, holding none of them: what counting the backups and
+    /// finding the largest id need.
+    fn each_backup_id(&self, mut f: impl FnMut(BackupId)) -> Result<()> {
         for entry in self.env.read_dir(&self.meta_dir).map_err(Error::from)? {
-            if let Some(id) = parse_backup_id(&entry.file_name())
-                && id > max_id
-            {
-                max_id = id;
+            if let Some(id) = parse_backup_id(&entry.map_err(Error::from)?.file_name()) {
+                f(id);
             }
         }
-        Ok(max_id + 1)
+        Ok(())
     }
+
+    fn meta_path(&self, id: BackupId) -> PathBuf {
+        self.meta_dir.join(backup_filename(id))
+    }
+
+    fn read_manifest(&self, id: BackupId, keyring: Option<&Keyring>) -> Result<BackupManifest> {
+        let bytes = self.env.read(&self.meta_path(id)).map_err(Error::from)?;
+        format::decode(&bytes, id, keyring).map_err(Error::from)
+    }
+
+    fn read_listing(&self, id: BackupId) -> io::Result<Listing> {
+        read_listing(&*self.env, &self.meta_dir, id)
+    }
+
+    /// One past the largest backup id `meta/` holds, from one walk that
+    /// keeps only the largest so far.
+    fn next_backup_id(&self) -> Result<BackupId> {
+        let mut last = 0u64;
+        self.each_backup_id(|id| last = last.max(id.0))?;
+        last.checked_add(1).map(BackupId).ok_or_else(|| {
+            Error::corruption(format!(
+                "backup {last} has the largest id there is, so no backup can follow it"
+            ))
+        })
+    }
+}
+
+/// Backup `id`'s clear listing, read from `meta_dir`: no key needed.
+fn read_listing(env: &dyn Env, meta_dir: &Path, id: BackupId) -> io::Result<Listing> {
+    format::decode_listing(&env.read(&meta_dir.join(backup_filename(id)))?)
+}
+
+/// What [`BackupEngine::list_backups`] reports for a backup whose listing
+/// reads. A listing whose sizes add up past `u64` is damaged: no backup
+/// holds that many bytes.
+fn summarize(id: BackupId, listing: &Listing) -> io::Result<BackupInfo> {
+    let bytes = listing
+        .objects
+        .iter()
+        .try_fold(0u64, |sum, &(_, size)| sum.checked_add(size))
+        .ok_or_else(|| invalid_data(format!("backup {id}: its tables' sizes overflow")))?;
+    Ok(BackupInfo {
+        id,
+        created_at_unix: listing.created_at_unix,
+        file_count: listing.objects.len(),
+        bytes,
+    })
 }
 
 fn hash_file(env: &dyn Env, path: &Path) -> io::Result<u128> {
@@ -431,455 +608,67 @@ fn shared_filename(hash: u128) -> String {
     format!("{:032x}.sst", hash)
 }
 
-fn backup_filename(id: u64) -> String {
-    format!("{:06}.backup", id)
+fn backup_filename(id: BackupId) -> String {
+    format!("{:06}.backup", id.0)
 }
 
-fn parse_backup_id(name: &str) -> Option<u64> {
-    let stem = name.strip_suffix(".backup")?;
-    stem.parse::<u64>().ok()
+/// The content id a shared table's file name carries. Only the name
+/// [`shared_filename`] writes parses, so a name and a content id map one to
+/// one.
+fn parse_shared_filename(name: &str) -> Option<u128> {
+    let hash = u128::from_str_radix(name.strip_suffix(".sst")?, 16).ok()?;
+    (shared_filename(hash) == name).then_some(hash)
 }
 
-fn encode_manifest(m: &BackupManifest) -> Vec<u8> {
-    let mut body = Vec::new();
-    body.extend_from_slice(&BACKUP_MANIFEST_MAGIC);
-    body.extend_from_slice(&BACKUP_MANIFEST_VERSION.to_le_bytes());
-    body.extend_from_slice(&m.created_at_unix.to_le_bytes());
-    body.extend_from_slice(&m.next_file_id.to_le_bytes());
-    body.extend_from_slice(&m.last_seq.to_le_bytes());
-    body.extend_from_slice(&(m.files.len() as u32).to_le_bytes());
-    for f in &m.files {
-        body.extend_from_slice(&f.level.to_le_bytes());
-        body.extend_from_slice(&f.file_id.to_le_bytes());
-        body.extend_from_slice(&f.file_size.to_le_bytes());
-        body.extend_from_slice(&f.num_entries.to_le_bytes());
-        body.extend_from_slice(&f.hash.to_le_bytes());
-        body.extend_from_slice(&(f.smallest_key.len() as u32).to_le_bytes());
-        body.extend_from_slice(&f.smallest_key);
-        body.extend_from_slice(&(f.largest_key.len() as u32).to_le_bytes());
-        body.extend_from_slice(&f.largest_key);
-    }
-    let checksum = checksum::backup_manifest(&body);
-    let mut out = Vec::with_capacity(body.len() + 8);
-    out.extend_from_slice(&body);
-    out.extend_from_slice(&checksum.to_le_bytes());
-    out
+/// The backup id a metadata file's name carries. Only the name
+/// [`backup_filename`] writes parses: `7.backup` or `+7.backup` would name
+/// a file the engine reads as `000007.backup`, a different file.
+fn parse_backup_id(name: &str) -> Option<BackupId> {
+    let id = BackupId(name.strip_suffix(".backup")?.parse::<u64>().ok()?);
+    (backup_filename(id) == name).then_some(id)
 }
 
-fn decode_manifest(data: &[u8]) -> io::Result<BackupManifest> {
-    if data.len() < 8 {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "short backup"));
-    }
-    let body_len = data.len() - 8;
-    let body = &data[..body_len];
-    let stored_cksum = u64::from_le_bytes(data[body_len..].try_into().unwrap());
-    if checksum::backup_manifest(body) != stored_cksum {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "backup manifest checksum mismatch",
-        ));
-    }
-    if body.len() < BACKUP_MANIFEST_MAGIC.len()
-        || body[..BACKUP_MANIFEST_MAGIC.len()] != BACKUP_MANIFEST_MAGIC
-    {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "backup manifest bad magic",
-        ));
-    }
-    let mut p = BACKUP_MANIFEST_MAGIC.len();
-    let version = read_u32(body, &mut p)?;
-    if version != BACKUP_MANIFEST_VERSION {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("unsupported backup manifest version {version}"),
-        ));
-    }
-    let created_at_unix = read_u64(body, &mut p)?;
-    let next_file_id = read_u64(body, &mut p)?;
-    let last_seq = read_u64(body, &mut p)?;
-    let count = read_u32(body, &mut p)? as usize;
-    let mut files = Vec::with_capacity(count);
-    for _ in 0..count {
-        let level = read_u32(body, &mut p)?;
-        let file_id = read_u64(body, &mut p)?;
-        let file_size = read_u64(body, &mut p)?;
-        let num_entries = read_u64(body, &mut p)?;
-        let hash = read_u128(body, &mut p)?;
-        let smallest_key = read_var_bytes(body, &mut p)?;
-        let largest_key = read_var_bytes(body, &mut p)?;
-        files.push(BackupFileEntry {
-            level,
-            file_id,
-            file_size,
-            num_entries,
-            hash,
-            smallest_key,
-            largest_key,
-        });
-    }
-    Ok(BackupManifest {
-        created_at_unix,
-        files,
-        next_file_id,
-        last_seq,
-    })
-}
-
-fn read_u32(data: &[u8], p: &mut usize) -> io::Result<u32> {
-    if *p + 4 > data.len() {
-        return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "short"));
-    }
-    let v = u32::from_le_bytes(data[*p..*p + 4].try_into().unwrap());
-    *p += 4;
-    Ok(v)
-}
-
-fn read_u64(data: &[u8], p: &mut usize) -> io::Result<u64> {
-    if *p + 8 > data.len() {
-        return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "short"));
-    }
-    let v = u64::from_le_bytes(data[*p..*p + 8].try_into().unwrap());
-    *p += 8;
-    Ok(v)
-}
-
-fn read_u128(data: &[u8], p: &mut usize) -> io::Result<u128> {
-    if *p + 16 > data.len() {
-        return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "short"));
-    }
-    let v = u128::from_le_bytes(data[*p..*p + 16].try_into().unwrap());
-    *p += 16;
-    Ok(v)
-}
-
-fn read_var_bytes(data: &[u8], p: &mut usize) -> io::Result<Vec<u8>> {
-    let len = read_u32(data, p)? as usize;
-    if *p + len > data.len() {
-        return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "short"));
-    }
-    let v = data[*p..*p + len].to_vec();
-    *p += len;
-    Ok(v)
-}
-
-/// Encode a restored backup as an engine-compatible MANIFEST stream.
+/// Encode a restored backup as an engine MANIFEST, through the engine's own
+/// encoder so a restored manifest cannot drift from the one it writes:
+/// sealed under the keyring's current key when there is one.
 ///
-/// The stamp comes from [`VersionSet::encode_stamp`] so a restored
-/// manifest cannot drift from the one the engine writes. The records
-/// use the legacy single-edit frames understood by the engine:
-/// `[len u32][body][cksum u32]`, with the same checksum as the batched
-/// frames written by [`crate::engine::manifest`].
-fn encode_engine_manifest(m: &BackupManifest) -> Vec<u8> {
-    const TAG_ADD_FILE: u8 = 1;
-    const TAG_LAST_SEQ: u8 = 3;
-    const TAG_NEXT_FILE_ID: u8 = 4;
-
-    let mut records: Vec<Vec<u8>> = Vec::new();
-    {
-        let mut r = Vec::new();
-        r.push(TAG_NEXT_FILE_ID);
-        r.extend_from_slice(&m.next_file_id.to_le_bytes());
-        records.push(r);
-    }
-    {
-        let mut r = Vec::new();
-        r.push(TAG_LAST_SEQ);
-        r.extend_from_slice(&m.last_seq.to_le_bytes());
-        records.push(r);
-    }
-    for f in &m.files {
-        let mut r = Vec::new();
-        r.push(TAG_ADD_FILE);
-        r.extend_from_slice(&f.level.to_le_bytes());
-        r.extend_from_slice(&f.file_id.to_le_bytes());
-        r.extend_from_slice(&(f.smallest_key.len() as u32).to_le_bytes());
-        r.extend_from_slice(&f.smallest_key);
-        r.extend_from_slice(&(f.largest_key.len() as u32).to_le_bytes());
-        r.extend_from_slice(&f.largest_key);
-        r.extend_from_slice(&f.file_size.to_le_bytes());
-        r.extend_from_slice(&f.num_entries.to_le_bytes());
-        records.push(r);
-    }
-
-    let mut out = crate::engine::manifest::VersionSet::encode_stamp().to_vec();
-    for record_buf in &records {
-        let len = record_buf.len() as u32;
-        let checksum = checksum::manifest_record(len, record_buf);
-        out.extend_from_slice(&len.to_le_bytes());
-        out.extend_from_slice(record_buf);
-        out.extend_from_slice(&checksum.to_le_bytes());
-    }
-    out
+/// Every write the backup holds is in its tables, so `min_wal_id` is the
+/// backup's next file id: no log numbered below it is ever replayed into the
+/// restored database, whatever the target's `wal/` holds (E30).
+fn encode_engine_manifest(
+    m: &BackupManifest,
+    keyring: Option<&Arc<Keyring>>,
+) -> io::Result<Vec<u8>> {
+    crate::engine::manifest::encode_manifest_image(
+        m.next_file_id,
+        m.last_seq,
+        m.next_file_id,
+        m.range_deletes_checked,
+        m.files.iter().map(|f| {
+            (
+                f.level as usize,
+                crate::engine::sstable::SsTableMeta {
+                    file_id: f.file_id,
+                    smallest_key: f.smallest_key.clone(),
+                    largest_key: f.largest_key.clone(),
+                    file_size: f.file_size,
+                    num_entries: f.num_entries,
+                    global_seq: f.global_seq,
+                    // Not in a backup's metadata: counted again after the
+                    // restored database opens (`compaction::census`).
+                    deletions: None,
+                },
+            )
+        }),
+        keyring,
+    )
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::Options;
-    use tempfile::TempDir;
+mod tests;
 
-    fn tiny_flush_opts() -> Options {
-        Options {
-            write_buffer_size: 4 * 1024,
-            ..Options::default()
-        }
-    }
+#[cfg(test)]
+mod unreadable_tests;
 
-    fn populate(db: &Db, prefix: &str, n: usize) {
-        let filler = vec![0u8; 256];
-        for i in 0..n {
-            let k = format!("{}_{:05}", prefix, i);
-            let mut v = filler.clone();
-            v.extend_from_slice(k.as_bytes());
-            db.put(k.as_bytes(), &v).unwrap();
-        }
-    }
-
-    fn assert_has(db: &Db, prefix: &str, n: usize) {
-        let filler = vec![0u8; 256];
-        for i in 0..n {
-            let k = format!("{}_{:05}", prefix, i);
-            let mut expected = filler.clone();
-            expected.extend_from_slice(k.as_bytes());
-            assert_eq!(db.get(k.as_bytes()).unwrap(), Some(expected));
-        }
-    }
-
-    fn shared_bytes(dir: &Path) -> u64 {
-        let shared = dir.join("shared");
-        let mut total = 0u64;
-        if let Ok(entries) = fs::read_dir(&shared) {
-            for entry in entries.flatten() {
-                if let Ok(md) = entry.metadata() {
-                    total += md.len();
-                }
-            }
-        }
-        total
-    }
-
-    fn shared_count(dir: &Path) -> usize {
-        let shared = dir.join("shared");
-        fs::read_dir(&shared)
-            .map(|it| it.flatten().count())
-            .unwrap_or(0)
-    }
-
-    fn shared_file_paths(dir: &Path) -> Vec<PathBuf> {
-        let shared = dir.join("shared");
-        let mut paths: Vec<_> = fs::read_dir(&shared)
-            .unwrap()
-            .flatten()
-            .map(|entry| entry.path())
-            .collect();
-        paths.sort();
-        paths
-    }
-
-    fn corrupt_file_same_size(path: &Path) {
-        let mut bytes = fs::read(path).unwrap();
-        assert!(!bytes.is_empty());
-        bytes[0] ^= 0xFF;
-        fs::write(path, bytes).unwrap();
-    }
-
-    #[test]
-    fn backup_and_restore_roundtrip() {
-        let src_dir = TempDir::new().unwrap();
-        let bkp_dir = TempDir::new().unwrap();
-        let tgt_dir = TempDir::new().unwrap();
-
-        let db = Db::open(src_dir.path(), tiny_flush_opts()).unwrap();
-        populate(&db, "k", 300);
-
-        let mut engine = BackupEngine::open(bkp_dir.path()).unwrap();
-        let id = engine.create_backup(&db).unwrap();
-        let infos = engine.list_backups();
-        assert_eq!(infos.len(), 1);
-        assert_eq!(infos[0].id, id);
-        assert!(infos[0].file_count >= 1);
-
-        engine.restore(id, tgt_dir.path()).unwrap();
-        drop(db);
-
-        let reopened = Db::open(tgt_dir.path(), Options::default()).unwrap();
-        assert_has(&reopened, "k", 300);
-    }
-
-    #[test]
-    fn incremental_backup_dedupes() {
-        let src_dir = TempDir::new().unwrap();
-        let bkp_dir = TempDir::new().unwrap();
-        let db = Db::open(src_dir.path(), tiny_flush_opts()).unwrap();
-        populate(&db, "x", 400);
-        db.compact_range(None, None).unwrap();
-
-        let mut engine = BackupEngine::open(bkp_dir.path()).unwrap();
-        let _id1 = engine.create_backup(&db).unwrap();
-        let shared_bytes_1 = shared_bytes(bkp_dir.path());
-        let shared_count_1 = shared_count(bkp_dir.path());
-
-        // No writes between backups - second backup must add no
-        // shared files.
-        let _id2 = engine.create_backup(&db).unwrap();
-        let shared_bytes_2 = shared_bytes(bkp_dir.path());
-        let shared_count_2 = shared_count(bkp_dir.path());
-
-        assert_eq!(shared_bytes_1, shared_bytes_2);
-        assert_eq!(shared_count_1, shared_count_2);
-        assert_eq!(engine.list_backups().len(), 2);
-    }
-
-    #[test]
-    fn create_backup_replaces_corrupt_existing_shared_object() {
-        let src_dir = TempDir::new().unwrap();
-        let bkp_dir = TempDir::new().unwrap();
-        let tgt_dir = TempDir::new().unwrap();
-        let db = Db::open(src_dir.path(), tiny_flush_opts()).unwrap();
-        populate(&db, "r", 400);
-        db.compact_range(None, None).unwrap();
-
-        let mut engine = BackupEngine::open(bkp_dir.path()).unwrap();
-        let _id1 = engine.create_backup(&db).unwrap();
-        let shared_files = shared_file_paths(bkp_dir.path());
-        assert!(!shared_files.is_empty());
-        let original_sizes: Vec<u64> = shared_files
-            .iter()
-            .map(|path| fs::metadata(path).unwrap().len())
-            .collect();
-        for path in &shared_files {
-            corrupt_file_same_size(path);
-        }
-
-        let id2 = engine.create_backup(&db).unwrap();
-
-        for (path, original_size) in shared_files.iter().zip(original_sizes) {
-            assert_eq!(fs::metadata(path).unwrap().len(), original_size);
-        }
-        engine.restore(id2, tgt_dir.path()).unwrap();
-        drop(db);
-        let restored = Db::open(tgt_dir.path(), Options::default()).unwrap();
-        assert_has(&restored, "r", 400);
-    }
-
-    #[test]
-    fn restore_rejects_corrupt_shared_object() {
-        let src_dir = TempDir::new().unwrap();
-        let bkp_dir = TempDir::new().unwrap();
-        let tgt_dir = TempDir::new().unwrap();
-        let db = Db::open(src_dir.path(), tiny_flush_opts()).unwrap();
-        populate(&db, "bad", 300);
-        db.compact_range(None, None).unwrap();
-
-        let mut engine = BackupEngine::open(bkp_dir.path()).unwrap();
-        let id = engine.create_backup(&db).unwrap();
-        let shared_files = shared_file_paths(bkp_dir.path());
-        assert!(!shared_files.is_empty());
-        corrupt_file_same_size(&shared_files[0]);
-
-        let kind = match engine.restore(id, tgt_dir.path()) {
-            Err(Error::Corruption(e)) => e.kind(),
-            Err(e) => panic!("expected corruption error, got {e:?}"),
-            Ok(()) => panic!("expected restore to reject corrupt shared object"),
-        };
-        assert_eq!(kind, io::ErrorKind::InvalidData);
-    }
-
-    #[test]
-    fn delete_backup_gcs_unreferenced_files() {
-        let src_dir = TempDir::new().unwrap();
-        let bkp_dir = TempDir::new().unwrap();
-        let db = Db::open(src_dir.path(), tiny_flush_opts()).unwrap();
-        populate(&db, "a", 200);
-        db.compact_range(None, None).unwrap();
-
-        let mut engine = BackupEngine::open(bkp_dir.path()).unwrap();
-        let id1 = engine.create_backup(&db).unwrap();
-        let shared_after_1 = shared_count(bkp_dir.path());
-        assert!(shared_after_1 >= 1);
-
-        // New data that doesn't overlap prior SSTs.
-        populate(&db, "z", 200);
-        db.compact_range(None, None).unwrap();
-        let id2 = engine.create_backup(&db).unwrap();
-        let shared_after_2 = shared_count(bkp_dir.path());
-
-        // Remove the first backup - any file it held that backup 2
-        // does not also reference should be gone.
-        engine.delete_backup(id1).unwrap();
-        let shared_after_delete = shared_count(bkp_dir.path());
-        assert!(shared_after_delete <= shared_after_2);
-        assert_eq!(engine.list_backups().len(), 1);
-
-        // backup 2 still restores cleanly.
-        let tgt_dir = TempDir::new().unwrap();
-        engine.restore(id2, tgt_dir.path()).unwrap();
-        drop(db);
-        let reopened = Db::open(tgt_dir.path(), Options::default()).unwrap();
-        assert_has(&reopened, "z", 200);
-    }
-
-    #[test]
-    fn delete_only_backup_removes_all_shared() {
-        let src_dir = TempDir::new().unwrap();
-        let bkp_dir = TempDir::new().unwrap();
-        let db = Db::open(src_dir.path(), tiny_flush_opts()).unwrap();
-        populate(&db, "q", 300);
-        db.compact_range(None, None).unwrap();
-
-        let mut engine = BackupEngine::open(bkp_dir.path()).unwrap();
-        let id = engine.create_backup(&db).unwrap();
-        assert!(shared_count(bkp_dir.path()) > 0);
-
-        engine.delete_backup(id).unwrap();
-        assert_eq!(shared_count(bkp_dir.path()), 0);
-        assert_eq!(engine.list_backups().len(), 0);
-    }
-
-    #[test]
-    fn purge_keeps_newest() {
-        let src_dir = TempDir::new().unwrap();
-        let bkp_dir = TempDir::new().unwrap();
-        let db = Db::open(src_dir.path(), tiny_flush_opts()).unwrap();
-
-        populate(&db, "g1", 100);
-        db.compact_range(None, None).unwrap();
-        let mut engine = BackupEngine::open(bkp_dir.path()).unwrap();
-        let _b1 = engine.create_backup(&db).unwrap();
-
-        populate(&db, "g2", 100);
-        db.compact_range(None, None).unwrap();
-        let _b2 = engine.create_backup(&db).unwrap();
-
-        populate(&db, "g3", 100);
-        db.compact_range(None, None).unwrap();
-        let b3 = engine.create_backup(&db).unwrap();
-
-        engine.purge_old_backups(1).unwrap();
-        let infos = engine.list_backups();
-        assert_eq!(infos.len(), 1);
-        assert_eq!(infos[0].id, b3);
-    }
-
-    #[test]
-    fn restore_independent_of_source() {
-        let src_dir = TempDir::new().unwrap();
-        let bkp_dir = TempDir::new().unwrap();
-        let tgt_dir = TempDir::new().unwrap();
-
-        let db = Db::open(src_dir.path(), tiny_flush_opts()).unwrap();
-        populate(&db, "ind", 250);
-
-        let mut engine = BackupEngine::open(bkp_dir.path()).unwrap();
-        let id = engine.create_backup(&db).unwrap();
-
-        db.close().unwrap();
-        drop(db);
-        fs::remove_dir_all(src_dir.path()).unwrap();
-
-        engine.restore(id, tgt_dir.path()).unwrap();
-        let reopened = Db::open(tgt_dir.path(), Options::default()).unwrap();
-        assert_has(&reopened, "ind", 250);
-    }
-}
+#[cfg(test)]
+mod sync_fault_tests;
