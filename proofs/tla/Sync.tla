@@ -35,9 +35,10 @@
 \*
 \* What can go wrong, each a RED configuration below: a waiter starves; a
 \* release frees the lock and tells nobody; somebody barges past an owed
-\* handoff (a spinner too); a waiter that stops spinning goes to sleep without
-\* looking, though a release nudged it while it spun and woke nobody; a waiter that gave up (its future was dropped) keeps the lock it
-\* had just been handed; a change made while another thread was serving the
+\* handoff (a spinner too); a waiter that stops spinning goes to sleep
+\* without looking, though a release nudged it while it spun and woke nobody;
+\* a waiter that gave up (its future was dropped) keeps the lock it had just
+\* been handed; a change made while another thread was serving the
 \* queue is never looked at; a thread serving the queue is kept at it by
 \* releases that have nobody to tell; a reentrant lock is freed while a
 \* guard still exists.
@@ -85,7 +86,10 @@
 \*   no_lost_wakeup_spinning,     a waiter asleep with its waker armed never
 \*   mark_spinning_wakes_nobody   has an unread mark, spins included, and a
 \*                                release that finds it spinning calls no
-\*                                waker (SpinningUnarmed, NoLostWakeup here)
+\*                                waker (NoLostWakeup here; the model has no
+\*                                ARMED bit: a spinning task is simply not
+\*                                "parked", so a release puts it on no wake
+\*                                list)
 \*   unbounded_barging_breaks_bound, release_without_wake_strands,
 \*   spin_without_look_strands    the RED cases, as counterexamples
 \* The Lean machine has no drain role, so DrainBounded and the two liveness
@@ -119,11 +123,15 @@
 \*   the_first_attempt_refuses_a_lock_owed_to_a_waiter  HandoffExclusive,
 \*                                                    BoundedBypass, for the
 \*                                                    Mutex's inline attempt
-\*   a_nudge_while_the_waiter_spins_is_never_lost      NoLostWakeup,
-\*                                                    SpinningUnarmed
-\* Each of the last four has a calibration that writes the one step the old
-\* way (or, for E48, without its guard) and must fail. Every other model above
-\* runs the spins too: under loom a spin has one round.
+\*   a_nudge_while_the_waiter_spins_is_never_lost      NoLostWakeup for a
+\*                                                    waiter spinning on its
+\*                                                    node (with floors on
+\*                                                    the spins it reaches)
+\* Each of the last four has a calibration: a copy of the run with the one
+\* step written the old way (for the two E48 models: with its guard taken
+\* away), which must fail. Under loom a spin has one round, so every model
+\* above also runs the spin before queueing; the last one also makes sure the
+\* spin on the node happens, and counts it.
 \*
 \* DrainBounded is also checked by two unit tests of src/sync/contend.rs,
 \* which race a release against a drain at a chosen instant:
@@ -347,15 +355,14 @@
 \*                                release freed for the owed waiter:
 \*                                HandoffExclusive.
 \* Every row above runs the spins: the GREEN rows check every safety promise
-\* with tasks that spin before queueing and on their nodes, and SpinningUnarmed
-\* in each of them checks that a spinner is never left armed.
+\* with tasks that spin before queueing and on their nodes.
 
 \* ===========================================================================
 \* WHERE EACH PIECE OF THIS MODEL LIVES IN THE RUST CODE (E48)
 \* ===========================================================================
 \* Read it as: "this word of the model" is "this place in the program", and
 \* what it means in plain words. Paths are under src/sync/; line numbers are
-\* those of the commit that adds this table. A step of the model is one
+\* those of the commit that last updated this table. A step of the model is one
 \* atomic instruction of the program unless the line says otherwise.
 \*
 \* THE STATE (what the program remembers):
@@ -373,16 +380,17 @@
 \*   phase       waiter.rs:54 PHASE bits: waiting, granted, cancelled.
 \*   nudged      waiter.rs:63 NUDGED: told to try again, not looked yet.
 \*   owedMark    waiter.rs:64 OWED: this waiter is counted owed.
-\*   wake, wl    waiter.rs:574 WakeList and its calls in Drop (waiter.rs:664):
+\*   wake, wl    waiter.rs:651 WakeList and its calls in Drop (waiter.rs:741):
 \*               whose waker is (to be) called.
 \*   got, held   the permits a future took (raw_semaphore.rs:279 poll_one's
 \*               Ready) and the guard that holds them (mutex.rs:149 its drop).
 \*   owner,depth reentrant_mutex.rs:117 enter, 103 reenter, 124 unlock.
 \*   bypass      contend.rs:172 Contend::bypass: races this waiter lost.
 \*   marked, took, seenH   locals of Policy::owe_or_take (queue.rs:408).
-\*   passOn      the flag Cancel::Withdrawn carries (waiter.rs:816).
+\*   passOn      the nudge flag Wait::cancel (waiter.rs:912) returns in
+\*               Cancel::Withdrawn, which Contend::cancel (contend.rs:281) passes on.
 \*   spinning    no field of its own: the stretch of Wait::spin_park
-\*               (waiter.rs:767) after Waiter::begin_spin (waiter.rs:283)
+\*               (waiter.rs:844) after Waiter::begin_spin (waiter.rs:283)
 \*               cleared ARMED (waiter.rs:294) and before the look re-arms it.
 \*               While it is TRUE the node has no waker to claim
 \*               (waiter.rs:115 claimable), so a release only marks it.
@@ -405,26 +413,26 @@
 \*   PreSpinOut  the spin's rounds run out (spin.rs:68 Gaps, spin.rs:109
 \*               Budget::rounds); contend.rs:164 halves the budget.
 \*   Reenter     reentrant_mutex.rs:103 reenter.
-\*   Push        waiter.rs:731 Wait::enqueue -> queue.rs:236 WaitQueue::push.
+\*   Push        waiter.rs:808 Wait::enqueue -> queue.rs:236 WaitQueue::push.
 \*   Publish     queue.rs:379 Policy::enqueue's transition (queue.rs:313).
 \*   Park0       contend.rs:224 park(queue, None) -> waiter.rs:213 Waiter::park.
 \*   Repark      contend.rs:267 spin_park with no spin (budget 0, or the node
-\*               marked: begin_spin false) -> waiter.rs:743 Wait::park.
-\*   SpinStart   waiter.rs:767 spin_park -> waiter.rs:283 begin_spin: a load,
+\*               marked: begin_spin false) -> waiter.rs:820 Wait::park.
+\*   SpinStart   waiter.rs:844 spin_park -> waiter.rs:283 begin_spin: a load,
 \*               and a swap clearing ARMED (waiter.rs:294) if it was armed.
 \*   SpinEnd     the spin loop's last waiter.rs:306 marked() read, then the
-\*               look waiter.rs:743 park(Some(waker)), whose last swap arms the
+\*               look waiter.rs:820 park(Some(waker)), whose last swap arms the
 \*               waker and reads the marks together (waiter.rs:213).
 \*   Poll        the executor polls a woken future: poll_one -> poll_contended
 \*               (raw_semaphore.rs:293) -> contend.rs:197 poll_from -> park.
 \*   GrantCons   contend.rs:228 Park::Granted -> queue.rs:232 consume_nudge.
 \*   NudgeCons   contend.rs:239 Park::Nudged -> queue.rs:232 consume_nudge.
-\*   Try         contend.rs:213 try_take for a retry; a loss counts at :262.
+\*   Try         contend.rs:244 try_take for a retry; a loss counts at :262.
 \*   Owe1..Owe7  contend.rs:242 take_or_owe -> queue.rs:408 owe_or_take:
 \*               the owed count, Waiter::owe (waiter.rs:313), the swap,
 \*               Waiter::unowe (waiter.rs:334), forgive (queue.rs:226), the
 \*               fetch-or, and the last transition.
-\*   Wd1, Wd2    contend.rs:278 Contend::cancel -> waiter.rs:816 Wait::cancel
+\*   Wd1, Wd2    contend.rs:278 Contend::cancel -> waiter.rs:912 Wait::cancel
 \*               -> waiter.rs:355 withdraw, then queue.rs:388 withdrawn.
 \*   Cancel      the future is dropped: mutex.rs Lock's drop ->
 \*               raw_semaphore.rs:306 PermitWait::cancel -> Contend::cancel.
@@ -437,15 +445,15 @@
 \*   D0          queue.rs:347 drain's fetch-and, queue.rs:254 take, and the
 \*               list's absorb, tidy and front (list.rs:60, :117, :85).
 \*   DH, DG, DGB the handoff loop of RawSemaphore::pass: take_for_waiter
-\*               (raw_semaphore.rs:198), WakeList::grant (waiter.rs:592),
+\*               (raw_semaphore.rs:198), WakeList::grant (waiter.rs:669),
 \*               and the add that puts back a refused grant.
 \*   DHO         queue.rs:221 hands_off.
 \*   DNB..DNF    the nudging walk of pass (raw_semaphore.rs:215-221):
-\*               Nudges::nudge -> WakeList::nudge (waiter.rs:609) ->
+\*               Nudges::nudge -> WakeList::nudge (waiter.rs:686) ->
 \*               Waiter::touch (waiter.rs:184), and Nudges::finish
 \*               (queue.rs:159).
 \*   DEnd, DEx   the end of drain: the exit swap, then the wakers called as
-\*               the WakeList drops (waiter.rs:664).
+\*               the WakeList drops (waiter.rs:741).
 \*
 \* THE PROMISES (what must always hold), and what in the code keeps them:
 \*   MutualExclusion, PermitsConserved   every take is a swap that checks
@@ -455,8 +463,9 @@
 \*               take_from, stops_spin for the spin).
 \*   NoLostWakeup (MarkedWoken, Stranded)  park's swaps read the marks as
 \*               they arm the waker; a spin ends in that same look.
-\*   SpinningUnarmed   begin_spin clears ARMED before the spin, and only the
-\*               look after it sets ARMED again.
+\*   (No promise here says a spinner is unarmed: the model has no ARMED
+\*   bit. That a release finds a spinner unarmed is begin_spin clearing
+\*   ARMED, checked by the waiter.rs unit tests and the loom model above.)
 \*   CancelPassesOn    Contend::cancel gives a grant back.
 \*   DrainBounded, DrainsEndWhenWaitersSettle   queue.rs:313-375.
 \*   EveryWaiterServed   the bypass bound plus the handoff.
@@ -1706,8 +1715,9 @@ DG(d) ==
                  /\ got' = [got EXCEPT ![h] = @ + dHand]
                  \* and the pass's hand is empty.
                  /\ dHand' = 0
-                 \* A sleeping future (its waker armed) is to be woken. One that runs, spinning on
-                 \* its node included, is not: it reads the grant itself.
+                 \* If the future is asleep (it returned Pending and waits for its waker), it goes
+                 \* on the wake list. If it is awake (busy in a poll, or spinning on its node), it
+                 \* is not: it will read the grant from its node itself.
                  /\ wl' = IF pc[h] = "parked" THEN wl \cup {h} ELSE wl
                  \* The loop goes round again.
                  /\ pc' = [pc EXCEPT ![d] = "dh"]
@@ -1819,8 +1829,9 @@ Nudge(i) ==
   IN /\ nudged' = [nudged EXCEPT ![n] = @ \/ hit]
      \* The pass notes that a nudge is on its way: this one, or the earlier one.
      /\ dSent' = (dSent \/ hit \/ pending)
-     \* A sleeping future (its waker armed) is to be woken. One that runs, spinning on its node
-     \* included, is not: the release skips the wake and the spinner reads the mark itself.
+     \* If the future is asleep (it returned Pending and waits for its waker), it goes on the
+     \* wake list. If it is awake (busy in a poll, or spinning on its node), the release calls no
+     \* waker: the future will read the mark from its node itself.
      /\ wl' = IF hit /\ pc[n] = "parked" THEN wl \cup {n} ELSE wl
      \* The budget shrinks by the request (never below zero).
      /\ dBudget' = IF dBudget >= Need[n] THEN dBudget - Need[n] ELSE 0
@@ -2158,19 +2169,6 @@ MarkedWoken ==
     pc[t] = "parked" /\ (phase[t] = "granted" \/ nudged[t]) =>
       \* its waker was called, or the pass under way is about to call it.
       wake[t] \/ t \in wl
-
-\* A SPINNING WAITER IS NEVER ARMED. A future spins on its node only inside its poll, at the step
-\* the spin runs at, with its node still in the queue's hands (waiting, or granted while it spun:
-\* only the future itself can withdraw it, and it is busy spinning); so its node has no waker a
-\* release could claim, and a release that marks it calls no waker: the spinner reads the mark
-\* itself.
-\* Rules out, for example: a future asleep (its waker armed) that the model still counts as
-\* spinning, so that a release would skip its wake.
-SpinningUnarmed ==
-  \* For every task:
-  \A t \in Tasks :
-    \* if it spins, it is at the spin step, and its node waits or was granted while it spun.
-    spinning[t] => pc[t] = "nspin" /\ phase[t] \in {"waiting", "granted"}
 
 \* Every task is between operations and nobody holds the drain role.
 Quiescent == ~drainOn /\ \A t \in Tasks : pc[t] \in {"idle", "holding", "owned", "parked"}

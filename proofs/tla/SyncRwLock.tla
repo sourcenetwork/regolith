@@ -194,7 +194,7 @@
 \*                                      out sleeps without reading the marks;
 \*                                      the release that nudged it while it
 \*                                      spun woke nobody: NoLostWakeup.
-\* Every row above runs the spins, and checks SpinningUnarmed.
+\* Every row above runs the spins.
 
 \* Borrow the standard TLA+ books: counting numbers, lists, and sizes of finite sets.
 EXTENDS Naturals, Sequences, FiniteSets
@@ -745,8 +745,10 @@ PreSpin(t) ==
   /\ pc[t] = "pspin"
   \* Must it stop?
   /\ IF StopsSpin
-       \* Yes: it goes on to push its node, entering nothing.
-       THEN /\ pc' = [pc EXCEPT ![t] = "push"] /\ UNCHANGED <<lockw, guards, bargedOwed, readInUpgrade>>
+       \* Yes: it goes on to push its node,
+       THEN /\ pc' = [pc EXCEPT ![t] = "push"]
+            \* entering nothing.
+            /\ UNCHANGED <<lockw, guards, bargedOwed, readInUpgrade>>
        \* No: the round enters the lock word if the request fits (no handoff is owed here),
        ELSE /\ CanBarge(Role[t])
             \* exactly as the first attempt would,
@@ -842,10 +844,14 @@ Repark(t) ==
 \* Waiter::begin_spin found nothing marked and took the node's ARMED bit down, so a release that
 \* nudges or grants it now only sets the mark (a task that is not "parked" goes on no wake list).
 SpinStart(t) ==
-  \* The task's try failed, and nothing is granted or nudged yet.
-  /\ pc[t] = "repark" /\ phase[t] = "waiting" /\ ~nudged[t]
-  \* The future spins: its node is unarmed.
-  /\ spinning' = [spinning EXCEPT ![t] = TRUE] /\ pc' = [pc EXCEPT ![t] = "nspin"]
+  \* The task's try failed,
+  /\ pc[t] = "repark"
+  \* and its node is still waiting, with no nudge on it yet.
+  /\ phase[t] = "waiting" /\ ~nudged[t]
+  \* The future spins, awake: a release that marks its node now calls no waker.
+  /\ spinning' = [spinning EXCEPT ![t] = TRUE]
+  \* It goes on spinning.
+  /\ pc' = [pc EXCEPT ![t] = "nspin"]
   \* Nothing else changes.
   /\ UNCHANGED <<lockw, qbits, owedCount, arrivals, waiting, upSlot, nodes, wake, wl, guards, bypass,
                  passOn, upW, dloc, ret, dEarned, ghosts>>
@@ -855,12 +861,16 @@ SpinStart(t) ==
 \* sleeps without reading the marks; a nudge that came while it spun called no waker, so the waiter
 \* sleeps beside it for ever.)
 SpinEnd(t) ==
-  \* The task is spinning on its node; the spin is over and the node is armed again.
-  /\ pc[t] = "nspin" /\ spinning' = [spinning EXCEPT ![t] = FALSE]
-  \* As built it looks; under the bug it may go to sleep without looking.
+  \* The task is spinning on its node,
+  /\ pc[t] = "nspin"
+  \* and the spin is over.
+  /\ spinning' = [spinning EXCEPT ![t] = FALSE]
+  \* As built it looks at its node; under the bug it may also go to sleep without looking.
   /\ \/ Look(t)
-     \* (the bug: straight to sleep, reading nothing)
-     \/ Mutant = "SpinNoRecheck" /\ pc' = [pc EXCEPT ![t] = "parked"] /\ UNCHANGED <<phase, nudged>>
+     \* (only under the bug: straight to sleep,
+     \/ /\ Mutant = "SpinNoRecheck"
+        \* without reading what is on its node.)
+        /\ pc' = [pc EXCEPT ![t] = "parked"] /\ UNCHANGED <<phase, nudged>>
   \* Nothing else changes.
   /\ UNCHANGED <<lockw, qbits, owedCount, arrivals, waiting, upSlot, owedMark, nkind, wake, wl,
                  guards, bypass, passOn, upW, dloc, ret, dEarned, ghosts>>
@@ -1916,10 +1926,6 @@ Spec == Init /\ [][Next]_vars /\ Fairness
 
 ----------------------------------------------------------------------------
 \* Invariants.
-
-\* A SPINNING WAITER IS NEVER ARMED, as in Sync.tla: a future spins on its node only inside its
-\* poll, at the spin step, with its node waiting or granted while it spun.
-SpinningUnarmed == \A t \in Tasks : spinning[t] => pc[t] = "nspin" /\ phase[t] \in {"waiting", "granted"}
 
 \* Every variable holds what its comment says.
 TypeOK ==
