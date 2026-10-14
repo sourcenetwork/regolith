@@ -14,6 +14,7 @@ use tempfile::TempDir;
 
 use super::descriptor::{Descriptor, FILLED, WRITTEN};
 use super::hook::{self, Stage};
+use super::park::Help;
 use super::pipeline::Turn;
 use super::pipeline_tests::{eventual_put, install, key, seq_of, stopped_at};
 use super::write_unit::{Await, Brought, CLAIMED, QUEUED, WANTED, WriteUnit};
@@ -189,9 +190,141 @@ fn within_deadline<T: Send + 'static>(call: impl FnOnce() -> T + Send + 'static)
         .expect("the call waited on a stopped thread without bound")
 }
 
-/// WU5: a commit whose record waits behind a holder that stopped with the
-/// unit claimed writes its record, and the holder's, itself once its
-/// patience ran out. The holder, let go on, finds its record written and
+/// WU5 against the reverted write stage's defect (817f379): a commit whose
+/// record waits behind a holder that stopped while it holds the unit's
+/// claim, its run gathered, writes its record, and the holder's, itself
+/// once its patience ran out. The holder is driven through the unit as a
+/// commit under contention is (a lone commit takes the fast path, WU8, and
+/// never holds the claim). Let go on, it finds its record written and
+/// writes nothing.
+#[test]
+fn a_commit_behind_a_holder_stopped_with_the_unit_claimed_writes_the_records_itself() {
+    let dir = TempDir::new().unwrap();
+    let (engine, recording) = recorded(&dir);
+    let pipe = engine.pipe().unwrap();
+    let holder = Arc::clone(&engine);
+    let behind = Arc::clone(&engine);
+    stopped_at(
+        Stage::Write,
+        move || {
+            let pipe = holder.pipe().unwrap();
+            let (index, desc) = install(&holder, eventual_put(b"held", b"v"));
+            assert!(matches!(
+                holder.help_decide(pipe, index, Help::Wait, None),
+                Turn::Done
+            ));
+            holder.fill(&desc);
+            let _ = holder.bring_written(pipe, &desc, Await::Park);
+        },
+        move || {
+            assert!(
+                !pipe.writes.quiet(),
+                "the holder stopped while it holds the unit's claim"
+            );
+            writes_since(&recording);
+            within_deadline(move || behind.submit(eventual_put(b"behind", b"v")))
+                .expect("the commit behind the stopped holder");
+            assert_eq!(
+                writes_since(&recording).len(),
+                2,
+                "the commit behind wrote its record and the holder's, one copy each"
+            );
+        },
+    );
+    assert_eq!(
+        engine.get(&key(b"held"), u64::MAX).unwrap(),
+        Some(b"v".to_vec())
+    );
+    assert_eq!(
+        engine.get(&key(b"behind"), u64::MAX).unwrap(),
+        Some(b"v".to_vec())
+    );
+}
+
+/// WU4: the holder that lets the unit go wakes the writer parked behind it,
+/// whatever its patience. The writer parks on its filled record with a
+/// note on the holder's claim; once the holder lets go, the writer's next
+/// step finds itself off its record's list: the holder took it, which a
+/// time out never does. A holder that tells nobody fails here.
+#[test]
+fn the_holder_that_lets_the_unit_go_wakes_the_writer_parked_behind_it() {
+    let dir = TempDir::new().unwrap();
+    let engine = RegolithEngine::open(dir.path(), EngineOptions::default()).unwrap();
+    let pipe = engine.pipe().unwrap();
+    let (held_go, held_wait) = mpsc::channel::<()>();
+    let (held_at, held_reached) = mpsc::channel();
+    let (parked, waiter_parked) = mpsc::channel();
+    let (writing, waiter_writing) = mpsc::channel();
+    let (waiter_go, waiter_wait) = mpsc::channel::<()>();
+    let waiter = spare::descriptor(Work::Request(eventual_put(b"waiter", b"v")), true);
+    let (engine, waiter) = (&*engine, &waiter);
+    thread::scope(|scope| {
+        let holder = scope.spawn(move || {
+            let mut fired = false;
+            hook::set(move |stage| {
+                if stage == Stage::Write && !fired {
+                    fired = true;
+                    held_at.send(()).unwrap();
+                    let _ = held_wait.recv_timeout(DEADLINE);
+                }
+            });
+            let (index, desc) = install(engine, eventual_put(b"held", b"v"));
+            assert!(matches!(
+                engine.help_decide(pipe, index, Help::Wait, None),
+                Turn::Done
+            ));
+            engine.fill(&desc);
+            let _ = engine.bring_written(pipe, &desc, Await::Park);
+            hook::clear();
+            engine.drive(pipe, index, &desc);
+        });
+        held_reached
+            .recv_timeout(DEADLINE)
+            .expect("the holder never reached its run's write");
+        let index = engine.enter(pipe, waiter);
+        let writer = scope.spawn(move || {
+            let (mut parks, mut writes) = (0, 0);
+            hook::set(move |stage| match stage {
+                Stage::WriteWait => {
+                    parks += 1;
+                    if parks == 1 {
+                        parked.send(()).unwrap();
+                    }
+                }
+                Stage::Write => {
+                    writes += 1;
+                    if writes == 1 {
+                        writing.send(()).unwrap();
+                        let _ = waiter_wait.recv_timeout(DEADLINE);
+                    }
+                }
+                _ => {}
+            });
+            engine.drive(pipe, index, waiter);
+            hook::clear();
+        });
+        waiter_parked
+            .recv_timeout(DEADLINE)
+            .expect("the writer never parked behind the holder");
+        held_go.send(()).unwrap();
+        waiter_writing
+            .recv_timeout(DEADLINE)
+            .expect("the writer never came back to write its record");
+        holder.join().unwrap();
+        assert!(
+            !waiter.has_sleepers(),
+            "the holder let the unit go and did not wake the writer parked behind it"
+        );
+        waiter_go.send(()).unwrap();
+        writer.join().unwrap();
+    });
+    seq_of(waiter).unwrap();
+}
+
+/// WU5, the fast path's own write: a commit whose record waits behind an
+/// owner that stopped inside its own write, as a copy through the gate with
+/// no claim held, writes the owner's record and its own itself once its
+/// patience ran out. The owner, let go on, finds its record written and
 /// writes nothing.
 #[test]
 fn a_commit_behind_a_stopped_holder_writes_the_records_itself() {

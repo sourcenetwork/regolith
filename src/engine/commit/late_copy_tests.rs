@@ -3,9 +3,10 @@
 //! that covers it has begun.
 //!
 //! An owner stops inside its record's write, or just before it, through
-//! the pipeline's test hooks, holding the write unit (`write_unit.rs`); a
-//! helper behind it writes the same record once its patience ran out, and
-//! a sync wants the log durable. The workload runs in
+//! the pipeline's test hooks. Alone, it takes the fast path (`write_unit.rs`,
+//! WU8): its write is a copy through the gate and it holds no claim on the
+//! write unit. A helper behind it writes the same record, in a run of its
+//! own that begins with it, and a sync wants the log durable. The workload runs in
 //! a child process, this test binary run again with the `LD_PRELOAD` shim
 //! of `tests/common/fault`, which journals every write and sync of the log
 //! in the order they reached the host. The parent reads the journal: a write

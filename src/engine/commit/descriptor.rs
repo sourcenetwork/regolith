@@ -664,8 +664,9 @@ impl Descriptor {
         !ready()
     }
 
-    /// Loom-only: whether a thread is still on the slot's list, unwoken.
-    #[cfg(loom)]
+    /// Tests and loom only: whether a thread is still on the slot's list,
+    /// unwoken.
+    #[cfg(any(test, loom))]
     pub(super) fn has_sleepers(&self) -> bool {
         !self.sleepers.is_empty()
     }
