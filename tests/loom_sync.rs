@@ -1008,18 +1008,18 @@ fn calibration_a_first_attempt_that_ignores_handoff_barges_past_an_owed_waiter()
 
 /// E48. A release that nudges a waiter spinning on its node calls no waker,
 /// and the waiter is served all the same (TLA+ NoLostWakeup and
-/// SpinningUnarmed, Lean `no_lost_wakeup_spinning`); the calibration ends
-/// the spin without the look and must leave the waiter asleep beside the
-/// nudge.
+/// Lean `no_lost_wakeup_spinning`), with floors on the spins it must reach;
+/// the calibration is the production spin with its look taken away and
+/// must leave the waiter armed beside an unread mark.
 #[test]
 fn a_nudge_while_the_waiter_spins_is_never_lost() {
     regolith::loom_exports::sync::a_nudge_while_the_waiter_spins_is_never_lost();
 }
 
 #[test]
-#[should_panic(expected = "the waiter sleeps beside a nudge nobody woke it for")]
-fn calibration_a_spin_that_sleeps_without_looking_loses_the_nudge() {
-    regolith::loom_exports::sync::calibration_a_spin_that_sleeps_without_looking_loses_the_nudge();
+#[should_panic(expected = "the waiter armed and slept beside an unread mark")]
+fn calibration_a_node_spin_that_skips_its_look_sleeps_beside_the_mark() {
+    regolith::loom_exports::sync::calibration_a_node_spin_that_skips_its_look_sleeps_beside_the_mark();
 }
 
 /// E33. An upgrade waits for a reader and is dropped. While its drop is

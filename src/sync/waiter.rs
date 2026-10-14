@@ -435,6 +435,83 @@ impl Waiter {
     }
 }
 
+/// Loom-only instruments of the spin on the waiter's node (E48): what the
+/// models in `loom_model.rs` count to show they reach each branch of the
+/// spin, and the one guard their calibration takes away. Loom runs a model's
+/// threads as coroutines on the test's own thread, so these are per test.
+#[cfg(loom)]
+pub(super) mod spin_probe {
+    use core::cell::Cell;
+    use std::thread::LocalKey;
+
+    std::thread_local! {
+        /// Spins on a node that began.
+        pub(in super::super) static SPINS: Cell<usize> = const { Cell::new(0) };
+        /// Spins that saw a mark land on the unarmed node.
+        pub(in super::super) static MARKED_WHILE_SPINNING: Cell<usize> = const { Cell::new(0) };
+        /// Spins that ran out, after which only the look found a mark.
+        pub(in super::super) static MARKED_AFTER_LAST_READ: Cell<usize> = const { Cell::new(0) };
+        /// The calibration's switch: a spin that runs out arms the waker
+        /// without the look's reading of the marks.
+        pub(in super::super) static SKIP_LOOK: Cell<bool> = const { Cell::new(false) };
+    }
+
+    /// Adds one to `counter`.
+    pub(in super::super) fn count(counter: &'static LocalKey<Cell<usize>>) {
+        counter.with(|c| c.set(c.get() + 1));
+    }
+
+    /// Reads and resets the three counts, in the order above.
+    pub(in super::super) fn take() -> [usize; 3] {
+        [&SPINS, &MARKED_WHILE_SPINNING, &MARKED_AFTER_LAST_READ].map(|c| c.with(|c| c.replace(0)))
+    }
+}
+
+#[cfg(loom)]
+impl Waiter {
+    /// The calibration's broken end of a spin: registers `waker` and arms it
+    /// without reading the marks, which is what `park` does in one swap
+    /// with the reading. A node that carries an unread mark at the arming
+    /// swap now sleeps beside it: no release will wake it, since the one
+    /// that marked it found it unarmed and the nudge marker stays up. The
+    /// model stops there rather than park for good, which loom would report
+    /// as a deadlock and abort the test binary with.
+    fn arm_without_look(&self, waker: &Waker) -> Park {
+        let mut state = self.state.load(Ordering::Acquire);
+        let target = loop {
+            let current = if state & TAKING != 0 {
+                !state & TAKEN != 0
+            } else {
+                state & CURRENT != 0
+            };
+            let next =
+                (state & !(ARMED | CURRENT)) | REGISTERING | if current { CURRENT } else { 0 };
+            match self.state.compare_exchange_weak(
+                state,
+                next,
+                Ordering::Acquire,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => break next,
+                Err(actual) => state = actual,
+            }
+        };
+        // SAFETY: as in `park`: the registering bit makes the slot this
+        // future's.
+        self.slot(target, CURRENT).with_mut(|slot| unsafe {
+            if !(*slot).as_ref().is_some_and(|w| w.will_wake(waker)) {
+                *slot = Some(waker.clone());
+            }
+        });
+        let before = self.state.fetch_xor(REGISTERING | ARMED, Ordering::AcqRel);
+        assert!(
+            before & NUDGED == 0 && before & PHASE != GRANTED,
+            "the waiter armed and slept beside an unread mark"
+        );
+        Park::Pending
+    }
+}
+
 /// What [`Waiter::take_claimed`] left behind.
 enum Taken {
     /// Another waker was claimed; take again.
@@ -770,13 +847,32 @@ impl Wait {
             // SAFETY: this future holds its reference until it clears `node`.
             let waiter = unsafe { node.as_ref() };
             if rounds > 0 && waiter.begin_spin() {
+                #[cfg(loom)]
+                spin_probe::count(&spin_probe::SPINS);
                 if (0..rounds).any(|_| {
                     pause();
                     waiter.marked()
                 }) {
+                    // A grant or nudge landed on the node while it was
+                    // unarmed, and the spin saw it.
+                    #[cfg(loom)]
+                    spin_probe::count(&spin_probe::MARKED_WHILE_SPINNING);
                     queue.spin.won(rounds);
                 } else {
                     queue.spin.ran_out(rounds);
+                    #[cfg(loom)]
+                    {
+                        if spin_probe::SKIP_LOOK.with(core::cell::Cell::get) {
+                            return waiter.arm_without_look(waker);
+                        }
+                        let park = self.park(queue, Some(waker));
+                        if !matches!(park, Park::Pending) {
+                            // A mark landed after the spin's last read: only
+                            // the look's swap saw it.
+                            spin_probe::count(&spin_probe::MARKED_AFTER_LAST_READ);
+                        }
+                        return park;
+                    }
                 }
             }
         }

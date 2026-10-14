@@ -520,105 +520,82 @@ fn owed_handoff_model(name: &'static str, attempt: fn(&RawSemaphore) -> Result<(
     });
 }
 
-/// E48, the spins. A waiter queues behind the holder. The holder lets go and
-/// takes the lock straight back, so the waiter's retry can lose and the
-/// waiter spins on its node; then the holder lets go again, which nudges the
-/// waiter while it may be spinning, and the release calls no waker. The
-/// waiter is served all the same: a lost wakeup would park it for good,
-/// which loom reports as a deadlock. Under loom a spin has one round, so the
-/// spin before queueing and the spin on the node both run, and both either
-/// see what they wait for or run out.
+/// E48, the spins. A waiter queues behind the holder; once it has queued,
+/// the holder puts the lock's spin budget back to one round if the waiter's
+/// spin before queueing used it up (as another waiter's won retry would), so
+/// the waiter's next lost retry does spin on its node. The holder lets go and
+/// takes the lock straight back, so the waiter's retry can lose; then it lets
+/// go again, which can land while the waiter spins on its unarmed node (the
+/// release calls no waker) or just after the spin's last read (only the look
+/// sees it). The waiter is served all the same: a lost wakeup would park it
+/// for good, which loom reports as a deadlock. The model counts the spins on
+/// the node, the marks the spin saw, and the marks only the look saw, and
+/// fails if any of the three never happened.
 pub fn a_nudge_while_the_waiter_spins_is_never_lost() {
-    explore(
+    node_spin_model(
         "a_nudge_while_the_waiter_spins_is_never_lost",
-        2,
-        10,
-        1,
-        |witnessed| {
-            let sem = Arc::new(RawSemaphore::new(1));
-            assert!(sem.try_acquire(1), "free at the start");
-            let waiter = {
-                let sem = Arc::clone(&sem);
-                thread::spawn(move || acquire_parking(&sem))
-            };
-            thread::yield_now();
-            sem.release(1);
-            if sem.take_one().is_ok() {
-                // The holder took the lock back past the waiter.
-                witnessed.fetch_add(1, StdOrdering::Relaxed);
-                thread::yield_now();
-                sem.release(1);
-            }
-            waiter.join().expect("waiter");
-            sem.release(1);
-            assert_eq!(sem.available(), 1, "a permit was lost or made up");
-        },
+        [100, 10, 10],
     );
 }
 
-/// The node protocol of the spin, written with its end the wrong way: the
-/// waiter takes ARMED down to spin, spins one round, and then arms its waker
-/// and sleeps without reading NUDGED. A release that nudges it during the
-/// spin finds it unarmed, sets NUDGED and calls no waker, so the waiter
-/// sleeps beside the nudge for ever. The model checks that end state
-/// directly (an armed sleeper with NUDGED up whose waker nobody called),
-/// rather than parking for real: a model that deadlocks aborts the test
-/// binary instead of failing one test.
-pub fn calibration_a_spin_that_sleeps_without_looking_loses_the_nudge() {
-    const ARMED: usize = 1;
-    const NUDGED: usize = 1 << 1;
-    explore(
-        "calibration_a_spin_that_sleeps_without_looking_loses_the_nudge",
-        2,
-        0,
-        0,
-        |_witnessed| {
-            // The waiter's node, armed: its future returned Pending once.
-            let node = Arc::new(AtomicUsize::new(ARMED));
-            // Whether a release called the waiter's waker.
-            let called = Arc::new(AtomicBool::new(false));
-            let releaser = {
-                let (node, called) = (Arc::clone(&node), Arc::clone(&called));
-                thread::spawn(move || {
-                    // The nudge (Waiter::touch): an armed waker is claimed and
-                    // called; an unarmed node only gets the mark.
-                    let mut state = node.load(Ordering::Acquire);
-                    loop {
-                        let armed = state & ARMED != 0;
-                        let next = if armed { state & !ARMED } else { state } | NUDGED;
-                        match node.compare_exchange(
-                            state,
-                            next,
-                            Ordering::AcqRel,
-                            Ordering::Acquire,
-                        ) {
-                            Ok(_) if armed => break called.store(true, Ordering::Release),
-                            Ok(_) => break,
-                            Err(actual) => state = actual,
-                        }
-                    }
-                })
-            };
-            // The waiter lost a retry and spins: ARMED comes down unless a
-            // nudge is there already.
-            let mut asleep = false;
-            if node.fetch_and(!ARMED, Ordering::AcqRel) & NUDGED == 0 {
-                // One round of the spin.
-                loom::hint::spin_loop();
-                if node.load(Ordering::Acquire) & NUDGED == 0 {
-                    // The defect: the spin ran out, and the waiter arms its
-                    // waker and sleeps without reading NUDGED in the same
-                    // step.
-                    node.fetch_or(ARMED, Ordering::AcqRel);
-                    asleep = true;
-                }
-            }
-            releaser.join().expect("releaser");
-            let nudged = node.load(Ordering::Acquire) & NUDGED != 0;
-            assert!(
-                !(asleep && nudged && !called.load(Ordering::Acquire)),
-                "the waiter sleeps beside a nudge nobody woke it for"
-            );
-        },
+/// The same run with the look after a spin that runs out taken away
+/// (`spin_probe::SKIP_LOOK`): the production `Wait::spin_park` then arms
+/// the waker without reading the marks. A nudge that landed while the
+/// waiter spun, or after its last read, is left unread beside a sleeper,
+/// and the arming swap's check fails.
+pub fn calibration_a_node_spin_that_skips_its_look_sleeps_beside_the_mark() {
+    super::waiter::spin_probe::SKIP_LOOK.with(|skip| skip.set(true));
+    node_spin_model(
+        "calibration_a_node_spin_that_skips_its_look_sleeps_beside_the_mark",
+        [0, 0, 0],
+    );
+}
+
+/// The run of the two models above; `floors` are the least counts of node
+/// spins, marks the spin saw, and marks only the look saw.
+fn node_spin_model(name: &'static str, floors: [usize; 3]) {
+    super::waiter::spin_probe::take();
+    explore(name, 2, 10, 1, |witnessed| {
+        let sem = Arc::new(RawSemaphore::new(1));
+        assert!(sem.try_acquire(1), "free at the start");
+        let waiter = {
+            let sem = Arc::clone(&sem);
+            thread::spawn(move || acquire_parking(&sem))
+        };
+        while sem.queue().state.load(Ordering::Acquire) & QUEUED == 0 {
+            thread::yield_now();
+        }
+        if sem.queue().spin.rounds() == 0 {
+            sem.queue().spin.won(0);
+        }
+        sem.release(1);
+        if sem.take_one().is_ok() {
+            // The holder took the lock back past the waiter.
+            witnessed.fetch_add(1, StdOrdering::Relaxed);
+            thread::yield_now();
+            sem.release(1);
+        }
+        waiter.join().expect("waiter");
+        sem.release(1);
+        assert_eq!(sem.available(), 1, "a permit was lost or made up");
+    });
+    let [spins, seen, late] = super::waiter::spin_probe::take();
+    println!(
+        "loom model {name}: {spins} node spins, {seen} marks seen by the spin, {late} only by the look"
+    );
+    assert!(
+        spins >= floors[0],
+        "{name}: {spins} node spins, below the floor {}",
+        floors[0]
+    );
+    assert!(
+        seen >= floors[1],
+        "{name}: {seen} marks seen by a spin, below the floor {}",
+        floors[1]
+    );
+    assert!(
+        late >= floors[2],
+        "{name}: {late} marks seen only by the look, below the floor {}",
+        floors[2]
     );
 }
