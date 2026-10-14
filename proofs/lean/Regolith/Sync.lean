@@ -1720,14 +1720,23 @@ same look as before (`Wait::park` with the waker), whose last compare-and-swap
 arms the waker and reads the marks together, so a mark that came during the
 spin sends W back to retry instead of to sleep.
 
-This section is that node, alone: one waiter's future and its marks, with
-every order in which releases and the future's own steps can happen. It proves
-that an armed, sleeping node never carries a mark nobody will act on
-(`no_lost_wakeup_spinning`), that a release which finds the waiter spinning
-calls no waker (`mark_spinning_wakes_nobody`), and, as the RED case, that a
-spin which gave up without the look would leave the waiter asleep beside a
-mark (`spin_without_look_strands`). TLA+: `NoLostWakeup` in `Sync.tla`,
-with `MC_Sync_Red_SpinNoRecheck`.
+This section is that node, alone: one waiter's future, its node's ARMED bit
+and its marks, with every order in which releases and the future's own steps
+can happen. It proves that a sleeping future is always armed and never has an
+unread mark (`no_lost_wakeup_spinning`), that a spinning future is never armed,
+so a release that finds it spinning calls no waker (`mark_spinning_wakes_nobody`),
+and, as the RED case, that a spin which gave up without the look would leave
+the waiter asleep beside a mark (`spin_without_look_strands`). TLA+:
+`NoLostWakeup` in `Sync.tla`, with `MC_Sync_Red_SpinNoRecheck`.
+
+What it does not cover: it is not joined to the queue machine above. That
+machine's `woken` stands for "this waiter will look at its node again"; this
+one shows that the node-level handshake (a release's mark against the
+future's look and spin) never breaks that promise, for one node and any
+interleaving of its own steps. Which waiter a release marks, and that the
+head of a free lock is marked at all, is `no_stranded_head` above; that a
+handed waiter is marked is `handed_woken`. TLA+ checks the two together,
+instruction by instruction, for two and three tasks.
 
 The spin before queueing needs nothing new here: each of its rounds either
 takes the free lock with no handoff owed, which is the `fast` step above (its
@@ -1737,14 +1746,13 @@ changes nothing at all.
 
 /-- Where a waiter's future is, as its node sees it. -/
 inductive Where where
-  /-- It returned `Pending` with its waker armed (ARMED up): it sleeps until the
-  waker is called. -/
+  /-- It returned `Pending` and sleeps until its waker is called. -/
   | asleep
-  /-- It is inside its poll, spinning on its node, ARMED down. -/
+  /-- It is inside its poll, spinning on its node. -/
   | spinning
   /-- It is inside its poll doing anything else: looking, retrying, registering. -/
   | running
-  /-- Its waker was called; the executor will poll it. -/
+  /-- Its waker was called while it slept; the executor will poll it. -/
   | woken
   -- Lean writes the comparison of two places for us.
   deriving DecidableEq
@@ -1753,43 +1761,69 @@ inductive Where where
 structure Node where
   /-- Where the future is. -/
   place : Where
+  /-- The node's ARMED bit: a waker sits in the node that a release may claim
+  and call. -/
+  armed : Bool
   /-- A nudge or grant sits on the node that the future has not read yet. -/
   marked : Bool
   -- Lean writes the comparison of two nodes for us.
   deriving DecidableEq
 
-/-- A future that has just queued: inside its poll, nothing marked. -/
-def Node.start : Node := ⟨.running, false⟩
+/-- A future that has just queued: inside its poll, its waker not armed yet
+(it is still registering), nothing marked. -/
+def Node.start : Node := ⟨.running, false, false⟩
 
 /-- The steps that can happen to one node, in any order. `lookAfterSpin` says
 whether a spin ends with the look, as the code does (`true`), or, as the RED
 case, may also go to sleep without it (`false`). -/
 inductive NodeStep (lookAfterSpin : Bool) : Node → Node → Prop
-  /-- A release nudges or grants the node (`Waiter::touch`). If the waker is
-  armed it is claimed and called: the future is woken. Otherwise (spinning or
-  running) only the mark is set, and no waker is called. -/
-  | mark (n : Node) :
-      -- After the step: an asleep future is woken and marked; any other is marked where it is.
+  /-- A release nudges or grants an armed node (`Waiter::touch` claims the
+  waker): the waker is taken and called, and the mark is set. A sleeping
+  future is woken; a running one simply has a wake on its way. -/
+  | markArmed (n : Node)
+      -- The node is armed.
+      (h : n.armed = true) :
+      -- After the step: not armed, marked, and woken if it slept.
       NodeStep lookAfterSpin n
-        -- (asleep: woken and marked; otherwise: marked where it is)
-        (if n.place = .asleep then ⟨.woken, true⟩ else { n with marked := true })
-  /-- The future looks at its node (`Waiter::park` with the waker): it arms the
-  waker and reads the mark in one compare-and-swap. Marked: it takes the mark
-  and goes on retrying, awake. Not marked: it sleeps, armed. -/
-  | look (n : Node)
-      -- The future is inside its poll.
-      (h : n.place = .running) :
-      -- After the step: awake with the mark read, or asleep with nothing marked.
-      NodeStep lookAfterSpin n (if n.marked then ⟨.running, false⟩ else ⟨.asleep, false⟩)
-  /-- After a lost retry, the future starts to spin (`Waiter::begin_spin`): it
-  takes ARMED down, and spins only if nothing is marked yet. -/
+        -- (a sleeper is woken; any other future stays where it is)
+        ⟨if n.place = .asleep then .woken else n.place, false, true⟩
+  /-- A release nudges or grants a node that is not armed: only the mark is set,
+  and no waker is called. -/
+  | markUnarmed (n : Node)
+      -- The node is not armed.
+      (h : n.armed = false) :
+      -- After the step: marked where it is.
+      NodeStep lookAfterSpin n { n with marked := true }
+  /-- The future looks at its node and nothing is marked (`Waiter::park` with
+  the waker): its last swap arms the waker and reads the marks together, and
+  the future sleeps. -/
+  | lookSleep (n : Node)
+      -- The future is inside its poll,
+      (h : n.place = .running)
+      -- and nothing is marked.
+      (hm : n.marked = false) :
+      -- After the step: asleep and armed.
+      NodeStep lookAfterSpin n ⟨.asleep, true, false⟩
+  /-- The future looks at its node and finds a mark: it takes the mark and goes
+  on retrying, awake. It may come out armed (the mark landed while it was
+  registering, and the arming swap read it) or not (it saw the mark before it
+  registered); `a` is which. -/
+  | lookMarked (n : Node) (a : Bool)
+      -- The future is inside its poll,
+      (h : n.place = .running)
+      -- and a mark is there.
+      (hm : n.marked = true) :
+      -- After the step: running, the mark read, armed or not.
+      NodeStep lookAfterSpin n ⟨.running, a || n.armed, false⟩
+  /-- After a lost retry, the future starts to spin (`Waiter::begin_spin`): with
+  nothing marked, it takes ARMED down and spins. -/
   | spinStart (n : Node)
       -- The future is inside its poll,
       (h : n.place = .running)
       -- and nothing is marked.
       (hm : n.marked = false) :
-      -- After the step: spinning.
-      NodeStep lookAfterSpin n { n with place := .spinning }
+      -- After the step: spinning, not armed.
+      NodeStep lookAfterSpin n ⟨.spinning, false, n.marked⟩
   /-- The spin ends, because it saw the mark or its rounds ran out; the future
   goes on to its look. -/
   | spinEnd (n : Node)
@@ -1804,8 +1838,8 @@ inductive NodeStep (lookAfterSpin : Bool) : Node → Node → Prop
       (hb : lookAfterSpin = false)
       -- and the future spins.
       (h : n.place = .spinning) :
-      -- After the step: asleep, whatever is marked.
-      NodeStep lookAfterSpin n { n with place := .asleep }
+      -- After the step: asleep and armed, whatever is marked.
+      NodeStep lookAfterSpin n { n with place := .asleep, armed := true }
   /-- The executor polls a woken future: it is inside its poll again. -/
   | poll (n : Node)
       -- The waker was called.
@@ -1822,51 +1856,67 @@ inductive NodeSteps (lookAfterSpin : Bool) : Node → Node → Prop
       -- Steps from a to b, then one step from b to c, make steps from a to c.
       NodeSteps lookAfterSpin a b → NodeStep lookAfterSpin b c → NodeSteps lookAfterSpin a c
 
-/-- The promise: a future asleep with its waker armed has no unread mark on
-its node. A mark set while it slept called its waker and woke it, and a mark
-set while it was awake, spinning included, was read by the look that put it to
-sleep. -/
-def NodeInv (n : Node) : Prop := n.place = .asleep → n.marked = false
+/-- The promise: a sleeping future is armed and has no unread mark on its node
+(so a release that marks it calls its waker), and a spinning future is not
+armed (so a release that marks it calls none, and the spin reads the mark). -/
+def NodeInv (n : Node) : Prop :=
+  -- A sleeper is armed and unmarked,
+  (n.place = .asleep → n.armed = true ∧ n.marked = false) ∧
+  -- and a spinner is not armed.
+  (n.place = .spinning → n.armed = false)
 
-/-- Every step of the code ends in a node that keeps the promise, whatever came
-before it: the only way to fall asleep is the look, which reads the mark in the
-same step, and a mark that lands on a sleeper wakes it. -/
+/-- One step of the code keeps the promise. -/
 theorem nodeStep_inv {n m : Node}
-    -- The step is one of the code's, with the look after every spin.
+    -- The promise holds before the step,
+    (hi : NodeInv n)
+    -- and the step is one of the code's, with the look after every spin.
     (hs : NodeStep true n m) :
-    -- The statement: the promise holds after it.
+    -- The statement: it holds after.
     NodeInv m := by
+  -- Unfold the promise on both sides.
+  unfold NodeInv at *
+  -- Name the two halves of the promise before the step.
+  obtain ⟨hsleep, hspin⟩ := hi
   -- Look at which step it was.
   cases hs with
-  -- A release marks the node: an asleep future is woken instead; any other is not asleep.
-  | mark =>
-    -- Unfold the promise and split on whether the future was asleep.
-    unfold NodeInv at *; split <;> simp_all
-  -- The look: it either takes the mark (awake) or sleeps with nothing marked.
-  | look h =>
-    -- Unfold the promise and split on the mark.
-    unfold NodeInv; split <;> simp
-  -- Starting to spin leaves the future awake.
+  -- An armed node marked: a sleeper wakes; a spinner cannot be armed.
+  | markArmed h =>
+    -- Split on whether the future slept, and settle each place.
+    split <;> rename_i hp <;> cases hpl : n.place <;> simp_all
+  -- An unarmed node marked: it stays where it is; a sleeper cannot be unarmed.
+  | markUnarmed h =>
+    -- Each place in turn; the promise before rules out an unarmed sleeper.
+    cases hpl : n.place <;> simp_all
+  -- The look that sleeps: asleep, armed, nothing marked.
+  | lookSleep h hm =>
+    -- Both halves hold outright.
+    simp
+  -- The look that finds a mark: the future runs on.
+  | lookMarked a h hm =>
+    -- It is neither asleep nor spinning.
+    simp
+  -- Starting to spin: spinning, not armed.
   | spinStart h hm =>
-    -- The future is spinning, not asleep.
-    unfold NodeInv; simp
-  -- Ending the spin leaves the future awake, about to look.
+    -- Both halves hold outright.
+    simp
+  -- Ending the spin: the future runs again.
   | spinEnd h =>
-    -- The future is inside its poll, not asleep.
-    unfold NodeInv; simp
+    -- It is neither asleep nor spinning.
+    simp
   -- The bad way out of a spin is not a step of the code.
   | spinSleep hb h =>
     -- `true = false` is impossible.
     exact absurd hb (by decide)
-  -- A woken future polled is awake.
+  -- A woken future polled runs again.
   | poll h =>
-    -- The future is inside its poll, not asleep.
-    unfold NodeInv; simp
+    -- It is neither asleep nor spinning.
+    simp
 
 /-- **`no_lost_wakeup_spinning`.** From a fresh node, after any steps of the
-code, spins included, the future is never asleep beside an unread mark. Rules
-out: a release nudges a spinning waiter (calling no waker), the waiter stops
-spinning and sleeps, and nothing ever wakes it. -/
+code, spins included, a sleeping future is armed with no unread mark, and a
+spinning one is not armed. Rules out: a release nudges a spinning waiter
+(calling no waker), the waiter stops spinning and sleeps, and nothing ever
+wakes it. -/
 theorem no_lost_wakeup_spinning {n : Node}
     -- Any node reached from a fresh one by the code's steps.
     (hr : NodeSteps true Node.start n) :
@@ -1874,27 +1924,26 @@ theorem no_lost_wakeup_spinning {n : Node}
     NodeInv n := by
   -- By induction over the steps taken.
   induction hr with
-  -- At the start the future is not asleep.
+  -- At the start the future runs: neither half has anything to check.
   | refl => unfold NodeInv Node.start; simp
-  -- After any further step the promise holds, by the last step alone.
-  | tail _ hs => exact nodeStep_inv hs
+  -- Each further step keeps the promise.
+  | tail _ hs ih => exact nodeStep_inv ih hs
 
-/-- **`mark_spinning_wakes_nobody`.** A release that marks a spinning waiter
-calls no waker: the future stays where it is, spinning, and only the mark is
-new. This is the wake E48 saves. -/
-theorem mark_spinning_wakes_nobody (b : Bool) (n : Node)
-    -- The future spins.
+/-- **`mark_spinning_wakes_nobody`.** In any node the code reaches, a release
+that marks a spinning future finds it unarmed, so it only sets the mark: the
+future stays spinning, no waker is called, and the spin reads the mark. This is
+the wake E48 saves. -/
+theorem mark_spinning_wakes_nobody {n : Node}
+    -- A node the code reaches,
+    (hr : NodeSteps true Node.start n)
+    -- whose future spins.
     (h : n.place = .spinning) :
-    -- The statement: the release's step leaves it spinning, marked, not woken.
-    NodeStep b n { n with marked := true } ∧ ({ n with marked := true } : Node).place = .spinning := by
-  -- The mark step's result is the node marked where it was, since it was not asleep.
-  have hm := NodeStep.mark (lookAfterSpin := b) n
-  -- The future was not asleep, so the release took the "mark only" branch.
-  have hne : n.place ≠ .asleep := by rw [h]; decide
-  -- Rewrite the step with that branch, and read off where the future is.
-  simp only [hne, ↓reduceIte] at hm
-  -- Both halves follow.
-  exact ⟨hm, h⟩
+    -- The statement: the node is unarmed, and the release's step leaves it spinning, marked.
+    n.armed = false ∧ NodeStep true n { n with marked := true } := by
+  -- The promise says a spinner is unarmed.
+  have hu : n.armed = false := (no_lost_wakeup_spinning hr).2 h
+  -- So the release takes the "mark only" step.
+  exact ⟨hu, .markUnarmed n hu⟩
 
 /-- **`spin_without_look_strands`** (the RED case). If a spin that runs out may
 sleep without its look, a fresh node can end asleep beside an unread mark: it
@@ -1904,11 +1953,11 @@ theorem spin_without_look_strands :
     -- The statement: some node the defective steps reach is asleep and marked.
     ∃ n, NodeSteps false Node.start n ∧ n.place = .asleep ∧ n.marked = true := by
   -- The run: start spinning, get marked, sleep without looking.
-  refine ⟨⟨.asleep, true⟩, .tail (.tail (.tail (.refl _)
+  refine ⟨⟨.asleep, true, true⟩, .tail (.tail (.tail (.refl _)
     -- The fresh future starts to spin.
     (.spinStart Node.start rfl rfl))
-    -- A release marks it; it was spinning, so it stays spinning, marked.
-    (.mark _))
+    -- A release marks it; it was spinning and unarmed, so only the mark is set.
+    (.markUnarmed _ rfl))
     -- Its spin runs out and it sleeps without reading the mark.
     (.spinSleep _ rfl rfl), rfl, rfl⟩
 
