@@ -94,8 +94,8 @@ instruction.
    spins included), `mark_spinning_wakes_nobody` (a release that finds the
    waiter spinning calls no waker; the spinner reads the mark itself) and the
    RED case `spin_without_look_strands` (a spin that sleeps without its look
-   leaves the waiter asleep beside a mark). TLA+: `SpinningUnarmed`,
-   `NoLostWakeup`, `MC_Sync_Red_SpinNoRecheck`.
+   leaves the waiter asleep beside a mark). TLA+: `NoLostWakeup`,
+   `MC_Sync_Red_SpinNoRecheck`.
 8. The RED cases, as counterexamples: `unbounded_barging_breaks_bound` and
    `unbounded_barging_leaves_barging_open` (a waiter that never raises the
    owed flag loses more than `B` races, with barging still open) and
@@ -1726,8 +1726,8 @@ that an armed, sleeping node never carries a mark nobody will act on
 (`no_lost_wakeup_spinning`), that a release which finds the waiter spinning
 calls no waker (`mark_spinning_wakes_nobody`), and, as the RED case, that a
 spin which gave up without the look would leave the waiter asleep beside a
-mark (`spin_without_look_strands`). TLA+: `SpinningUnarmed` and
-`NoLostWakeup` in `Sync.tla`, with `MC_Sync_Red_SpinNoRecheck`.
+mark (`spin_without_look_strands`). TLA+: `NoLostWakeup` in `Sync.tla`,
+with `MC_Sync_Red_SpinNoRecheck`.
 
 The spin before queueing needs nothing new here: each of its rounds either
 takes the free lock with no handoff owed, which is the `fast` step above (its
