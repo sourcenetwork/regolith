@@ -6,6 +6,8 @@
 //! ```
 //!
 //! The models live in `src/engine/commit/loom_model.rs`,
+//! `src/engine/commit/loom_write_unit.rs`,
+//! `src/engine/commit/loom_turn_wait.rs`,
 //! `src/engine/loom_model/step.rs` and `src/engine/loom_model/park.rs`,
 //! next to the crate-private types they drive. What each proves:
 //!
@@ -40,6 +42,22 @@
 //!   the wake of a parked job had off the list when the job landed is told
 //!   once.
 //!
+//! - **The write unit** (E45, L58): one thread at a time holds the unit; a
+//!   writer parked on its record is woken when the holder's run writes it,
+//!   and when the holder lets the unit go with the record still waiting; a
+//!   run looks at its record again once counted in at the gate, so it never
+//!   lands under a sync; a `commit_nowait` commit left on its queue is
+//!   told when the unit is let go; one thread at a time encodes a record,
+//!   the owner or a thread that needs it; and a writer parked on a record
+//!   being encoded is woken when it is filled; the fast path of a writer
+//!   racing a claimer writes only whole records; and two writers behind a
+//!   holder are never left asleep, on the production note, park, release,
+//!   tell and wake (the review's two lost wakes are its calibrations).
+//! - **A call far from its turn** (E45 step 2, `turn_wait.rs`): a blocking
+//!   call parked on its own slot is named by the pass that brings its turn
+//!   near and told by the next finished commit, and is woken when its slot
+//!   lands, whoever published it.
+//!
 //! Every model is bounded by a small scenario (a ring of two cells, two
 //! threads or two and a reader) and an explicit preemption bound given in
 //! the model's own code, never by a time limit. Each is paired with a
@@ -49,7 +67,7 @@
 
 #![cfg(loom)]
 
-use regolith::loom_exports::{park, pipeline, step};
+use regolith::loom_exports::{park, pipeline, step, turn_wait, write_unit};
 
 #[test]
 fn an_index_is_installed_or_voided_never_both() {
@@ -244,4 +262,125 @@ fn a_wake_that_comes_before_the_park_tells_the_queues_with_the_job_free() {
 #[should_panic(expected = "a queue was told the job may go on while it was still claimed")]
 fn a_wake_that_tells_at_once_reaches_a_queue_with_the_job_claimed() {
     park::a_wake_that_tells_at_once_reaches_a_queue_with_the_job_claimed();
+}
+
+#[test]
+fn a_parked_writer_is_woken_when_its_record_is_written() {
+    write_unit::a_parked_writer_is_woken_when_its_record_is_written();
+}
+
+#[test]
+fn a_writer_parked_for_the_next_claim_is_woken_when_the_unit_is_let_go() {
+    write_unit::a_writer_parked_for_the_next_claim_is_woken_when_the_unit_is_let_go();
+}
+
+#[test]
+#[should_panic(expected = "a writer parked for the next claim was never woken")]
+fn a_holder_that_tells_nobody_leaves_a_writer_asleep() {
+    write_unit::calibration_a_holder_that_tells_nobody_leaves_a_writer_asleep();
+}
+
+#[test]
+fn a_run_never_lands_under_a_sync() {
+    write_unit::a_run_never_lands_under_a_sync();
+}
+
+#[test]
+#[should_panic(expected = "a run landed under the sync")]
+fn a_run_that_does_not_look_again_lands_under_the_sync() {
+    write_unit::calibration_a_run_that_does_not_look_again_lands_under_the_sync();
+}
+
+#[test]
+fn one_thread_at_a_time_holds_the_unit() {
+    write_unit::one_thread_at_a_time_holds_the_unit();
+}
+
+#[test]
+#[should_panic]
+fn a_claim_that_is_a_load_and_a_store_writes_two_runs_at_once() {
+    write_unit::calibration_a_claim_that_is_a_load_and_a_store_writes_two_runs_at_once();
+}
+
+#[test]
+fn a_queued_commit_is_told_when_the_unit_is_let_go() {
+    write_unit::a_queued_commit_is_told_when_the_unit_is_let_go();
+}
+
+#[test]
+#[should_panic(expected = "a commit left on its queue waits on a job nobody releases")]
+fn a_commit_that_notes_before_it_loads_waits_on_a_job_nobody_releases() {
+    write_unit::calibration_a_commit_that_notes_before_it_loads_waits_on_a_job_nobody_releases();
+}
+
+#[test]
+fn one_thread_encodes_a_record() {
+    write_unit::one_thread_encodes_a_record();
+}
+
+#[test]
+#[should_panic]
+fn an_encoding_claimed_with_a_load_and_a_store_writes_one_buffer_twice() {
+    write_unit::calibration_an_encoding_claimed_with_a_load_and_a_store_writes_one_buffer_twice();
+}
+
+#[test]
+fn a_writer_parked_on_a_record_being_encoded_is_woken_when_it_is_filled() {
+    write_unit::a_writer_parked_on_a_record_being_encoded_is_woken_when_it_is_filled();
+}
+
+#[test]
+#[should_panic(expected = "a writer parked on a record being encoded was never woken")]
+fn a_fill_that_wakes_nobody_leaves_a_writer_asleep() {
+    write_unit::calibration_a_fill_that_wakes_nobody_leaves_a_writer_asleep();
+}
+
+#[test]
+fn a_call_far_from_its_turn_is_named_and_told() {
+    turn_wait::a_call_far_from_its_turn_is_named_and_told();
+}
+
+#[test]
+#[should_panic(expected = "a call far from its turn was never told")]
+fn a_pass_that_reads_the_count_first_leaves_a_sleeper_untold() {
+    turn_wait::calibration_a_pass_that_reads_the_count_first_leaves_a_sleeper_untold();
+}
+
+#[test]
+fn a_call_far_from_its_turn_is_woken_when_its_slot_lands() {
+    turn_wait::a_call_far_from_its_turn_is_woken_when_its_slot_lands();
+}
+
+#[test]
+#[should_panic(expected = "a call far from its turn slept through its landing")]
+fn a_call_that_looks_before_it_registers_sleeps_through_its_landing() {
+    turn_wait::calibration_a_call_that_looks_before_it_registers_sleeps_through_its_landing();
+}
+
+#[test]
+fn the_fast_path_racing_a_claimer_writes_only_whole_records() {
+    write_unit::the_fast_path_racing_a_claimer_writes_only_whole_records();
+}
+
+#[test]
+#[should_panic]
+fn a_fast_path_that_marks_its_record_filled_first_lets_a_claimer_read_it_half_encoded() {
+    write_unit::calibration_a_fast_path_that_marks_its_record_filled_first_lets_a_claimer_read_it_half_encoded();
+}
+
+#[test]
+fn two_writers_behind_a_holder_are_never_left_asleep() {
+    write_unit::two_writers_behind_a_holder_are_never_left_asleep();
+}
+
+#[test]
+#[should_panic(expected = "a writer behind the holder was left asleep")]
+fn a_note_trusted_off_a_load_leaves_a_writer_asleep() {
+    write_unit::calibration_a_note_trusted_off_a_load_leaves_a_writer_asleep();
+}
+
+#[test]
+#[should_panic(expected = "a writer behind the holder was left asleep")]
+fn a_holder_that_wakes_the_first_record_only_leaves_a_writer_asleep() {
+    write_unit::calibration_a_holder_that_wakes_the_first_record_only_leaves_a_writer_asleep();
 }

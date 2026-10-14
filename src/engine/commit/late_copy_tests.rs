@@ -3,8 +3,10 @@
 //! that covers it has begun.
 //!
 //! An owner stops inside its record's write, or just before it, through
-//! the pipeline's test hooks; a helper behind it writes the same record
-//! past the courtesy and a sync wants the log durable. The workload runs in
+//! the pipeline's test hooks. Alone, it takes the fast path (`write_unit.rs`,
+//! WU8): its write is a copy through the gate and it holds no claim on the
+//! write unit. A helper behind it writes the same record, in a run of its
+//! own that begins with it, and a sync wants the log durable. The workload runs in
 //! a child process, this test binary run again with the `LD_PRELOAD` shim
 //! of `tests/common/fault`, which journals every write and sync of the log
 //! in the order they reached the host. The parent reads the journal: a write
@@ -234,7 +236,7 @@ fn journal_of(scenario: Scenario) -> Journal {
 }
 
 /// A range of a log, `(log, offset, length)`, and how many writes wrote it.
-type Copies = Vec<((PathBuf, u64, u64), usize)>;
+type Copies = Vec<((PathBuf, u64), usize)>;
 
 /// What a journal shows of one log so far.
 #[derive(Default)]
@@ -266,9 +268,9 @@ fn late_writes(journal: &Journal) -> (Vec<String>, Copies) {
         match r.kind {
             OpKind::Write if r.a >= 0 => {
                 let (offset, len) = (r.a as u64, r.written());
-                *copies
-                    .entry((r.path.clone(), offset, len))
-                    .or_insert(0usize) += 1;
+                // Keyed by where a write starts: a run that begins with a
+                // record writes that record again, whatever follows it.
+                *copies.entry((r.path.clone(), offset)).or_insert(0usize) += 1;
                 if let Some(sync_seq) = log.last_sync
                     && overlaps(&log.synced, offset, len)
                 {

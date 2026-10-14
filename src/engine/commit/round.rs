@@ -38,6 +38,7 @@ use super::park::Help;
 use super::pipeline::Pipeline;
 use super::ring::{Linked, Loaded};
 use super::spare;
+use super::write_unit::Await;
 use crate::perf_context::{PerfTimer, PerfTimerField};
 use crate::statistics::{Histogram, Ticker};
 use crate::sync::internal::{Arc as RingArc, AtomicPtr, AtomicU64, Ordering};
@@ -192,7 +193,7 @@ impl RegolithEngine {
         pipe.round.replace(round, Round::new(self.me.clone()));
         // The slots this round made durable, and the ones behind them that
         // waited only for those: bounded by what was decided when it began.
-        let _ = self.publish_upto(pipe, tip.index, None);
+        let _ = self.publish_upto(pipe, tip.index, None, Await::Copy);
         true
     }
 
@@ -220,7 +221,10 @@ impl RegolithEngine {
             return true;
         }
         // The written prefix ends where the first unwritten record starts,
-        // or after the newest decided slot when every record is written.
+        // or after the newest decided slot when every record is written. The
+        // holder of the round writes what is not written, through the write
+        // unit or as a copy, and waits for no other thread
+        // (`write_unit.rs`, `Await::Copy`).
         let mut through = tip.after.next_off;
         let first = pipe.ring.published() + 1;
         for index in first..=tip.index {
@@ -236,7 +240,7 @@ impl RegolithEngine {
             if !Arc::ptr_eq(&decision.after.log, log) {
                 continue;
             }
-            self.write_slot(&desc);
+            let _ = self.bring_written(pipe, &desc, Await::Copy);
             if !desc.is(WRITTEN) {
                 through = place.offset;
                 break;

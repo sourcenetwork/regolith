@@ -82,11 +82,13 @@ impl RegolithEngine {
         );
         let index = self.enter(pipe, &desc);
         // Every slot up to this one is decided, this one included: the
-        // reservation is made then. Its record is left to whoever passes
-        // the slot next.
+        // reservation is made then. Its record is encoded here, so the
+        // next run of the write unit takes it (`write_unit.rs`), and left
+        // to be written by whoever passes the slot next.
         while let Turn::Blocked(job) = self.help_decide(pipe, index, Help::Wait, Some(&desc)) {
             self.run_or_wait(&job);
         }
+        self.fill(&desc);
         let reserved = Self::reserved(&desc);
         spare::keep_descriptor(desc);
         reserved
@@ -133,7 +135,11 @@ impl RegolithEngine {
             // The reservation was given up: nothing is taken.
             Err(job) => Some(job),
             Ok(index) => match self.help_decide(pipe, index, Help::Leave, Some(&desc)) {
-                Turn::Done => None,
+                Turn::Done => {
+                    // As a blocking reservation: encoded for the next run.
+                    self.fill(&desc);
+                    None
+                }
                 Turn::Blocked(job) => {
                     desc.mark(ABANDONED);
                     Some(job)

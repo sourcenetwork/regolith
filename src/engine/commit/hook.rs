@@ -15,11 +15,23 @@ pub(crate) enum Stage {
     Validate,
     /// Before a decided slot is applied.
     Apply,
-    /// Before a slot's record is written.
+    /// Inside the encoding of a slot's record into its descriptor, the
+    /// encoding claimed (`FILLING`) and the record not filled yet.
+    Fill,
+    /// A blocking call far from its turn found the next slot decided by
+    /// another thread and is about to park until its turn nears
+    /// (`pipeline.rs`, P6).
+    TurnWait,
+    /// Before a slot's record is written: the write unit claimed and its
+    /// run gathered, or a copy about to count in.
     Write,
     /// Inside a record's write: counted in at the log's gate, the record
     /// not written by anyone yet, its bytes not yet with the host.
     InWrite,
+    /// A blocking call found the record it needs in another thread's hands
+    /// (the write unit claimed, or the record not filled) and is about to
+    /// park on it (`write_unit.rs`).
+    WriteWait,
     /// Before a sync round is claimed.
     Sync,
     /// A sync about to wait for writes in flight below the prefix it syncs

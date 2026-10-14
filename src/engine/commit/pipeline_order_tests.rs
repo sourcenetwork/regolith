@@ -18,6 +18,7 @@ use super::pipeline_tests::{
     arm_sync_failure, durable_put, eventual_put, install, key, open_engine, put_with, seq_of,
     stopped_at,
 };
+use super::write_unit::Await;
 use super::*;
 use crate::sync::internal::Mutex;
 
@@ -216,7 +217,10 @@ fn a_record_written_ahead_of_an_unwritten_one_is_not_recovered() {
         Turn::Done
     ));
     // Only the second commit's record is written: a hole lies before it.
-    engine.write_slot(&second);
+    // Its owner fills it and the write unit writes it; the first is not
+    // filled, so no run takes it.
+    engine.fill(&second);
+    let _ = engine.bring_written(pipe, &second, Await::Copy);
     assert_eq!(engine.snapshot_seq(), base, "neither commit is published");
 
     let cut = TempDir::new().unwrap();
