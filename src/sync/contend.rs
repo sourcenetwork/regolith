@@ -802,8 +802,10 @@ mod tests {
     }
 
     /// B. The spin stops at once behind a settled queue (waiters queued and
-    /// nobody changing the queue) and behind an owed handoff: the contender
-    /// looks once and queues, and the budget is left alone.
+    /// nobody changing the queue): the contender looks once and queues, and
+    /// the budget is left alone. The owed handoff, the spin's other stop, is
+    /// pinned for every state word by
+    /// `the_spin_takes_only_what_a_fresh_caller_may`.
     #[test]
     fn a_contender_queues_at_once_behind_a_settled_queue() {
         let sem = RawSemaphore::new(1);
@@ -834,6 +836,37 @@ mod tests {
         second.cancel(&watched, 1);
         sem.release(1);
         assert!(sem.try_acquire(1), "nothing is left held or owed");
+    }
+
+    /// B, the spin's rule for every state word with up to two permits and
+    /// every combination of the queue's six bits: one round takes a permit
+    /// exactly when a fresh caller may (a permit free and no handoff owed)
+    /// and the queue is not settled (waiters queued with nobody holding the
+    /// drain role), and leaves the word as that take would; otherwise it
+    /// changes nothing. A spin that ignored an owed handoff fails here at
+    /// the word with one permit and HANDOFF up.
+    #[test]
+    fn the_spin_takes_only_what_a_fresh_caller_may() {
+        const SHIFT: u32 = super::super::queue::FIRST_BIT;
+        const DRAINING_BIT: usize = 1;
+        const QUEUED_BIT: usize = 1 << 2;
+        for permits in 0..=2usize {
+            for flags in 0..(1usize << SHIFT) {
+                let state = (permits << SHIFT) | flags;
+                let sem = RawSemaphore::new(0);
+                sem.queue().state.store(state, Ordering::Relaxed);
+                let took = spin_take(&sem, 1, state);
+                let settled = flags & (QUEUED_BIT | DRAINING_BIT) == QUEUED_BIT;
+                let may = permits >= 1 && flags & HANDOFF == 0 && !settled;
+                assert_eq!(took, may, "state {state:#x}: the spin took the wrong thing");
+                let after = sem.queue().state.load(Ordering::Relaxed);
+                let expected = if took { state - (1 << SHIFT) } else { state };
+                assert_eq!(
+                    after, expected,
+                    "state {state:#x}: the spin left the wrong word"
+                );
+            }
+        }
     }
 
     /// B. A queued waiter whose retry wins after a nudge brings a spent
