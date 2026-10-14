@@ -17,7 +17,8 @@ impl RegolithEngine {
     /// Whether putting `value` under the content-addressed `key` contradicts
     /// the value a commit made after `floor` left under it.
     ///
-    /// Runs under the pipeline mutex, so the view cannot move underneath it.
+    /// Runs while the commit's slot is decided, in ring order, so `view`
+    /// holds every commit decided before it and none after.
     /// The caller has already seen that something committed after `floor`.
     pub(super) fn content_mismatch(
         &self,

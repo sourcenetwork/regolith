@@ -20,6 +20,7 @@ use crate::engine::internal_key::{
     encode_internal_key,
 };
 use crate::engine::range_tombstone::RangeTombstoneSet;
+use crate::engine::{filter_call, merge_call};
 use crate::options::{CompactionDecision, CompactionFilter, MergeOperator};
 
 /// An internal key and its value.
@@ -115,7 +116,7 @@ impl<'a> Stripes<'a> {
         if value_type != VALUE_TYPE_VALUE {
             return;
         }
-        match filter.filter(self.level, user_key, value) {
+        match filter_call::filter_value(filter, self.level, user_key, value) {
             CompactionDecision::Keep => {}
             CompactionDecision::Change(changed) => *value = changed,
             CompactionDecision::Remove => {
@@ -154,7 +155,7 @@ fn fold(merge: &dyn MergeOperator, kept: &[Entry], operands: usize) -> Option<En
                 _ => return None,
             };
             let operands: Vec<&[u8]> = oldest_first.collect();
-            let merged = merge.full_merge(user_key, base, &operands)?;
+            let merged = merge_call::full_merge(merge, user_key, base, &operands)?;
             Some((
                 encode_internal_key(user_key, newest_seq, VALUE_TYPE_VALUE),
                 merged,
@@ -163,7 +164,7 @@ fn fold(merge: &dyn MergeOperator, kept: &[Entry], operands: usize) -> Option<En
         None if operands > 1 => {
             let oldest = oldest_first.next()?.to_vec();
             let folded = oldest_first.try_fold(oldest, |folded, next| {
-                merge.partial_merge(user_key, &folded, next)
+                merge_call::partial_merge(merge, user_key, &folded, next)
             })?;
             Some((
                 encode_internal_key(user_key, newest_seq, VALUE_TYPE_MERGE),

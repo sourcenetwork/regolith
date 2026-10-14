@@ -5,7 +5,8 @@
 //! `CacheOnly` read pushes a request there, whatever thread it runs on, and
 //! the thread that finishes a unit pushes the completion there. So does a
 //! call that leaves a job for the queue's thread (a commit's fsync, an owed
-//! step, a stall), and a thread that finished one. A push that finds the
+//! step, a stall), a thread that finished one, and the thread whose read
+//! frees an open-file slot a parked unit wanted. A push that finds the
 //! owner idle wakes it, once; a push to a busy owner wakes nobody.
 
 use std::io;
@@ -18,6 +19,7 @@ use super::atomic_waker::AtomicWaker;
 use super::job::{Delivery, Job};
 use super::stack::{IDLE, Rest, SHUT, Stack};
 use super::unit::{Unit, UnitKey};
+use crate::env::open_file_limit::slots::SlotWaiter;
 use crate::io_queue::QueueId;
 use crate::sync::internal::{AtomicUsize, Ordering};
 
@@ -45,9 +47,21 @@ pub(crate) enum Message {
     },
     /// `job` landed; one per job this queue registered on.
     JobDone(Arc<Job>),
+    /// `job`, which parked on this queue, may go on: the owner steps it
+    /// again at its next poll.
+    Ready(Arc<Job>),
     /// A completion decided on another thread, to be told on this one: a
     /// foreground job a worker ran for a caller on this queue.
     Deliver(Arc<dyn Delivery>),
+    /// An open-file slot freed that a unit this queue parked was waiting
+    /// for (D60): run the queue's parked units again.
+    SlotFreed,
+    /// A timed wait on this queue: `slot` is ready at the owner's first
+    /// poll that finds the queue's clock at `due` microseconds or later.
+    Timer { due: u64, slot: Arc<WaitSlot> },
+    /// A `CacheOnly` call read these landed blocks (sorted) and finished
+    /// without a wait: what the queue kept for it may go.
+    Finished(Box<[UnitKey]>),
 }
 
 /// What a finished unit left for the reads of one queue.
@@ -76,16 +90,29 @@ pub(crate) struct QueueShared {
     /// [`thread_token`]: I/O regolith starts on a thread goes to the queue
     /// that thread owns.
     owner: AtomicUsize,
+    /// How many completed waits the owner keeps for their calls' next runs
+    /// (`io_queue::ledger`). A call that read landed blocks tells the queue
+    /// when it finishes only while there are some, so a call with nothing
+    /// kept for it sends nothing.
+    kept: AtomicUsize,
 }
 
+#[cfg(not(loom))]
 thread_local! {
     /// One byte per thread, whose address names the thread while it lives.
     static TOKEN: u8 = const { 0 };
 }
 
+// A loom model's threads share one host thread, so the byte is loom's own
+// thread-local, boxed: its address is the model thread's while it lives.
+#[cfg(loom)]
+loom::thread_local! {
+    static TOKEN: Box<u8> = Box::new(0);
+}
+
 /// A number naming the calling thread, unique among the threads alive now.
 pub(crate) fn thread_token() -> usize {
-    TOKEN.with(|token| std::ptr::from_ref(token).addr())
+    TOKEN.with(|token| std::ptr::from_ref::<u8>(token).addr())
 }
 
 impl QueueShared {
@@ -98,6 +125,7 @@ impl QueueShared {
             bound,
             landed: OnceLock::new(),
             owner: AtomicUsize::new(0),
+            kept: AtomicUsize::new(0),
         }
     }
 
@@ -216,6 +244,17 @@ impl QueueShared {
             .insert(key, landing);
     }
 
+    /// Whether the owner keeps any completed wait for a call's next run.
+    pub(crate) fn keeps(&self) -> bool {
+        self.kept.load(Ordering::Relaxed) != 0
+    }
+
+    /// The owner keeps `kept` completed waits now. Set before the waits it
+    /// completes are told, so a call run again once told sees them.
+    pub(crate) fn set_kept(&self, kept: usize) {
+        self.kept.store(kept, Ordering::Relaxed);
+    }
+
     /// Let go of what landed for `key`.
     pub(crate) fn forget(&self, key: &UnitKey) {
         if let Some(landed) = self.landed.get() {
@@ -224,18 +263,43 @@ impl QueueShared {
     }
 }
 
+/// A queue is what a unit's reopen parks on the open-file table: a freed
+/// slot reaches the queue's owner as a message, so the owner learns of it at
+/// its next poll, or is woken for it when idle, and a busy owner never is.
+impl SlotWaiter for QueueShared {
+    fn slot_freed(&self) {
+        // A dropped queue refuses, and its drop released its parked units.
+        let _ = self.deliver(Message::SlotFreed);
+    }
+}
+
 /// One waiting read: ready once its queue's owner says so, with any number
 /// of tasks listening.
 pub(crate) struct WaitSlot {
     /// One waker per listening `IoWait`, closed with [`SHUT`] when ready.
     wakers: Stack<Arc<AtomicWaker>>,
+    /// The landed blocks the call that recorded this wait had read, sorted:
+    /// it reads them again when it is run again, so its queue keeps them
+    /// until then. Empty for any other wait.
+    holds: Box<[UnitKey]>,
 }
 
 impl WaitSlot {
     pub(crate) fn new() -> Self {
+        Self::holding(Box::default())
+    }
+
+    /// The wait of a call that read the landed blocks `holds` (sorted).
+    pub(crate) fn holding(holds: Box<[UnitKey]>) -> Self {
         Self {
             wakers: Stack::new(),
+            holds,
         }
+    }
+
+    /// The landed blocks the call that recorded this wait had read, sorted.
+    pub(crate) fn holds(&self) -> &[UnitKey] {
+        &self.holds
     }
 
     pub(crate) fn is_ready(&self) -> bool {

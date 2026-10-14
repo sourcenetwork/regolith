@@ -33,20 +33,26 @@ use crate::{DbSlice, ReadMode, Result};
 ///
 /// # Example
 ///
-/// ```no_run
+/// ```
 /// use regolith::{Db, Options};
 ///
-/// let db = Db::open("/tmp/regolith_iter", Options::default()).unwrap();
+/// let db = Db::open("fruit", Options::memory()).unwrap();
 /// db.put(b"apple", b"red").unwrap();
 /// db.put(b"banana", b"yellow").unwrap();
 /// db.put(b"cherry", b"red").unwrap();
 ///
+/// // From the first key at or after `b`, in key order.
+/// let mut seen = Vec::new();
 /// let mut it = db.iter();
 /// it.seek(b"b");
 /// while it.valid() {
-///     println!("{:?} = {:?}", it.key(), it.value());
+///     let (key, value) = (it.key().unwrap(), it.value().unwrap());
+///     seen.push(format!("{} is {}", String::from_utf8_lossy(key), String::from_utf8_lossy(value)));
 ///     it.next();
 /// }
+/// // The walk ended at the last key, not on an error.
+/// it.status().unwrap();
+/// assert_eq!(seen, ["banana is yellow", "cherry is red"]);
 /// ```
 ///
 /// # Non-blocking walks

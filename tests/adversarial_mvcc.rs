@@ -7,6 +7,7 @@
 //! `tests/concurrency.rs` probes: many concurrent writers so real
 //! groups form, snapshots held across commits, and compaction running
 //! underneath.
+#![cfg(not(target_arch = "wasm32"))]
 
 use std::collections::HashMap;
 use std::sync::Arc;

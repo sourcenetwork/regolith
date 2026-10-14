@@ -14,18 +14,22 @@
 //! - **Bloom filters** for fast negative lookups
 //! - **Level-based compaction** on background worker threads, or inline on a
 //!   target that has none
-//! - **An arena-backed skip list memtable** that readers walk without a lock
-//!   until a range delete lands in it. A block-cache hit is lock-free; a miss
-//!   inserts under its shard's lock
+//! - **Reads that take no lock**: the published view of memtables and tables
+//!   is loaded wait-free, the arena-backed skip list memtable and its range
+//!   tombstones are walked without a lock, and the CLOCK block cache admits,
+//!   evicts and serves blocks by compare-and-swap, never evicting a block a
+//!   reader holds
 //! - **Zero-copy reads** via [`DbSlice`], which borrows the bytes the
 //!   database already holds
 //!
 //! # Quick Start
 //!
-//! ```no_run
+//! ```
 //! use regolith::{Db, Options};
 //!
-//! let db = Db::open("/tmp/my_db", Options::default()).unwrap();
+//! // In memory, so the example runs anywhere. With `Options::default()`
+//! // the database lives in the directory named here.
+//! let db = Db::open("my_db", Options::memory()).unwrap();
 //!
 //! // Write
 //! db.put(b"hello", b"world").unwrap();
@@ -71,10 +75,12 @@ mod io_queue;
 mod iter;
 mod log_layout;
 mod options;
+mod per_thread;
 mod perf_context;
 mod portability;
 mod rate_limiter;
 mod slice;
+mod snapshot_wait;
 mod sst_file_writer;
 mod statistics;
 mod stream_writer;
@@ -86,7 +92,7 @@ mod transaction;
 mod ttl;
 mod txn_buffer;
 
-pub use backup::{BackupEngine, BackupId, BackupInfo};
+pub use backup::{BackupEngine, BackupId, BackupInfo, Backups, UnreadableBackup};
 pub use checkpoint::Checkpoint;
 pub use column_family::{ColumnFamilyHandle, DEFAULT_CF_NAME};
 pub use conflict::{Access, Conflict, WriteKind};
@@ -119,6 +125,7 @@ pub use options::{
 pub use perf_context::{PerfContext, PerfContextSnapshot, PerfLevel};
 pub use rate_limiter::{Priority, RateLimiter, TokenBucketRateLimiter};
 pub use slice::DbSlice;
+pub use snapshot_wait::SnapshotWait;
 pub use sst_file_writer::{IngestOptions, SstFileMeta, SstFileWriter};
 pub use statistics::{Histogram, HistogramSnapshot, Statistics, Ticker};
 pub use stream_writer::{StreamOptions, StreamingWriter};
@@ -132,13 +139,19 @@ pub use transaction::{
 
 /// The transactional API and the traits a caller implements, in one import:
 /// `use regolith::prelude::*;`.
+///
+/// Every trait a caller implements is here ([`KeyClassifier`],
+/// [`MergeOperator`], [`LogLayout`], [`TransactionHooks`], [`EventListener`],
+/// [`KeyProvider`], [`CompactionFilter`], [`Env`]), with the types its
+/// required methods name. The file traits an [`Env`] hands out stay in
+/// [`crate::env`].
 pub mod prelude {
     pub use crate::{
-        AbortReason, CommitInfo, CommitReceipt, CommitTicket, Conflict, Db, IoBudget, IoQueue,
-        IsolationLevel, JobTicket, KeyClass, KeyClassifier, KeyId, KeyMaterial, KeyProvider,
-        LockWait, LogLayout, MergeOperator, OptimisticTransactionDb, Options, QueueId, ReadMode,
-        RetryPolicy, StallWait, TransactError, Transaction, TransactionError, TransactionHooks,
-        TxResult, TxnOptions, WouldBlock,
+        AbortReason, CommitInfo, CommitReceipt, CommitTicket, CompactionDecision, CompactionFilter,
+        Conflict, Db, Env, EventListener, IoBudget, IoQueue, IsolationLevel, JobTicket, KeyClass,
+        KeyClassifier, KeyId, KeyMaterial, KeyProvider, LockWait, LogLayout, MergeOperator,
+        OptimisticTransactionDb, Options, QueueId, ReadMode, RetryPolicy, StallWait, TransactError,
+        Transaction, TransactionError, TransactionHooks, TxResult, TxnOptions, WouldBlock,
     };
 }
 pub use ttl::{DbWithTtl, TtlCompactionFilter, strip_timestamp};
@@ -156,7 +169,14 @@ pub mod loom_exports {
     //! check, and this module is the seam that lets the test target call
     //! them. It does not exist in an ordinary build.
 
-    pub use crate::engine::loom_model::{arena, handoff, io_queue, jobs, skiplist, slice, version};
+    pub use crate::engine::commit::loom_model as pipeline;
+    pub use crate::engine::commit::loom_turn_wait as turn_wait;
+    pub use crate::engine::commit::loom_write_unit as write_unit;
+    pub use crate::engine::loom_model::{
+        arena, families, gate, handoff, io_queue, jobs, park, skiplist, slice, snapshots, step,
+        tombstones, version,
+    };
+    pub use crate::env::open_file_limit::loom_model as open_files;
     pub use crate::sync::loom_model as sync;
     pub use crate::transaction::lock_loom as locks;
 }
@@ -260,11 +280,7 @@ use std::sync::Arc;
 use engine::RegolithEngine;
 
 fn invalid_cf_handle_error(cf: &ColumnFamilyHandle) -> Error {
-    Error::invalid_column_family(format!(
-        "column family handle '{}' with id {} is not live",
-        cf.name(),
-        cf.id()
-    ))
+    column_family::invalid_handle_error(cf)
 }
 
 fn invalid_input_error(message: impl Into<String>) -> Error {
@@ -272,7 +288,7 @@ fn invalid_input_error(message: impl Into<String>) -> Error {
 }
 
 fn invalid_cf_id_error(cf_id: u32) -> Error {
-    Error::invalid_column_family(format!("column family id {cf_id} is not live"))
+    column_family::dropped_family_error(cf_id)
 }
 
 fn invalid_cf_id_io_error(cf_id: u32) -> std::io::Error {
@@ -427,7 +443,9 @@ pub type Result<T> = std::result::Result<T, Error>;
 /// [`Error::WouldBlock`] with a [`WouldBlock::Stall`] wait, completed on the
 /// writer's own [`IoQueue`] once background work clears the stall; run the
 /// write again then, or wrap it in [`through_stalls`] to wait on this
-/// thread. A slowdown threshold delays nothing.
+/// thread. A slowdown threshold delays nothing. A transaction's commit is
+/// the exception, since it cannot be run again: it waits the stall out
+/// ([`Transaction::commit`], [`Transaction::commit_nowait`]).
 pub struct Db {
     engine: Arc<RegolithEngine>,
     durability: engine::DurabilityMode,
@@ -460,6 +478,47 @@ impl Db {
     /// Returns [`Error::Io`] with [`std::io::ErrorKind::Unsupported`]
     /// when the platform cannot start the background compaction
     /// thread, as a single-threaded target does.
+    ///
+    /// # Databases written by 0.1.x
+    ///
+    /// A database written by a 0.1.x release can hold a level below level 0
+    /// whose tables overlap in key range: that release placed an ingested
+    /// table carrying a range tombstone by the range of its keys and
+    /// recorded it with the wider range of the tombstone. Such a database
+    /// is valid and opens. The first open moves the tables of that level,
+    /// and of every level above it down to level 1, into level 0, oldest
+    /// level first, where tables may overlap. No table is rewritten and
+    /// nothing is lost: every read returns the newest version, and a key
+    /// that a range tombstone of a moved table covers and that is older
+    /// than it reads as deleted, as that tombstone says (0.1.x could still
+    /// return it from a level it read first). The open logs one warning,
+    /// counts the moved tables in [`Ticker::ManifestTablesDemoted`] and in
+    /// the `regolith.manifest.tables_demoted` property, and records the move
+    /// before it returns, so the next open has nothing to move. Compaction
+    /// then brings the tables back down as it does any level 0 table; until
+    /// it has, they count toward the level 0 write thresholds. A read-only
+    /// open makes the same move in its own view, every time, and writes
+    /// nothing.
+    ///
+    /// The same releases could leave an ingested table's range delete in the
+    /// bottom level below older keys it deletes, with no level overlapping. A
+    /// point read then found such a key before the range delete and returned
+    /// it, while a scan did not; a compaction of the bottom level would drop
+    /// the range delete and bring the key back for good. The first open of a
+    /// database that does not record this check copies every range delete
+    /// that has a newer level, a level 0 table read before it or the
+    /// recovered log holding keys in its range in front of every key, so the
+    /// key reads as deleted everywhere. A copy deletes only what its range
+    /// delete deletes, so the copies of range deletes that were in front
+    /// already change no read. The open logs one warning, counts the copies
+    /// in [`Ticker::ManifestRangeDeletesCopied`] and in the
+    /// `regolith.manifest.range_deletes_copied` property, and records the
+    /// check before it returns; a database this release creates records it
+    /// from the start and is never checked. The copies are one level 0
+    /// table after the first flush, which compaction carries down; where the
+    /// copied ranges are wide, that is a one-time rewrite of the data inside
+    /// them. A read-only open copies in its own view, every time, and writes
+    /// nothing.
     pub fn open<P: AsRef<Path>>(path: P, opts: Options) -> Result<Self> {
         opts.validate()?;
         let read_only = opts.read_only;
@@ -477,6 +536,9 @@ impl Db {
             RegolithEngine::open(path.as_ref(), engine_opts)?
         };
         let cfs = Arc::new(CfRegistry::new());
+        // Attached before the first write, so every write is fenced against
+        // the registry when it is decided, from the start.
+        engine.attach_families(Arc::clone(&cfs));
         let db = Self {
             engine,
             durability,
@@ -495,7 +557,9 @@ impl Db {
     /// The handle replays any existing WAL files into memory so reads
     /// see committed-but-unflushed writes, but it does not create,
     /// rewrite, compact, or delete files. Mutating APIs return
-    /// [`Error::ReadOnly`].
+    /// [`Error::ReadOnly`]. A database a 0.1.x release left with an
+    /// overlapping level, or with a range delete below older keys it
+    /// deletes, reads correctly here too, see [`Db::open`].
     pub fn open_read_only<P: AsRef<Path>>(path: P, mut opts: Options) -> Result<Self> {
         opts.read_only = true;
         Self::open(path, opts)
@@ -719,14 +783,7 @@ impl Db {
         self.ensure_writable()?;
         self.validate_write_kv_sizes(key, value)?;
         self.admit_write(opts)?;
-        let stats = self.stats();
-        let _scope = statistics::TimeScope::new(stats, Histogram::DbWrite);
-        let bytes = (key.len() + value.len()) as u64;
-        if let Some(s) = stats {
-            s.add(Ticker::KeysWritten, 1);
-            s.add(Ticker::BytesWritten, bytes);
-            s.record(Histogram::BytesPerWrite, bytes);
-        }
+        let _scope = statistics::TimeScope::new(self.stats(), Histogram::DbWrite);
         perf_context::record_write_call();
         let (dm, disable_wal) = self.resolve_write_opts(opts);
         self.engine
@@ -752,9 +809,6 @@ impl Db {
         self.ensure_writable()?;
         self.validate_key_size(key)?;
         self.admit_write(opts)?;
-        if let Some(s) = self.stats() {
-            s.add(Ticker::KeysDeleted, 1);
-        }
         let mut batch = BTreeMap::new();
         batch.insert(prefix_key(DEFAULT_CF_ID, key), None);
         let (dm, disable_wal) = self.resolve_write_opts(opts);
@@ -782,9 +836,6 @@ impl Db {
         self.engine.require_merge_operator()?;
         self.validate_write_kv_sizes(key, operand)?;
         self.admit_write(opts)?;
-        if let Some(s) = self.stats() {
-            s.add(Ticker::MergesWritten, 1);
-        }
         let (dm, disable_wal) = self.resolve_write_opts(opts);
         self.engine
             .apply_grouped_batch(
@@ -826,9 +877,6 @@ impl Db {
         self.validate_key_size(start)?;
         self.validate_key_size(end)?;
         self.admit_write(opts)?;
-        if let Some(s) = self.stats() {
-            s.add(Ticker::RangeDeletesWritten, 1);
-        }
         let (dm, disable_wal) = self.resolve_write_opts(opts);
         self.engine
             .apply_grouped_batch(
@@ -925,39 +973,7 @@ impl Db {
         self.validate_batch_sizes(&batch, disable_wal)?;
         self.admit_write(opts)?;
         perf_context::record_write_call();
-        let stats = self.stats();
-        let _scope = statistics::TimeScope::new(stats, Histogram::DbWrite);
-        if let Some(s) = stats {
-            let mut bytes: u64 = 0;
-            let mut puts: u64 = 0;
-            let mut deletes: u64 = 0;
-            let mut range_deletes: u64 = 0;
-            let mut merges: u64 = 0;
-            for op in &batch.ops {
-                match op {
-                    WriteBatchOp::Put { key, value } => {
-                        puts += 1;
-                        bytes += (key.len() + value.len()) as u64;
-                    }
-                    WriteBatchOp::Delete { key } => {
-                        deletes += 1;
-                        bytes += key.len() as u64;
-                    }
-                    WriteBatchOp::DeleteRange { .. } => {
-                        range_deletes += 1;
-                    }
-                    WriteBatchOp::Merge { .. } => {
-                        merges += 1;
-                    }
-                }
-            }
-            s.add(Ticker::KeysWritten, puts);
-            s.add(Ticker::KeysDeleted, deletes);
-            s.add(Ticker::BytesWritten, bytes);
-            s.add(Ticker::RangeDeletesWritten, range_deletes);
-            s.add(Ticker::MergesWritten, merges);
-            s.record(Histogram::BytesPerWrite, bytes);
-        }
+        let _scope = statistics::TimeScope::new(self.stats(), Histogram::DbWrite);
         self.engine
             .submit_batch(batch.ops, dm, disable_wal)
             .map_err(Error::from)
@@ -1107,8 +1123,8 @@ impl Db {
     }
 
     /// Check one prefixed key's column family, remembering the last id
-    /// found live so a run of ops in one column family takes the
-    /// registry lock once.
+    /// found live so a run of ops in one column family costs one registry
+    /// lookup.
     fn validate_prefixed_cf(&self, live: &mut Option<u32>, prefixed_key: &[u8]) -> Result<()> {
         let cf_id = prefixed_cf_id(prefixed_key).map_err(Error::from)?;
         if *live == Some(cf_id) {
@@ -1122,12 +1138,14 @@ impl Db {
     }
 
     fn validate_batch_cf_liveness(&self, batch: &WriteBatch) -> Result<()> {
-        // A batch is usually one column family, or a few long runs of one,
-        // and every distinct run still reaches the registry once. A drop
-        // that lands between two runs of the same id in one call is the
-        // same race the per-op form had: the lock was never held across the
-        // batch, so neither form promises more than "rejected or applied
-        // as a whole" for a drop that overlaps the write.
+        // The early check, at the API boundary: a batch naming a family
+        // already gone is refused before any work. A batch is usually one
+        // column family, or a few long runs of one, and every distinct run
+        // reaches the registry once. A drop that lands after this check is
+        // caught by the fence made when the batch's slot is decided
+        // (`engine::commit::families`), which refuses the batch whole, so a
+        // batch racing a drop is applied whole before the tombstone or
+        // refused whole, never split across it.
         let mut live = None;
         for op in &batch.ops {
             match op {
@@ -1152,17 +1170,24 @@ impl Db {
     /// [`CompactionFilter`] (see its note on snapshots). Dropping the
     /// returned `Snapshot` releases the pin and may allow subsequent
     /// compactions to reclaim more space.
+    ///
+    /// A snapshot held for long also defers the compaction of deleted
+    /// ranges: a table holding a deletion newer than the oldest live
+    /// snapshot is not compacted for its deletions until that snapshot is
+    /// dropped (see [`CompactionStyle`]), so scans over a range deleted
+    /// since then keep walking its deletions meanwhile.
     pub fn snapshot(&self) -> Snapshot {
-        let seq = self.engine.register_snapshot_at_horizon();
+        let (seq, pin) = self.engine.register_snapshot_at_horizon();
         Snapshot {
             engine: Arc::clone(&self.engine),
             cfs: Arc::clone(&self.cfs),
             seq,
             mode: ReadMode::Blocking,
+            pin,
         }
     }
 
-    /// A new I/O queue for the calling thread (plan 4.10, D53).
+    /// A new I/O queue for the calling thread.
     ///
     /// Hand its [`IoQueue::id`] to the read handles this thread uses, in
     /// [`ReadMode::CacheOnly`] through [`Snapshot::with_read_mode`] or
@@ -1194,13 +1219,20 @@ impl Db {
     /// `Err`, then `None`, so a failure is never read as the end of the
     /// range.
     ///
-    /// ```no_run
+    /// ```
     /// # use regolith::{Db, Options};
-    /// # let db = Db::open("/tmp/scan_stream_doc", Options::default()).unwrap();
+    /// # let db = Db::open("users", Options::memory())?;
+    /// db.put(b"user:ada", b"1815")?;
+    /// db.put(b"user:bob", b"1970")?;
+    /// db.put(b"visit:1", b"ada")?;
+    ///
+    /// // `;` is the byte after `:`, so this is every key under `user:`.
+    /// let mut users = Vec::new();
     /// for entry in db.scan_stream(Some(b"user:"), Some(b"user;"))? {
     ///     let (key, value) = entry?;
-    ///     println!("{} is {} bytes", String::from_utf8_lossy(&key), value.len());
+    ///     users.push((key, value.len()));
     /// }
+    /// assert_eq!(users, [(b"user:ada".to_vec(), 4), (b"user:bob".to_vec(), 4)]);
     /// # Ok::<(), regolith::Error>(())
     /// ```
     pub fn scan_stream(&self, start: Option<&[u8]>, end: Option<&[u8]>) -> Result<ScanStream> {
@@ -1286,6 +1318,14 @@ impl Db {
     }
 
     /// Delete all data in the database.
+    ///
+    /// A call that does its own I/O and waits on this thread: for the
+    /// compaction pass or job in flight, and for the commits in
+    /// flight, to end. Call it off a thread that must not block. On
+    /// `wasm32`, whose one thread cannot wait for itself, a call made from
+    /// inside a compaction or a checkpoint (a listener, a compaction filter)
+    /// fails with an I/O error of kind
+    /// [`WouldBlock`](std::io::ErrorKind::WouldBlock) instead.
     pub fn drop_all(&self) -> Result<()> {
         self.ensure_writable()?;
         self.engine.drop_all().map_err(Error::from)
@@ -1304,7 +1344,12 @@ impl Db {
     /// thread's [`IoQueue`] when it polls; a thread with neither runs it
     /// before this returns. It flushes the active memtable contents that
     /// fall in the range to L0 first, and is serialized with the background
-    /// compaction so the two can't fight over the same inputs. The ticket
+    /// compaction so the two can't fight over the same inputs. Neither
+    /// starves the other: a compaction pass waits out a bounded number of
+    /// jobs like this one, and a job a bounded number of passes
+    /// ([`sync::MAX_BYPASS`]). A poll never waits for a pass in flight
+    /// either: until the job may go on it stays pending on the queue, whose
+    /// owner is woken when it may. The ticket
     /// completes on this thread's queue (or, with none, when the job
     /// finished): await it, poll the queue, or [`JobTicket::wait`] for it
     /// from a thread with no queue. An invalid bound fails the ticket at
@@ -1344,15 +1389,17 @@ impl Db {
         }
     }
 
-    /// Rotate the active memtable and write it to a level-0 SSTable,
-    /// on this thread, before returning.
+    /// Rotate the active memtable and see it written to a level-0
+    /// SSTable before returning.
     ///
     /// A no-op when the active memtable holds no entries and no range
     /// tombstones. This is the same flush a full memtable triggers on
     /// the write path, made explicit so a caller can decide when to
-    /// pay for it. Memtable flushes are written by the calling thread
-    /// in every mode, so this behaves identically with and without
-    /// background compaction workers.
+    /// pay for it. This thread writes the table, unless a compaction
+    /// worker gets to the sealed memtable first: the worker then writes
+    /// it, paced by [`Options::rate_limiter`] like the rest of its work,
+    /// and this call returns once the table is in level 0. With no
+    /// worker it is always this thread.
     ///
     /// Flushing does not compact: the new file lands in L0 and stays
     /// there until a compaction job merges it. See [`Db::compact_step`]
@@ -1375,17 +1422,25 @@ impl Db {
     /// The returned [`CompactionOutcome`] separates the two reasons a
     /// pass can do nothing, because a caller has to act on them
     /// differently. [`CompactionOutcome::Idle`] means nothing was over
-    /// its compaction trigger and the tree is settled.
-    /// [`CompactionOutcome::Contended`] means work is pending but
-    /// another thread holds the input files, so the right response is to
-    /// wait for that thread rather than conclude the engine is done.
+    /// its compaction trigger, no deleted range was worth a pass (see
+    /// [`CompactionStyle`]), and the tree is settled.
+    /// [`CompactionOutcome::Contended`] means work may be pending but
+    /// another thread is in the way, so the right response is to try again
+    /// later rather than conclude the engine is done: another pass holds the
+    /// input files, or a [`Db::compact_range`], an ingest, a checkpoint, a
+    /// backup or a [`Db::drop_all`] holds the compaction gate alone or is
+    /// owed it. This call never waits for that thread.
     ///
     /// A drain therefore looks like this, and stops only on `Idle`:
     ///
-    /// ```no_run
+    /// ```
     /// # use regolith::{CompactionOutcome, Db, Options};
     /// # fn main() -> regolith::Result<()> {
-    /// # let db = Db::open("/tmp/db", Options::default())?;
+    /// # let db = Db::open("rows", Options::memory())?;
+    /// # for round in 0..8u8 {
+    /// #     db.put(b"row", &[round])?;
+    /// #     db.flush()?;
+    /// # }
     /// loop {
     ///     match db.compact_step()? {
     ///         CompactionOutcome::DidWork => continue,
@@ -1393,18 +1448,21 @@ impl Db {
     ///         CompactionOutcome::Idle => break,
     ///     }
     /// }
+    /// # assert_eq!(db.compact_step()?, CompactionOutcome::Idle);
+    /// # assert_eq!(db.get(b"row")?, Some(vec![7]));
     /// # Ok(())
     /// # }
     /// ```
     ///
-    /// Every compaction style regolith offers reduces the file count it
-    /// merges, so a loop driven by `DidWork` cannot be fed forever by
-    /// its own output.
+    /// A size-triggered compaction reduces the file count it merges, and
+    /// a compaction picked for its deletions moves them one level down or
+    /// discards them, so a loop driven by `DidWork` cannot be fed forever
+    /// by its own output.
     ///
     /// Safe to call with background workers running: the job is picked
-    /// under the same engine-wide compaction lock and the same
-    /// in-progress file set the workers use, so the two can never pick
-    /// overlapping inputs.
+    /// under the same engine-wide compaction gate and the same claims on
+    /// tables the workers use, so the two can never pick overlapping
+    /// inputs.
     pub fn compact_step(&self) -> Result<CompactionOutcome> {
         self.ensure_writable()?;
         self.engine.run_one_compaction_pass().map_err(Error::from)
@@ -1430,6 +1488,31 @@ impl Db {
         }
     }
 
+    /// The statistics this database was opened with
+    /// ([`Options::statistics`]), or `None` when it was opened with none.
+    ///
+    /// It is the object the caller configured, not a copy: every handle on
+    /// this database adds to it, a ticker read through it is the total they
+    /// all added, and [`Statistics::reset`] through it zeroes it for all of
+    /// them. Clone the `Arc` to keep it past the database handle. A database
+    /// opened without statistics never makes one, so this stays `None` for
+    /// its whole life. What a read sees while updates run is stated on
+    /// [`Statistics`].
+    ///
+    /// ```
+    /// # use std::sync::Arc;
+    /// # use regolith::{Db, Options, Statistics, Ticker};
+    /// let options = Options::memory().statistics(Some(Arc::new(Statistics::new())));
+    /// let db = Db::open("statistics-doc", options)?;
+    /// db.put(b"k", b"v")?;
+    /// let stats = db.statistics().expect("opened with statistics");
+    /// assert_eq!(stats.get_ticker(Ticker::KeysWritten), 1);
+    /// # Ok::<(), regolith::Error>(())
+    /// ```
+    pub fn statistics(&self) -> Option<&Arc<Statistics>> {
+        self.engine.statistics_shared()
+    }
+
     /// What the environment this database was opened on can
     /// actually do.
     ///
@@ -1446,12 +1529,34 @@ impl Db {
 
     /// Return the integer value of a named property, or `None` if
     /// `name` isn't recognized or doesn't have an integer form.
+    ///
+    /// `regolith.manifest.tables_demoted` is the number of tables this open
+    /// moved to level 0 out of levels a 0.1.x release left overlapping (see
+    /// [`Db::open`]): zero once a read-write open has recorded the move, and
+    /// the same count at every read-only open until then.
+    /// `regolith.manifest.range_deletes_copied` is the number of range
+    /// deletes this open copied in front of keys an earlier release may have
+    /// left them behind (see [`Db::open`]): zero once a read-write open has
+    /// recorded the check, and the same count at every read-only open until
+    /// then.
+    ///
+    /// `regolith.disk-available-bytes` and `regolith.disk-available-inodes`
+    /// are what the environment's [`env::Env::disk_space`] reports, and
+    /// `None` where it reports nothing: the default [`env::StdEnv`] reports
+    /// them on Unix, and not on Windows or WASI.
+    ///
+    /// `regolith.num-uncounted-tables` is the number of tables whose
+    /// deletions have not been counted yet (see [`CompactionStyle`]).
     pub fn get_int_property(&self, name: &str) -> Option<u64> {
         if let Some(level_str) = name.strip_prefix("regolith.num-files-at-level") {
             let level: usize = level_str.parse().ok()?;
             return Some(self.engine.num_files_at_level(level));
         }
         match name {
+            "regolith.manifest.tables_demoted" => Some(self.engine.tables_demoted_at_open()),
+            "regolith.manifest.range_deletes_copied" => {
+                Some(self.engine.range_deletes_copied_at_open())
+            }
             "regolith.total-sst-files-size" => Some(self.engine.total_sst_size()),
             "regolith.cur-size-active-mem-table" => Some(self.engine.active_memtable_size()),
             "regolith.memtable-reserved-bytes" => Some(self.engine.memtables_reserved_size()),
@@ -1491,6 +1596,11 @@ impl Db {
                 self.engine.disk_space().map(|d| d.available_inodes)
             }
             "regolith.background-errors" => Some(self.engine.background_error_count()),
+            // Tables whose deletions have not been counted yet: tables an
+            // earlier version or a restored backup left, which are counted
+            // in the background. A table that cannot be read stays counted
+            // here.
+            "regolith.num-uncounted-tables" => Some(self.engine.current_version().uncounted as u64),
             _ => None,
         }
     }
@@ -1683,6 +1793,10 @@ impl Db {
     /// handle fail with [`Error::Closed`]. Calling `close` more than
     /// once is allowed.
     ///
+    /// Close does not give the directory back: it stays locked, and opening
+    /// it again fails, until this handle and every snapshot, iterator and
+    /// transaction made from it have been dropped.
+    ///
     /// Close syncs the write-ahead log and ends it with a record saying it
     /// is complete, so every write survives a power cut after `close`
     /// returns, under either durability mode. A close whose sync fails
@@ -1702,35 +1816,32 @@ impl Db {
         self.engine.close().map_err(Error::from)
     }
 
-    /// Block until no [`Snapshot`] and no snapshot-backed iterator is
-    /// live, returning how many pins were still outstanding when
-    /// `timeout` elapsed. `0` means the wait succeeded.
+    /// How many [`Snapshot`]s and snapshot-backed iterators are live, and a
+    /// wait for the last of them to be released. The call itself never
+    /// waits: it returns a [`SnapshotWait`] at once.
     ///
     /// A snapshot pins the SSTables it can see, so closing a database
     /// while one is outstanding leaves those files on disk and their
     /// readers open. An embedder that wants a clean shutdown has to wait
-    /// for its readers to finish, and this is that wait: it blocks on
-    /// the release itself rather than polling a counter, so it costs
-    /// nothing while it waits and adds no latency once the last reader
-    /// is done.
+    /// for its readers to finish, and the handle is that wait: ask it
+    /// ([`SnapshotWait::pinned`]), await it from a task, or block on it by
+    /// name ([`SnapshotWait::wait`]). Either wait is for the release
+    /// itself rather than a polled counter, so it costs nothing while it
+    /// waits and adds no latency once the last reader is done.
     ///
     /// Counts pins, not handles. An iterator taken from a snapshot pins
     /// it again for as long as the iterator lives, so a `Snapshot` that
     /// has already been dropped can still be counted here, which is
     /// exactly the case an embedder tracking its own transaction objects
-    /// would miss.
+    /// would miss. An open transaction pins its snapshot too, until its
+    /// commit is decided or it is rolled back; a
+    /// [`Transaction::commit_nowait`](crate::Transaction::commit_nowait)
+    /// commit holds it until the commit lands.
     ///
-    /// Returns a count rather than an error because whether outstanding
-    /// readers are a failure is the caller's decision: [`Db::close`]
-    /// does not require this wait, and a database closed with snapshots
-    /// live is consistent, just not tidy.
-    ///
-    /// The timeout is measured on the clock of [`Options::env`]. Where the
-    /// env has no clock the wait is one wait of `timeout`, ended early by
-    /// the last release. On a target with a single thread (wasm without
-    /// the `atomics` feature) nothing can release a pin while this call
-    /// waits, so it returns the count at once without waiting: release the
-    /// snapshots first, then call it.
+    /// The handle reports a count rather than an error because whether
+    /// outstanding readers are a failure is the caller's decision:
+    /// [`Db::close`] does not require this wait, and a database closed with
+    /// snapshots live is consistent, just not tidy.
     ///
     /// ```
     /// # use std::time::Duration;
@@ -1741,16 +1852,19 @@ impl Db {
     /// db.put(b"k", b"v")?;
     ///
     /// let snapshot = db.snapshot();
-    /// assert_eq!(db.wait_for_snapshots(Duration::from_millis(50)), 1);
+    /// let readers = db.wait_for_snapshots();
+    /// assert_eq!(readers.pinned(), 1);
+    /// assert_eq!(readers.wait(Duration::from_millis(50)), 1);
     ///
     /// drop(snapshot);
-    /// assert_eq!(db.wait_for_snapshots(Duration::from_secs(5)), 0);
+    /// assert!(readers.is_ready());
+    /// assert_eq!(readers.wait(Duration::from_secs(5)), 0);
     /// db.close()?;
     /// # Ok(())
     /// # }
     /// ```
-    pub fn wait_for_snapshots(&self, timeout: std::time::Duration) -> u64 {
-        self.engine.wait_for_snapshots(timeout)
+    pub fn wait_for_snapshots(&self) -> SnapshotWait {
+        SnapshotWait::new(Arc::clone(&self.engine))
     }
 
     /// Test-only: number of SSTable files at `level`.
@@ -1807,7 +1921,11 @@ impl Db {
     /// returns the existing handle (idempotent).
     ///
     /// The new CF is persisted to the on-disk metadata before this
-    /// call returns, so it survives a crash and a reopen.
+    /// call returns, so it survives a crash and a reopen. It becomes
+    /// visible only once that write is committed, and concurrent creates
+    /// of one name return the same handle. Ids are never reused: a name
+    /// created again after a drop is a new family, and a handle to the
+    /// old one stays refused.
     pub fn create_column_family(&self, name: &str) -> Result<ColumnFamilyHandle> {
         self.ensure_writable()?;
         if name.is_empty() {
@@ -1819,25 +1937,14 @@ impl Db {
             return Ok(existing);
         }
         self.validate_prefixed_key_size(&meta::name_key(name))?;
-        // Before the allocation, so a write that cannot be admitted leaves
+        // Before the ordered step, so a write that cannot be admitted leaves
         // no name registered.
         self.admit_write(&WriteOptions::default())?;
-        let Some((handle, next_id)) = self.cfs.allocate(name) else {
-            return Err(Error::invalid_argument(
-                "the column-family id space is exhausted",
-            ));
-        };
-        let mut batch = BTreeMap::new();
-        batch.insert(
-            meta::name_key(name),
-            Some(handle.id().to_be_bytes().to_vec()),
-        );
-        batch.insert(meta::next_id_key(), Some(next_id.to_be_bytes().to_vec()));
+        // The id is drawn, persisted and published in one ordered step, so a
+        // racing create of the same name returns this family.
         self.engine
-            .apply_grouped_batch(batch, Vec::new(), Vec::new(), self.durability, false)
-            .map(|_| ())
-            .map_err(Error::from)?;
-        Ok(handle)
+            .create_family(name, self.durability)
+            .map_err(Error::from)
     }
 
     /// Drop a column family. Every key stored in the CF is removed
@@ -1848,6 +1955,13 @@ impl Db {
     ///
     /// Dropping the default column family is not allowed and
     /// returns an error.
+    ///
+    /// A write to the family that races the drop either commits before
+    /// it, and the range tombstone deletes it, or is refused with
+    /// [`Error::InvalidColumnFamily`]; it never lands after the
+    /// tombstone. Every later write, read or drop through a handle to the
+    /// family is refused the same way. Two drops of one family race to
+    /// one success.
     pub fn drop_column_family(&self, cf: ColumnFamilyHandle) -> Result<()> {
         self.ensure_writable()?;
         if cf.id() == DEFAULT_CF_ID {
@@ -1862,20 +1976,14 @@ impl Db {
         }
         self.validate_cf_handle(&cf)?;
         self.admit_write(&WriteOptions::default())?;
-        let lo = cf_lower_bound(cf.id());
-        let hi = cf_upper_bound(cf.id());
-        // Apply the data range-delete and the metadata entry
-        // removal in a single atomic batch so a crash mid-drop
-        // either leaves the CF fully present or fully removed.
-        let mut point_ops = BTreeMap::new();
-        point_ops.insert(meta::name_key(cf.name()), None);
-        let range_deletes = vec![(lo, hi)];
+        // The range tombstone and the meta delete commit as one group, so a
+        // crash mid-drop leaves the CF fully present or fully removed, and
+        // the family is retired in the same ordered step: a write racing the
+        // drop is either deleted by the tombstone or refused, never committed
+        // after it.
         self.engine
-            .apply_grouped_batch(point_ops, range_deletes, Vec::new(), self.durability, false)
-            .map(|_| ())
-            .map_err(Error::from)?;
-        self.cfs.remove(cf.name());
-        Ok(())
+            .drop_family(&cf, self.durability)
+            .map_err(Error::from)
     }
 
     /// Read `key` from column family `cf`. Same semantics as
@@ -2628,6 +2736,9 @@ pub struct Snapshot {
     seq: u64,
     /// Where this snapshot's block-cache misses go.
     mode: ReadMode,
+    /// Where `seq` is pinned in the engine's snapshot registry. The drop
+    /// releases exactly there, whichever thread it runs on.
+    pin: engine::SnapshotPin,
 }
 
 impl Drop for Snapshot {
@@ -2637,7 +2748,7 @@ impl Drop for Snapshot {
         // version it was keeping alive for this snapshot's sake,
         // subject to other live snapshots that may still pin older
         // seqs.
-        self.engine.release_snapshot(self.seq);
+        self.engine.release_snapshot(self.pin.take());
     }
 }
 
@@ -2651,12 +2762,12 @@ impl std::fmt::Debug for Snapshot {
 
 impl Snapshot {
     fn clone_pin(&self) -> Self {
-        self.engine.register_snapshot(self.seq);
         Self {
             engine: Arc::clone(&self.engine),
             cfs: Arc::clone(&self.cfs),
             seq: self.seq,
             mode: self.mode,
+            pin: self.engine.clone_snapshot_pin(&self.pin),
         }
     }
 
@@ -3279,6 +3390,12 @@ impl WriteBatch {
 #[cfg(test)]
 mod write_limit_tests;
 
+#[cfg(all(test, not(target_family = "wasm")))]
+mod cf_race_tests;
+
+#[cfg(all(test, not(target_family = "wasm")))]
+mod prefix_form_tests;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3440,7 +3557,9 @@ mod tests {
         let db = Db::open(dir.path(), Options::default()).unwrap();
         db.put(b"k", b"v").unwrap();
 
-        let blocked_wal_path = dir.path().join("wal").join("wal_000002.log");
+        // The log close creates after its flush: the open's log is 1 and the
+        // flush's table 2.
+        let blocked_wal_path = dir.path().join("wal").join("wal_000003.log");
         std::fs::create_dir(&blocked_wal_path).unwrap();
 
         match db.close().unwrap_err() {
@@ -3449,6 +3568,8 @@ mod tests {
         }
 
         assert_eq!(db.get(b"k").unwrap(), Some(b"v".to_vec()));
+        // The failed close left the database taking writes again.
+        db.put(b"after", b"close").unwrap();
 
         std::fs::remove_dir(&blocked_wal_path).unwrap();
         db.close().unwrap();
@@ -3464,6 +3585,7 @@ mod tests {
         drop(db);
         let reopened = Db::open(dir.path(), Options::default()).unwrap();
         assert_eq!(reopened.get(b"k").unwrap(), Some(b"v".to_vec()));
+        assert_eq!(reopened.get(b"after").unwrap(), Some(b"close".to_vec()));
     }
 
     #[test]
@@ -8356,7 +8478,7 @@ mod tests {
 
         // Force any remaining flushes through and run one more
         // FIFO pass via compact_range (which acquires the
-        // compaction lock and drains pending work).
+        // compaction gate and drains pending work).
         db.compact_range(None, None).wait().unwrap();
         std::thread::sleep(std::time::Duration::from_millis(100));
 

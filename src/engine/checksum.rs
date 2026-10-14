@@ -27,8 +27,8 @@ const WAL_STAMP_V2_DOMAIN: &[u8] = b"regolith/wal-stamp/v2";
 
 // Seeds for the one-shot checks of a format 2 write-ahead log record, the
 // same role the domains above play. One-shot rather than a domain-prefixed
-// streaming hasher because they run once per commit group, where a
-// hasher's setup would cost more than hashing a small group does. Frozen
+// streaming hasher because they run once per commit, where a hasher's
+// setup would cost more than hashing a small record does. Frozen
 // like the domains: they are part of the on-disk format.
 // "regowal2" and "rego-hdr" in ASCII.
 const WAL_GROUP_PAYLOAD_SEED: u64 = 0x7265_676F_7761_6C32;

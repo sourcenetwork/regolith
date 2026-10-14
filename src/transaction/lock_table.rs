@@ -60,6 +60,11 @@ const KEY_BUCKETS: usize = 64;
 /// The use count of an entry taken out of the table.
 const RETIRED: usize = usize::MAX;
 
+/// One transaction's waits, one per key: a wait is published by one
+/// linearizable insert, or by replacing a wait that is over
+/// (`Transaction::publish_wait`), and stays until the transaction ends.
+pub(super) type LockWaits = HashMap<Vec<u8>, Arc<PendingLock>>;
+
 /// The table of key locks one [`TransactionDb`](super::TransactionDb) keeps.
 pub(crate) struct LockTable {
     keys: HashMap<Vec<u8>, Arc<KeyLock>>,
@@ -209,18 +214,70 @@ impl LockTable {
 /// A pessimistic transaction's name in the key locks it holds or waits for.
 ///
 /// Its address is the name, so it is aligned past the lock's queue bits and
-/// has a size of its own. Held through an `Arc` by the transaction, by the
-/// commit whose locks wait for their group to land, and by the transaction's
-/// close claim, so the name stays unique while any lock can carry it.
-#[repr(align(64))]
+/// its handoff mark ([`OwnerId::ALIGN`]) and has a size of its own. Held
+/// through an `Arc` by the transaction, by the commit whose locks wait for it
+/// to land, and by the transaction's close claim, so the name stays unique
+/// while any lock can carry it.
+#[repr(align(128))]
 pub(crate) struct LockOwner {
     /// Gives the owner a size, so no two owners share an address.
     _place: u8,
 }
 
+/// Owners a thread keeps for its next pessimistic transactions. A thread
+/// runs one transaction at a time as a rule; the few beyond that cover
+/// transactions it holds open side by side.
+const OWNER_POOL: usize = 4;
+
+std::thread_local! {
+    /// The owners this thread's ended transactions gave back
+    /// ([`LockOwner::give_back`]), each held by nothing else.
+    static OWNERS: std::cell::RefCell<Vec<Arc<LockOwner>>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
 impl LockOwner {
     pub(super) fn new() -> Arc<Self> {
         Arc::new(Self { _place: 0 })
+    }
+
+    /// A name for a pessimistic transaction that begins on this thread: one
+    /// an earlier transaction of the thread gave back, else a new one. So a
+    /// thread that runs transactions one after another allocates no owner
+    /// and changes no count in steady state.
+    pub(super) fn take() -> Arc<Self> {
+        OWNERS
+            .try_with(|pool| pool.borrow_mut().pop())
+            .ok()
+            .flatten()
+            .unwrap_or_else(Self::new)
+    }
+
+    /// Give `owner` back as its transaction ends, for this thread's next
+    /// transaction, if nothing else holds it. A commit whose locks are
+    /// released at its landing (`LandingLocks`) and a close claim each hold a
+    /// clone while they may still carry or release the name, so an owner one
+    /// of them holds is dropped instead, and the name is never lent out while
+    /// a lock can still carry it for the old transaction. A name a handoff
+    /// wrote for the old transaction and has not cleared yet carries the
+    /// handoff's mark, which the next transaction's calls never take for a
+    /// hold (`OwnedLock`).
+    pub(super) fn give_back(owner: Arc<Self>) {
+        // Nothing ever makes a `Weak` of an owner, so a strong count of one is
+        // every reference. The fence pairs with the release the last other
+        // holder's drop made, so what it did with the name happened before
+        // the name is lent again.
+        if Arc::strong_count(&owner) != 1 {
+            return;
+        }
+        std::sync::atomic::fence(std::sync::atomic::Ordering::Acquire);
+        // A thread that is exiting has no pool left; the owner is dropped.
+        let _ = OWNERS.try_with(|pool| {
+            let mut pool = pool.borrow_mut();
+            if pool.len() < OWNER_POOL {
+                pool.push(owner);
+            }
+        });
     }
 
     /// The name this owner's locks carry.
@@ -237,6 +294,10 @@ const POLLING: usize = 1;
 /// The wait is over: the lock was taken, found held by the transaction, or
 /// the wait was abandoned.
 const DONE: usize = 2;
+/// Set beside [`POLLING`] by a wake that came while the poll ran. Such a
+/// wake told only the notes recorded before it, so the poll that leaves the
+/// wait pending finds it here and wakes again (`PendingLock::poll`).
+const WOKEN: usize = 4;
 
 /// What one poll of a [`PendingLock`] found.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -262,14 +323,13 @@ pub(super) struct PendingLock {
     /// The key's lock, with a use taken for this wait.
     key_lock: Arc<KeyLock>,
     /// The place in the lock's queue. Touched only by the call that moved
-    /// `state` from `IDLE`.
+    /// `Wakeup::state` from `IDLE`.
     wait: UnsafeCell<OwnedWait>,
-    state: AtomicUsize,
     wakeup: Arc<Wakeup>,
     waker: Waker,
 }
 
-// SAFETY: `wait` is touched only by the one call that moved `state` from
+// SAFETY: `wait` is touched only by the one call that moved `Wakeup::state` from
 // `IDLE` (to `POLLING`, or to `DONE` when it abandons the wait), so no two
 // threads ever reach it at once; everything else is atomic or `Sync`.
 unsafe impl Send for PendingLock {}
@@ -280,13 +340,13 @@ impl PendingLock {
     /// A wait on `key_lock`, which the caller pinned for it.
     pub(super) fn new(key_lock: Arc<KeyLock>) -> Self {
         let wakeup = Arc::new(Wakeup {
+            state: AtomicUsize::new(IDLE),
             notes: Stack::new(),
             sleepers: Stack::new(),
         });
         Self {
             key_lock,
             wait: UnsafeCell::new(OwnedWait::new()),
-            state: AtomicUsize::new(IDLE),
             waker: Waker::from(Arc::clone(&wakeup)),
             wakeup,
         }
@@ -297,7 +357,7 @@ impl PendingLock {
     }
 
     pub(super) fn is_done(&self) -> bool {
-        self.state.load(Ordering::Acquire) == DONE
+        self.wakeup.state.load(Ordering::Acquire) == DONE
     }
 
     /// Complete `slot` on `queue` (directly with none) at the lock's next
@@ -317,11 +377,50 @@ impl PendingLock {
     /// Poll the wait once for `owner`. `told` is the completion the calling
     /// call recorded for itself with [`note`](Self::note), if it did: a poll
     /// that ends the wait voids it, since that call does not wait after all.
+    ///
+    /// A call that finds another polling returns [`Polled::Busy`] with its
+    /// note recorded. A wake that came while that poll ran told only the
+    /// notes recorded before it, and its nudge is still on the wait, so it
+    /// marks the poll [`WOKEN`], and the poll that leaves the wait pending
+    /// and finds the mark wakes again: a call that met it is told even if
+    /// the poller's own caller never comes back.
     pub(super) fn poll(&self, owner: OwnerId, told: Option<&WaitSlot>) -> Polled {
-        match self
-            .state
-            .compare_exchange(IDLE, POLLING, Ordering::AcqRel, Ordering::Acquire)
-        {
+        self.poll_checked::<true, false>(owner, told)
+    }
+
+    /// [`poll`](Self::poll) as it was before the hand-back: the loom
+    /// calibration that shows a call meeting the poll is otherwise left
+    /// untold.
+    #[cfg(loom)]
+    pub(super) fn poll_without_recheck(&self, owner: OwnerId, told: Option<&WaitSlot>) -> Polled {
+        self.poll_checked::<false, false>(owner, told)
+    }
+
+    /// [`poll`](Self::poll) as it was before defect F1's fix: it takes the
+    /// transaction's name for a hold even while a handoff wrote it and has
+    /// not granted it. The loom calibration that shows that breaks mutual
+    /// exclusion.
+    #[cfg(loom)]
+    pub(super) fn poll_trusting_a_half_made_handoff(
+        &self,
+        owner: OwnerId,
+        told: Option<&WaitSlot>,
+    ) -> Polled {
+        self.poll_checked::<true, true>(owner, told)
+    }
+
+    /// [`poll`](Self::poll) with the hand-back of a wake that came while it
+    /// ran (`RECHECK`), or without it, and with the name a handoff is still
+    /// granting taken for a hold (`TRUST_MARK`) or not: the production poll
+    /// is `<true, false>`, and the other forms are the loom calibrations that
+    /// show each rule is needed.
+    fn poll_checked<const RECHECK: bool, const TRUST_MARK: bool>(
+        &self,
+        owner: OwnerId,
+        told: Option<&WaitSlot>,
+    ) -> Polled {
+        let state = &self.wakeup.state;
+        match state.compare_exchange(IDLE, POLLING, Ordering::AcqRel, Ordering::Acquire) {
             Ok(_) => {}
             Err(DONE) => {
                 if let Some(told) = told {
@@ -340,10 +439,12 @@ impl PendingLock {
             .with_mut(|wait| unsafe { (*wait).poll(lock, owner, &self.waker) });
         let polled = if ready.is_ready() {
             Polled::Acquired
-        } else if lock.holder() == owner.word() {
+        } else if lock.holder() == owner.word() || (TRUST_MARK && trusts_mark(lock, owner)) {
             // Another call of the transaction took it while this one waited;
             // the lock cannot be handed to this wait while its own owner
-            // holds it, so the cancel only withdraws.
+            // holds it, so the cancel only withdraws. A handoff to this wait
+            // that is not granted yet names it with `GRANTING`, which this
+            // comparison never matches: the wait stays, and the grant wakes it.
             // SAFETY: as above.
             self.wait
                 .with_mut(|wait| unsafe { (*wait).cancel(lock, owner) });
@@ -352,7 +453,13 @@ impl PendingLock {
             Polled::Pending
         };
         if polled == Polled::Pending {
-            self.state.store(IDLE, Ordering::Release);
+            // The swap reads the mark a wake that came while this poll ran
+            // left (`Wakeup::wake_all`). A call this poll turned away noted
+            // itself before it looked, so what that wake missed is told here.
+            let ended = state.swap(IDLE, Ordering::AcqRel);
+            if RECHECK && ended & WOKEN != 0 {
+                self.wakeup.wake_all();
+            }
         } else {
             if let Some(told) = told {
                 told.complete();
@@ -367,6 +474,7 @@ impl PendingLock {
     /// wait's use is the caller's to give back.
     pub(super) fn abandon(&self, owner: OwnerId) -> bool {
         if self
+            .wakeup
             .state
             .compare_exchange(IDLE, DONE, Ordering::AcqRel, Ordering::Acquire)
             .is_err()
@@ -383,21 +491,52 @@ impl PendingLock {
     /// The wait is over: every other call of the transaction waiting on it
     /// runs again.
     fn finish(&self) {
-        self.state.store(DONE, Ordering::Release);
+        self.wakeup.state.store(DONE, Ordering::Release);
         self.wakeup.wake_all();
     }
+}
+
+/// Whether the lock names `owner`, a handoff's marked name included: only the
+/// loom calibration of defect F1 asks, and outside loom nothing does.
+#[cfg(loom)]
+fn trusts_mark(lock: &crate::sync::OwnedLock, owner: OwnerId) -> bool {
+    lock.names(owner)
+}
+
+/// Outside loom no poll takes a marked name for a hold.
+#[cfg(not(loom))]
+fn trusts_mark(_lock: &crate::sync::OwnedLock, _owner: OwnerId) -> bool {
+    false
 }
 
 /// What a wake of a [`PendingLock`] tells: every [`LockWait`](crate::LockWait)
 /// handed out since the last wake, each on its own queue, and every thread
 /// that blocks on the wait.
 struct Wakeup {
+    /// The wait's [`IDLE`], [`POLLING`] (with [`WOKEN`] when a wake came
+    /// while it ran) or [`DONE`]. Here rather than in the wait, so a wake
+    /// can mark the poll it falls into.
+    state: AtomicUsize,
     notes: Stack<Note>,
     sleepers: Stack<Thread>,
 }
 
 impl Wakeup {
     fn wake_all(&self) {
+        // Mark a poll under way before telling the notes: one this wake
+        // misses was recorded after it, by a call the poll turned away.
+        let mut state = self.state.load(Ordering::Acquire);
+        while state == POLLING {
+            match self.state.compare_exchange_weak(
+                state,
+                POLLING | WOKEN,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => break,
+                Err(actual) => state = actual,
+            }
+        }
         for note in self.notes.take(0) {
             note.deliver();
         }
@@ -445,8 +584,8 @@ impl Note {
     }
 }
 
-/// The key locks a pessimistic commit holds while its group lands, released
-/// by the thread that lands it: once the commit is applied and visible (and
+/// The key locks a pessimistic commit holds until it lands, released by the
+/// thread that lands it: once the commit is applied and visible (and
 /// durable at `Immediate`), whether or not its outcome was delivered.
 pub(super) struct LandingLocks {
     table: Arc<LockTable>,
@@ -563,6 +702,95 @@ mod tests {
         assert!(b.lock.unlock(kept.id()));
         table.unpin(b"b", &b);
         assert_eq!(table.len(), 0);
+    }
+
+    /// E42. An owner is lent to the thread's next transaction only when its
+    /// transaction held the last reference: one a landing commit or a close
+    /// claim still holds is never lent, and its name stays its own.
+    #[test]
+    fn an_owner_is_lent_again_only_when_nothing_else_holds_it() {
+        OWNERS.with(|pool| pool.borrow_mut().clear());
+        let owner = LockOwner::take();
+        let name = owner.id().word();
+        let landing = Arc::clone(&owner);
+        LockOwner::give_back(owner);
+        let next = LockOwner::take();
+        assert_ne!(next.id().word(), name, "lent while another holder had it");
+        drop(landing);
+        let name = next.id().word();
+        LockOwner::give_back(next);
+        let again = LockOwner::take();
+        assert_eq!(again.id().word(), name, "the only holder gave it back");
+        for _ in 0..OWNER_POOL + 2 {
+            LockOwner::give_back(LockOwner::new());
+        }
+        assert_eq!(
+            OWNERS.with(|pool| pool.borrow().len()),
+            OWNER_POOL,
+            "the pool is bounded"
+        );
+        OWNERS.with(|pool| pool.borrow_mut().clear());
+    }
+
+    /// Make `waiter`'s wait owed: it loses every race the bound allows while
+    /// `holder` releases and barges back in. `holder` holds the lock after.
+    fn owe(lock: &OwnedLock, holder: OwnerId, waiter: OwnerId, pending: &PendingLock) {
+        assert_eq!(pending.poll(waiter, None), Polled::Pending, "queued");
+        for _ in 0..crate::sync::MAX_BYPASS {
+            assert!(lock.unlock(holder));
+            assert_eq!(lock.try_lock(holder), TryLock::Taken, "barged");
+            assert_eq!(pending.poll(waiter, None), Polled::Pending, "a lost race");
+        }
+    }
+
+    /// F1. A release hands the lock to an owed wait in two steps: it writes
+    /// the waiter's name, then grants the waiter. The waiting transaction
+    /// polls between the two (on another thread, in the code; here inside
+    /// the hook) and must not take the name for a hold of its own: that
+    /// would withdraw the wait, the grant would then fail and free the lock,
+    /// and the transaction would go on believing it holds the key.
+    #[test]
+    fn a_poll_between_the_name_and_the_grant_does_not_conclude_mine() {
+        let lock = Arc::new(KeyLock::new());
+        let (holder, waiter) = (LockOwner::new(), LockOwner::new());
+        let (h, w) = (holder.id(), waiter.id());
+        assert_eq!(lock.lock.try_lock(h), TryLock::Taken);
+        let pending = Arc::new(PendingLock::new(Arc::clone(&lock)));
+        owe(&lock.lock, h, w, &pending);
+
+        let seen = Arc::new(std::sync::Mutex::new(None));
+        {
+            let (pending, seen, lock) =
+                (Arc::clone(&pending), Arc::clone(&seen), Arc::clone(&lock));
+            crate::sync::between_take_and_grant(move || {
+                let polled = pending.poll(w, None);
+                let tried = lock.lock.try_lock(w);
+                *seen.lock().unwrap() = Some((polled, tried));
+            });
+        }
+        assert!(
+            lock.lock.unlock(h),
+            "the release hands the lock to the owed wait"
+        );
+        let (polled, tried) = seen
+            .lock()
+            .unwrap()
+            .take()
+            .expect("the handoff ran the hook");
+        assert_ne!(
+            polled,
+            Polled::Mine,
+            "the poll took the half-made handoff for a hold"
+        );
+        assert_ne!(
+            tried,
+            TryLock::Mine,
+            "a try took the half-made handoff for a hold"
+        );
+        // The grant went through: the wait is the holder.
+        assert_eq!(lock.lock.holder(), w.word(), "the handoff was undone");
+        assert_eq!(pending.poll(w, None), Polled::Acquired);
+        assert!(lock.lock.unlock(w));
     }
 
     #[test]

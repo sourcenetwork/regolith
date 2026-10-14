@@ -33,6 +33,7 @@
 //! were recorded. A hang would be equally invisible, so every test body
 //! runs on a worker thread whose progress counter is watched from the
 //! test thread with a deadline plus bounded backoff.
+#![cfg(not(target_arch = "wasm32"))]
 
 use std::fs;
 use std::panic;

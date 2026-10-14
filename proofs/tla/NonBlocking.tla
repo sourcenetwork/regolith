@@ -37,13 +37,15 @@
 \*     threads or with one (the single-threaded wasm case) (AllDone).
 \*
 \* THE COMMIT SIDE (commit units). Writes take the same path:
-\*   - a group of commits made by commit_nowait that needs an fsync is
-\*     written and left as ONE unit, the group's fsync. Each member's commit
-\*     puts a note for it on its OWN queue; the first member to poll claims
-\*     it with one CAS and runs the fsync; every member's queue is told once.
-\*     Any thread that takes the commit pipeline next may land it too
-\*     (LandHere), and close lands it. Tiny example: threads A and B commit
-\*     into group 4; B polls first, syncs once, and the note to A wakes A.
+\*   - commits made by commit_nowait that need an fsync wait on ONE unit,
+\*     the sync round that covers their records (the round is the one claim
+\*     on the log's device step, src/engine/commit/round.rs). Each such
+\*     commit puts a note for it on its OWN queue; the first of those queues
+\*     to poll claims it with one CAS and runs the fsync; every one of them
+\*     is told once. A thread that needs the log durable inside a blocking
+\*     call may run it too (LandHere), and close runs it. Tiny example:
+\*     threads A and B commit, and round 4 covers both; B polls first, syncs
+\*     once, and the note to A wakes A.
 \*     What can go wrong: the fsync runs twice (SingleRun), the commits are
 \*     visible before the fsync (VisibleAfterSync), or B's poll makes A's
 \*     ticket ready on B's thread instead of at A's own poll
@@ -55,6 +57,33 @@
 \*     the stall again, landing the unit itself if it cleared meanwhile.
 \*     What can go wrong: a writer installs the unit just after the clearer
 \*     looked, and nobody ever lands it (StallLandsWhenClear).
+\*     A transaction's commit cannot be made a second time, so a stall does
+\*     not end it: a commit_nowait commit is left on its queue behind the
+\*     stall's unit and goes on at the poll that finds the unit landed, and
+\*     a blocking commit sleeps on the unit (RegolithEngine::admit_commit and
+\*     admit_commit_nowait, src/engine/mod.rs). Both are waiters of the unit
+\*     like any stopped write and look at the stall again once they have it:
+\*     the writer below that registers, looks again and later runs again
+\*     (WriteTry, Rerun) stands for them.
+\*
+\* TIMED WAITS. A transaction that lost its commit may wait a little before
+\* it runs again (RetryPolicy::backoff). A thread that must never block
+\* cannot sleep, so its task asks the thread's queue for a "timed wait"
+\* (IoRuntime::timer, src/engine/io/mod.rs): ready once the clock reaches a
+\* due time. The request is a note in the queue's inbox like any other. The
+\* owner's poll takes it in, and the first poll that finds the clock at the
+\* due time or later completes it (Timers, src/io_queue/timers.rs). Nobody
+\* is woken for a timed wait and nothing sleeps for one: each poll tells the
+\* owner how long it may idle until the next one is due
+\* (IoProgress::wake_in), and the owner polls again by then.
+\* Tiny example. At time 40 thread A asks for a wait due at 100. A's poll at
+\* 60 leaves it and says "idle at most 40". A's poll at 100 completes it.
+\* What can go wrong: the wait lands on another thread's queue
+\* (TimerOnOwnQueue); a poll completes it before it is due (TimerNotEarly);
+\* A goes idle, the wait comes due, and A sleeps for ever because nothing
+\* wakes it (AllDone, with an owner that polls again in time: TimerWake);
+\* A drops its queue and the task waiting on the wait is never told
+\* (DroppedHoldsNothing).
 \*
 \* WHAT IS MODELLED, and the code each piece mirrors:
 \*   unit        a single-flight read: Unit, src/engine/io/unit.rs
@@ -67,15 +96,31 @@
 \*               landed for the queue (QueueShared::landed). The block cache
 \*               is left out on purpose: it only ever makes a re-run find its
 \*               block sooner, so this is the hard case, the one where only
-\*               the landing carries the read (a disabled cache).
+\*               the landing carries the read (a disabled cache). `have`
+\*               only grows: a re-run finds every block that landed for it.
+\*               The code bounds the landings by bytes, and keeps that
+\*               promise by holding past the bound what a call run again
+\*               still needs (src/io_queue/ledger.rs); LandingHold.tla
+\*               checks that, for calls that need several blocks at once.
+\*   timed       the timed waits a queue's owner holds: IoQueue::timers,
+\*               src/io_queue/queue.rs
+\*   elapsed     the clock, as far as a timed wait can tell: the waits whose
+\*               due time it has reached (Env::now_micros read by a poll)
+\*   dropped     the queues that are gone: Drop for IoQueue
 \*
 \* WHAT IS LEFT OUT, and why that loses nothing:
 \*   - Memory ordering and the exact CAS loops: the loom models check those
 \*     (tests/loom_io_queue.rs). Here each CAS is one atomic step.
 \*   - The byte bound on a queue: it delays a read (a "room" wait) but never
-\*     changes who is told what.
-\*   - A dropped queue: it releases its units exactly as close does (Release
-\*     below), so it adds no new kind of step.
+\*     changes who is told what. The bound on what stays landed is
+\*     LandingHold.tla's, see `have` above.
+\*   - What a dropped queue does with its units: it releases them exactly
+\*     as close does (Release below), which adds no new kind of step. What
+\*     it does with its timed waits is a step of its own (DropQueue), so the
+\*     threads that may drop a queue here wait on timed waits only.
+\*   - The clock as a number, and how long an owner may idle: a timed wait
+\*     is either due or not, and an owner that holds a due one runs again
+\*     (TimerWake). Lean keeps the numbers: poll_after_wake_in_completes.
 \*   - Read failures: a failed unit is told to its waiters like a landed one;
 \*     only what lands differs.
 \*   - Jobs (I/O regolith starts itself: the flush or the bounded step a
@@ -84,9 +129,10 @@
 \*     same path as a read's miss (a unit, a request on the starting
 \*     thread's own queue, src/engine/io/job.rs); SelfStart stands for all
 \*     of them.
-\*   - What a group's fsync writes and applies: GroupCommit.tla checks the
-\*     group's contents, its order and its failure path. Here a group is a
-\*     unit whose finish is its fsync, then its publication.
+\*   - What a sync round writes and publishes: CommitPipeline.tla checks
+\*     which commits a round covers, their order and the failure path. Here
+\*     a round is a unit whose finish is its fsync, then the publication of
+\*     the commits it covers.
 \*
 \* CONFIGURATIONS (each GREEN must pass, each RED must break the one
 \* invariant it names):
@@ -116,26 +162,49 @@
 \*                                   NoOrphanUnit breaks.
 \*   MC_NonBlocking_Red_BusyWoken    a poll that forgets to clear the idle
 \*                                   flag: BusyNeverWoken breaks.
-\*   MC_NonBlocking_Green_Commit     two threads commit into one group with
-\*                                   commit_nowait; any thread may land it.
+\*   MC_NonBlocking_Green_Commit     two threads commit with commit_nowait
+\*                                   and one round covers both; any thread
+\*                                   may run it.
 \*   MC_NonBlocking_Green_Stall      two writers stopped by one stall.
-\*   MC_NonBlocking_Red_DoubleSync   the DoubleRun claim on a group: its
+\*   MC_NonBlocking_Red_DoubleSync   the DoubleRun claim on a round: its
 \*                                   fsync runs twice, SingleRun breaks.
-\*   MC_NonBlocking_Red_PublishAtWrite  a group visible as soon as it is
+\*   MC_NonBlocking_Red_PublishAtWrite  commits visible as soon as they are
 \*                                   written: VisibleAfterSync breaks.
-\*   MC_NonBlocking_Red_DeliverOnLander  the thread that lands a group makes
-\*                                   every member's ticket ready itself:
-\*                                   DeliveredOnOwnPoll breaks.
+\*   MC_NonBlocking_Red_DeliverOnLander  the thread that runs a round makes
+\*                                   every waiting commit's ticket ready
+\*                                   itself: DeliveredOnOwnPoll breaks.
 \*   MC_NonBlocking_Red_NoRecheck    a stopped writer that does not look at
 \*                                   the stall again after registering:
 \*                                   StallLandsWhenClear breaks.
+\*   MC_NonBlocking_Green_Timer      a thread asks for a timed wait beside
+\*                                   its read; another asks for one and may
+\*                                   drop its queue. Every invariant.
+\*   MC_NonBlocking_Green_TimerLive  two threads with a timed wait each, one
+\*                                   of which may drop its queue: every
+\*                                   timed wait finishes (AllDone).
+\*   MC_NonBlocking_Red_IdlePastDue  an owner that stays idle past a timed
+\*                                   wait's due time: AllDone breaks.
+\*   MC_NonBlocking_Red_EarlyFire    a poll that completes a timed wait
+\*                                   without looking at the clock:
+\*                                   TimerNotEarly breaks.
+\*   MC_NonBlocking_Red_DropForgets  a dropped queue that leaves its timed
+\*                                   waits pending: DroppedHoldsNothing
+\*                                   breaks.
+\*   MC_NonBlocking_Red_TimerWrongQueue  a timed wait's note goes to the
+\*                                   other thread's queue: TimerOnOwnQueue
+\*                                   breaks.
 \*
 \* Lean, proofs/lean/Regolith/IoQueue.lean, proves the same rules for every
-\* number of threads and units, the commit units included: group_sync_once
-\* (SingleRun for a group), group_visible_after_sync (VisibleAfterSync),
+\* number of threads and units, the commit units included: round_sync_once
+\* (SingleRun for a round), round_visible_after_sync (VisibleAfterSync),
 \* ticket_ready_only_at_own_poll (DeliveredOnOwnPoll) and
 \* stall_lands_when_clear (StallLandsWhenClear), with the RED cases
-\* lander_delivery_breaks_own_poll and no_recheck_strands_stall.
+\* lander_delivery_breaks_own_poll and no_recheck_strands_stall. For timed
+\* waits, with the clock as a number: timed_wait_completed_once,
+\* timed_wait_completed_by_owner (TimerOnOwnQueue), timed_wait_not_before_due
+\* (TimerNotEarly), dropped_queue_holds_no_wait (DroppedHoldsNothing) and
+\* poll_after_wake_in_completes (AllDone for a timed wait), with the RED
+\* cases early_fire_breaks_due and idle_owner_never_completes.
 
 \* We use numbers, sequences (for inboxes) and finite sets.
 EXTENDS Naturals, Sequences, FiniteSets
@@ -152,15 +221,22 @@ CONSTANTS
   Jobs,
   \* [Jobs -> Threads]: the thread whose call started each job.
   JobOf,
-  \* Names for commit groups' fsyncs; disjoint from Blocks and Jobs.
-  Groups,
-  \* [Groups -> SUBSET Threads]: the threads with a commit_nowait member in
-  \* each group.
-  MembersOf,
+  \* Names for sync rounds; disjoint from Blocks and Jobs.
+  Rounds,
+  \* [Rounds -> SUBSET Threads]: the threads with a commit_nowait commit that
+  \* each round covers.
+  CommittersOf,
   \* Names for write stalls; disjoint from the rest.
   Stalls,
   \* [Stalls -> SUBSET Threads]: the threads whose write each stall stops.
   StoppedBy,
+  \* Names for timed waits; disjoint from the rest.
+  Timers,
+  \* [Timers -> Threads]: the thread that asks for each timed wait, on its
+  \* own queue.
+  TimerOf,
+  \* The threads that may drop their queue while the run goes on.
+  Droppers,
   \* How many units may ever be made (each miss of a gone unit makes one).
   MaxUnits,
   \* "none" for the real code, or the name of one planted bug.
@@ -170,27 +246,37 @@ CONSTANTS
 NoUnit == 0
 \* The unit numbers that can exist.
 Ids == 1..MaxUnits
-\* Everything a unit can stand for: a block, a job, a group's fsync, or a
-\* stall.
-Things == Blocks \cup Jobs \cup Groups \cup Stalls
+\* Everything a wait can be for: a block, a job, a sync round or a stall
+\* (each of which gets a unit), or a timed wait (which gets none).
+Things == Blocks \cup Jobs \cup Rounds \cup Stalls \cup Timers
 \* What thread t is waiting to see finished: its reads, its jobs, its
-\* commits, and its stopped writes.
+\* commits, its stopped writes, and its timed waits.
 Goal(t) == Want[t] \cup {j \in Jobs : JobOf[j] = t}
-           \cup {g \in Groups : t \in MembersOf[g]}
+           \cup {r \in Rounds : t \in CommittersOf[r]}
            \cup {s \in Stalls : t \in StoppedBy[s]}
+           \cup {x \in Timers : TimerOf[x] = t}
 \* The other thread (only used by the WrongQueue bug, with two threads).
 Other(t) == CHOOSE o \in Threads : o # t
 
 \* Blocks and jobs are different things.
 ASSUME Blocks \cap Jobs = {}
-\* Groups are neither blocks nor jobs.
-ASSUME Groups \cap (Blocks \cup Jobs) = {}
+\* Rounds are neither blocks nor jobs.
+ASSUME Rounds \cap (Blocks \cup Jobs) = {}
 \* Stalls are none of the others.
-ASSUME Stalls \cap (Blocks \cup Jobs \cup Groups) = {}
-\* Each group has its member threads.
-ASSUME MembersOf \in [Groups -> SUBSET Threads]
+ASSUME Stalls \cap (Blocks \cup Jobs \cup Rounds) = {}
+\* Each round has the threads whose commits it covers.
+ASSUME CommittersOf \in [Rounds -> SUBSET Threads]
 \* Each stall stops some threads' writes.
 ASSUME StoppedBy \in [Stalls -> SUBSET Threads]
+\* Timed waits are none of the others.
+ASSUME Timers \cap (Blocks \cup Jobs \cup Rounds \cup Stalls) = {}
+\* Each timed wait is asked for by one thread.
+ASSUME TimerOf \in [Timers -> Threads]
+\* The threads that may drop their queue are threads.
+ASSUME Droppers \subseteq Threads
+\* A thread that may drop its queue waits on timed waits only, so its drop
+\* has no unit to let go: units are let go as close lets them go (Release).
+ASSUME \A t \in Droppers : Goal(t) \subseteq Timers
 \* Each thread wants a set of blocks.
 ASSUME Want \in [Threads -> SUBSET Blocks]
 \* Each job belongs to one thread.
@@ -200,7 +286,8 @@ ASSUME MaxUnits \in Nat
 \* The bug names this model knows.
 ASSUME Mutant \in {"none", "WrongQueue", "LostIdleWakeup", "DoubleRun",
                    "SelfIoNowhere", "BusyWoken", "PublishAtWrite",
-                   "DeliverOnLander", "NoRecheck"}
+                   "DeliverOnLander", "NoRecheck", "IdlePastDue",
+                   "EarlyFire", "DropForgets"}
 
 \* The state that changes from step to step.
 VARIABLES
@@ -270,14 +357,15 @@ VARIABLES
   checking,
   \* close() has run.
   closedDb,
-  \* [Groups -> Ids \cup {NoUnit}]: the unit each group's fsync got when its
-  \* leader wrote it (GroupSync's job).
-  gunit,
-  \* [Groups -> SUBSET Threads]: the members whose commit_nowait returned.
+  \* [Rounds -> Ids \cup {NoUnit}]: the unit each round got when the first
+  \* commit to wait on it put it on a queue (the round's job, Round::job,
+  \* src/engine/commit/round.rs).
+  roundUnit,
+  \* [Rounds -> SUBSET Threads]: the threads whose commit_nowait returned.
   joined,
-  \* The groups whose fsync ran.
+  \* The rounds whose fsync ran.
   synced,
-  \* The groups readers can see.
+  \* The rounds whose commits readers can see.
   visible,
   \* Ghost: <<thread, thing>> for every wait made ready by a step that was
   \* not that thread's own poll.
@@ -287,20 +375,32 @@ VARIABLES
   \* [Threads -> [Stalls -> {"none", "seen", "recheck"}]]: a stopped write's
   \* progress: it saw the stall, or it registered its wait and is about to
   \* look at the stall again.
-  spc
+  spc,
+  \* [Threads -> SUBSET Timers]: the timed waits each queue's owner took in
+  \* and holds until they are due (IoQueue::timers).
+  timed,
+  \* The timed waits whose due time the clock has reached.
+  elapsed,
+  \* The threads whose queue is dropped.
+  dropped
 
 \* Every variable, so "nothing changed" can be written once.
 vars == <<table, what, state, outcome, waiters, shut, regd, runners, runs,
           toTell, told, next, inbox, idleFlag, taken, waiting, attached,
           slot, have, done, started, own, woken, checking, closedDb,
-          gunit, joined, synced, visible, offPoll, stalled, spc>>
+          roundUnit, joined, synced, visible, offPoll, stalled, spc,
+          timed, elapsed, dropped>>
 
 \* The commit side's variables, so a step that leaves them alone says so once.
-commitVars == <<gunit, joined, synced, visible, offPoll, stalled, spc>>
+commitVars == <<roundUnit, joined, synced, visible, offPoll, stalled, spc>>
 
-\* A note in an inbox: "read" (a read recorded unit u for reader r) or
-\* "done" (unit u finished).
-Msg == [kind : {"read", "done"}, u : Ids, reader : Threads \cup {0}]
+\* The variables of the timed waits, for the same reason.
+timerVars == <<timed, elapsed, dropped>>
+
+\* A note in an inbox: "read" (a read recorded unit u for reader r), "done"
+\* (unit u finished), or "timer" (reader r asked for timed wait u).
+Msg == [kind : {"read", "done", "timer"}, u : Ids \cup Timers,
+        reader : Threads \cup {0}]
 
 \* The start: no unit, empty inboxes, every thread busy, nothing done.
 Init ==
@@ -354,10 +454,10 @@ Init ==
   /\ checking = [t \in Threads |-> FALSE]
   \* The database is open.
   /\ closedDb = FALSE
-  \* No group is written yet.
-  /\ gunit = [g \in Groups |-> NoUnit]
-  \* No member has committed.
-  /\ joined = [g \in Groups |-> {}]
+  \* No round is on a queue yet.
+  /\ roundUnit = [r \in Rounds |-> NoUnit]
+  \* No commit_nowait has returned.
+  /\ joined = [r \in Rounds |-> {}]
   \* No fsync ran.
   /\ synced = {}
   \* Nothing is visible.
@@ -368,6 +468,12 @@ Init ==
   /\ stalled = Stalls
   \* No write has met a stall yet.
   /\ spc = [t \in Threads |-> [s \in Stalls |-> "none"]]
+  \* No owner holds a timed wait.
+  /\ timed = [t \in Threads |-> {}]
+  \* No timed wait is due.
+  /\ elapsed = {}
+  \* Every queue is open.
+  /\ dropped = {}
 
 -----------------------------------------------------------------------------
 \* HELPERS
@@ -445,6 +551,8 @@ Hit(t, x) ==
                  slot, have, started, own, woken, checking, closedDb>>
   \* The commit side is untouched.
   /\ UNCHANGED commitVars
+  \* No timed wait is touched.
+  /\ UNCHANGED timerVars
 
 \* Thread t runs its read of block x and misses (IoRuntime::miss). It does
 \* not touch the disk: it finds or makes the unit for x, puts a "read" note
@@ -492,6 +600,8 @@ Miss(t, x) ==
                  waiting, attached, have, done, started, own, checking, closedDb>>
   \* The commit side is untouched.
   /\ UNCHANGED commitVars
+  \* No timed wait is touched.
+  /\ UNCHANGED timerVars
 
 \* A call on thread t makes regolith start job j itself (a flush with no
 \* worker). The job takes the miss path: a unit, and a "read" note on the
@@ -526,10 +636,13 @@ SelfStart(t, j) ==
                  waiting, attached, have, done, own, checking, closedDb>>
   \* The commit side is untouched.
   /\ UNCHANGED commitVars
+  \* No timed wait is touched.
+  /\ UNCHANGED timerVars
 
 \* Thread t's wait for x is ready: it runs again (Hit or Miss decide what
-\* happens). A job's caller sees its job finished, and a commit's caller its
-\* ticket ready; a stopped write will run again (WriteTry).
+\* happens). A job's caller sees its job finished, a commit's caller its
+\* ticket ready, and a task that asked for a timed wait goes on; a stopped
+\* write will run again (WriteTry).
 Rerun(t, x) ==
   \* Only a running thread runs tasks.
   /\ own[t] = "busy"
@@ -537,94 +650,106 @@ Rerun(t, x) ==
   /\ slot[t][x] = "ready"
   \* The wait is used up.
   /\ slot' = [slot EXCEPT ![t][x] = "none"]
-  \* A job or a commit is finished for its caller; a read or a write will
-  \* run again.
-  /\ done' = IF x \in Jobs \cup Groups THEN [done EXCEPT ![t] = @ \cup {x}] ELSE done
+  \* A job, a commit or a timed wait is finished for its caller; a read or a
+  \* write will run again.
+  /\ done' = IF x \in Jobs \cup Rounds \cup Timers
+               \* Finished: it joins what t has done.
+               THEN [done EXCEPT ![t] = @ \cup {x}]
+               \* A read or a write: not done yet.
+               ELSE done
   \* Nothing else changes.
   /\ UNCHANGED <<table, what, state, outcome, waiters, shut, regd, runners, runs,
                  toTell, told, next, inbox, idleFlag, taken, waiting, attached,
                  have, started, own, woken, checking, closedDb>>
   \* The commit side is untouched.
   /\ UNCHANGED commitVars
+  \* No timed wait is touched.
+  /\ UNCHANGED timerVars
 
 -----------------------------------------------------------------------------
 \* WHAT A COMMITTER DOES (on its own thread): commit_nowait
 
-\* Thread t's commit_nowait in group g returns. The first member's commit
-\* is the leader's: it writes the group and leaves its fsync as one unit
-\* (GroupSync's job, src/engine/commit/deferred.rs). Every member, the
-\* leader included, puts a note for that unit on its OWN queue and returns
-\* with a ticket that waits on it. Bug PublishAtWrite makes the group
-\* visible as soon as it is written.
-CommitNowait(t, g) ==
-  \* The unit the group has, or the one its leader makes now.
-  LET fresh == gunit[g] = NoUnit
-      \* The unit this member's ticket waits on.
-      u == IF fresh THEN next ELSE gunit[g]
+\* Thread t's commit_nowait returns, its commit waiting on round r. The
+\* first such commit finds the round with nobody on it (in the code the
+\* round is there already: each round installs the next before it lands,
+\* src/engine/commit/round.rs). Every such commit puts a note for the
+\* round's unit on its OWN queue and returns with a ticket that waits on
+\* it. Bug PublishAtWrite makes the round's commits visible as soon as they
+\* are written.
+CommitNowait(t, r) ==
+  \* The unit the round has, or the one the first commit to wait gives it now.
+  LET fresh == roundUnit[r] = NoUnit
+      \* The unit this commit's ticket waits on.
+      u == IF fresh THEN next ELSE roundUnit[r]
   \* With those names, the step is:
   IN
   \* Only a running thread commits.
   /\ own[t] = "busy"
-  \* t has a member in g and has not committed it.
-  /\ t \in MembersOf[g] /\ t \notin joined[g]
-  \* The group was written before close, or the database is open (a group
+  \* t has a commit round r covers, and its commit_nowait has not returned.
+  /\ t \in CommittersOf[r] /\ t \notin joined[r]
+  \* The round was on a queue before close, or the database is open (a commit
   \* close came before is CommitClosed).
   /\ ~closedDb \/ ~fresh
   \* A new unit needs a free number.
   /\ fresh => next <= MaxUnits
-  \* The leader's write makes the unit, in the table, free.
-  /\ table' = IF fresh THEN [table EXCEPT ![g] = next] ELSE table
-  \* It stands for the group's fsync.
-  /\ what' = IF fresh THEN [what EXCEPT ![next] = g] ELSE what
+  \* The first commit to wait puts the unit in the table, free.
+  /\ table' = IF fresh THEN [table EXCEPT ![r] = next] ELSE table
+  \* It stands for the round.
+  /\ what' = IF fresh THEN [what EXCEPT ![next] = r] ELSE what
   \* Nobody has claimed it.
   /\ state' = IF fresh THEN [state EXCEPT ![next] = "free"] ELSE state
   \* The next number moves on when one was used.
   /\ next' = IF fresh THEN next + 1 ELSE next
-  \* The group remembers its unit.
-  /\ gunit' = IF fresh THEN [gunit EXCEPT ![g] = next] ELSE gunit
+  \* The round remembers its unit.
+  /\ roundUnit' = IF fresh THEN [roundUnit EXCEPT ![r] = next] ELSE roundUnit
   \* t's commit returned.
-  /\ joined' = [joined EXCEPT ![g] = @ \cup {t}]
+  /\ joined' = [joined EXCEPT ![r] = @ \cup {t}]
   \* The note goes to t's own queue.
   /\ Push(t, [kind |-> "read", u |-> u, reader |-> t])
   \* The ticket waits.
-  /\ slot' = [slot EXCEPT ![t][g] = "pending"]
-  \* The bug publishes the group before any fsync.
-  /\ visible' = IF Mutant = "PublishAtWrite" THEN visible \cup {g} ELSE visible
+  /\ slot' = [slot EXCEPT ![t][r] = "pending"]
+  \* The bug publishes the round's commits before any fsync.
+  /\ visible' = IF Mutant = "PublishAtWrite" THEN visible \cup {r} ELSE visible
   \* Nothing else changes.
   /\ UNCHANGED <<outcome, waiters, shut, regd, runners, runs, toTell, told, taken,
                  waiting, attached, have, done, started, own, checking, closedDb>>
   \* The rest of the commit side is untouched.
   /\ UNCHANGED <<synced, offPoll, stalled, spc>>
+  \* No timed wait is touched.
+  /\ UNCHANGED timerVars
 
-\* Thread t's commit_nowait comes after close, and no group was written for
-\* it: it is refused with Closed, and its ticket is ready at once, on t.
-CommitClosed(t, g) ==
+\* Thread t's commit_nowait comes after close, and no round was on a queue
+\* for it: it is refused with Closed, and its ticket is ready at once, on t.
+CommitClosed(t, r) ==
   \* Only a running thread commits.
   /\ own[t] = "busy"
-  \* t has a member in g and has not committed it.
-  /\ t \in MembersOf[g] /\ t \notin joined[g]
-  \* Close came first, before any member wrote the group.
-  /\ closedDb /\ gunit[g] = NoUnit
+  \* t has a commit round r covers, and its commit_nowait has not returned.
+  /\ t \in CommittersOf[r] /\ t \notin joined[r]
+  \* Close came first, before any commit waited on the round.
+  /\ closedDb /\ roundUnit[r] = NoUnit
   \* t's commit returned.
-  /\ joined' = [joined EXCEPT ![g] = @ \cup {t}]
+  /\ joined' = [joined EXCEPT ![r] = @ \cup {t}]
   \* With Closed: the commit is over for its caller.
-  /\ done' = [done EXCEPT ![t] = @ \cup {g}]
+  /\ done' = [done EXCEPT ![t] = @ \cup {r}]
   \* Nothing else changes.
   /\ UNCHANGED <<table, what, state, outcome, waiters, shut, regd, runners, runs,
                  toTell, told, next, inbox, idleFlag, taken, waiting, attached,
                  slot, have, started, own, woken, checking, closedDb>>
   \* The rest of the commit side is untouched.
-  /\ UNCHANGED <<gunit, synced, visible, offPoll, stalled, spc>>
+  /\ UNCHANGED <<roundUnit, synced, visible, offPoll, stalled, spc>>
+  \* No timed wait is touched.
+  /\ UNCHANGED timerVars
 
-\* Thread t takes the commit pipeline (to write the next group, to flush,
-\* or a blocking member waiting on its own group) and lands the group that
-\* is owed first: it claims the group's unit with the same one CAS
-\* (land_pending, GroupSync::land_here). It need not be a member.
+\* Thread t, not polling, needs the log durable (a blocking commit, a
+\* rotation, an ordered unit) and finds the round with nobody running it:
+\* it claims the round's unit with the same one CAS
+\* (RegolithEngine::run_or_wait, src/engine/commit/park.rs). It need not
+\* have a commit the round covers.
 LandHere(t, u) ==
-  \* Only a running thread takes the pipeline.
+  \* Only a running thread does this.
   /\ own[t] = "busy"
-  \* u is a group's fsync.
-  /\ what[u] \in Groups
+  \* u is a round.
+  /\ what[u] \in Rounds
   \* The CAS succeeds only on a free unit (the bug: also on a claimed one).
   /\ \/ state[u] = "free"
      \* The bug: a unit someone else already claimed.
@@ -639,6 +764,8 @@ LandHere(t, u) ==
                  done, started, own, woken, checking, closedDb>>
   \* The commit side is untouched.
   /\ UNCHANGED commitVars
+  \* No timed wait is touched.
+  /\ UNCHANGED timerVars
 
 -----------------------------------------------------------------------------
 \* WHAT A WRITER DOES UNDER A STALL (on its own thread)
@@ -668,7 +795,9 @@ WriteTry(t, s) ==
                  toTell, told, next, inbox, idleFlag, taken, waiting, attached,
                  slot, have, started, own, woken, checking, closedDb>>
   \* The rest of the commit side is untouched.
-  /\ UNCHANGED <<gunit, joined, synced, visible, offPoll, stalled>>
+  /\ UNCHANGED <<roundUnit, joined, synced, visible, offPoll, stalled>>
+  \* No timed wait is touched.
+  /\ UNCHANGED timerVars
 
 \* The stopped writer finds the stall's unit, or installs a fresh passive
 \* one, and puts a note for it on its own queue (StallSignal::wait). It has
@@ -706,7 +835,9 @@ StallWait(t, s) ==
   /\ UNCHANGED <<outcome, waiters, shut, regd, runners, runs, toTell, told, taken,
                  waiting, attached, have, done, started, own, checking, closedDb>>
   \* The rest of the commit side is untouched.
-  /\ UNCHANGED <<gunit, joined, synced, visible, offPoll, stalled>>
+  /\ UNCHANGED <<roundUnit, joined, synced, visible, offPoll, stalled>>
+  \* No timed wait is touched.
+  /\ UNCHANGED timerVars
 
 \* Land the stall unit u: it ends without a read, its waiter list is shut,
 \* and every queue on it is owed a note (Job::release of a passive job).
@@ -749,7 +880,9 @@ StallRecheck(t, s) ==
                  waiting, attached, slot, have, done, started, own, woken,
                  checking, closedDb>>
   \* The rest of the commit side is untouched.
-  /\ UNCHANGED <<gunit, joined, synced, visible, offPoll, stalled>>
+  /\ UNCHANGED <<roundUnit, joined, synced, visible, offPoll, stalled>>
+  \* No timed wait is touched.
+  /\ UNCHANGED timerVars
 
 \* Background work (a flush, a compaction pass) clears stall s and lands
 \* the unit its stopped writers wait on, if there is one (StallSignal::
@@ -774,7 +907,9 @@ Clear(s) ==
                  waiting, attached, slot, have, done, started, own, woken,
                  checking, closedDb>>
   \* The rest of the commit side is untouched.
-  /\ UNCHANGED <<gunit, joined, synced, visible, offPoll, spc>>
+  /\ UNCHANGED <<roundUnit, joined, synced, visible, offPoll, spc>>
+  \* No timed wait is touched.
+  /\ UNCHANGED timerVars
 
 -----------------------------------------------------------------------------
 \* WHAT A QUEUE'S OWNER DOES WHEN IT POLLS (IoQueue::poll)
@@ -797,6 +932,8 @@ Take(t) ==
                  own, woken, checking, closedDb>>
   \* The commit side is untouched.
   /\ UNCHANGED commitVars
+  \* No timed wait is touched.
+  /\ UNCHANGED timerVars
 
 \* The owner handles its oldest taken note.
 Handle(t) ==
@@ -812,6 +949,11 @@ Handle(t) ==
      IN
      \* The note is handled now.
      /\ taken' = [taken EXCEPT ![t] = Tail(@)]
+     \* A "timer" note: the owner takes the wait in and holds it until it is
+     \* due (Timers::record). Any other note leaves the held waits alone.
+     /\ timed' = IF m.kind = "timer" THEN [timed EXCEPT ![t] = @ \cup {m.u}]
+                                     \* Not a "timer" note: as they were.
+                                     ELSE timed
      \* What else happens depends on the note and the unit:
      /\ CASE
           \* A read of a unit this queue already registered on: the read
@@ -856,7 +998,8 @@ Handle(t) ==
             /\ attached' = [attached EXCEPT ![t][u] = {}]
             \* Nothing else changes.
             /\ UNCHANGED <<waiters, shut, regd>>
-          \* A "done" note for a unit the queue no longer waits on: nothing.
+          \* A "done" note for a unit the queue no longer waits on, or a
+          \* "timer" note (recorded above): nothing about units changes.
           [] OTHER ->
             \* Nothing changes.
             UNCHANGED <<waiters, shut, regd, waiting, attached, slot, have>>
@@ -865,6 +1008,8 @@ Handle(t) ==
                  inbox, idleFlag, done, started, own, woken, checking, closedDb>>
   \* The commit side is untouched.
   /\ UNCHANGED commitVars
+  \* The clock and the dropped queues are untouched.
+  /\ UNCHANGED <<elapsed, dropped>>
 
 \* The owner claims a unit it waits on with ONE compare-and-swap from free
 \* to claimed (Unit::claim). Bug DoubleRun also lets a claimed unit be
@@ -890,14 +1035,16 @@ Claim(t, u) ==
                  done, started, own, woken, checking, closedDb>>
   \* The commit side is untouched.
   /\ UNCHANGED commitVars
+  \* No timed wait is touched.
+  /\ UNCHANGED timerVars
 
 \* The claimer reads the block and finishes the unit (Unit::finish): it
 \* writes the outcome, marks the unit done, shuts the waiter list in ONE
 \* swap (taking every registered queue), and drops the unit from the table.
-\* For a group's unit the "read" is the group's fsync: the group is synced,
-\* then applied and published (visible). Bug DeliverOnLander also makes
-\* every registered member's ticket ready right here, on the lander's
-\* thread, instead of at each member's own poll.
+\* For a round's unit the "read" is the round's fsync: its commits are
+\* synced, then published (visible). Bug DeliverOnLander also makes every
+\* registered commit's ticket ready right here, on the runner's thread,
+\* instead of at each one's own poll.
 Finish(t, u) ==
   \* t is running u.
   /\ t \in runners[u]
@@ -922,23 +1069,25 @@ Finish(t, u) ==
             /\ table' = IF table[what[u]] = u THEN [table EXCEPT ![what[u]] = NoUnit] ELSE table
        \* Already ended by the first finisher.
        ELSE UNCHANGED <<state, outcome, shut, toTell, waiters, table>>
-  \* A group's fsync ran: the group is durable, then visible.
-  /\ synced' = IF what[u] \in Groups THEN synced \cup {what[u]} ELSE synced
+  \* A round's fsync ran: its commits are durable, then visible.
+  /\ synced' = IF what[u] \in Rounds THEN synced \cup {what[u]} ELSE synced
   \* Applied and published only after the fsync.
-  /\ visible' = IF what[u] \in Groups THEN visible \cup {what[u]} ELSE visible
-  \* The bug readies each registered member's ticket on this thread.
-  /\ IF Mutant = "DeliverOnLander" /\ what[u] \in Groups /\ state[u] = "claimed"
-       \* Every registered member's wait is ready now, made so by t.
+  /\ visible' = IF what[u] \in Rounds THEN visible \cup {what[u]} ELSE visible
+  \* The bug readies each registered commit's ticket on this thread.
+  /\ IF Mutant = "DeliverOnLander" /\ what[u] \in Rounds /\ state[u] = "claimed"
+       \* Every registered commit's wait is ready now, made so by t.
        THEN /\ Ready(regd[u], what[u])
             \* Ghost: each of those, not t, was readied off its own poll.
             /\ offPoll' = offPoll \cup {<<q, what[u]>> : q \in regd[u] \ {t}}
-       \* The real code: readiness comes only at each member's poll.
+       \* The real code: readiness comes only at each commit's own queue's poll.
        ELSE UNCHANGED <<slot, offPoll>>
   \* Nothing else changes.
   /\ UNCHANGED <<what, regd, told, next, inbox, idleFlag, taken, waiting,
                  attached, have, done, started, own, woken, checking, closedDb>>
   \* The rest of the commit side is untouched.
-  /\ UNCHANGED <<gunit, joined, stalled, spc>>
+  /\ UNCHANGED <<roundUnit, joined, stalled, spc>>
+  \* No timed wait is touched.
+  /\ UNCHANGED timerVars
 
 \* The finishing thread puts the "done" note for u into queue q's inbox:
 \* one push per queue it took off the waiter list.
@@ -957,6 +1106,8 @@ Tell(u, q) ==
                  own, checking, closedDb>>
   \* The commit side is untouched.
   /\ UNCHANGED commitVars
+  \* No timed wait is touched.
+  /\ UNCHANGED timerVars
 
 -----------------------------------------------------------------------------
 \* GOING IDLE AND WAKING UP (IoQueue::idle_waker, QueueShared::rest)
@@ -977,6 +1128,9 @@ Rest(t) ==
   /\ \A u \in waiting[t] : state[u] # "free" \/ Passive(u)
   \* Its inbox is empty (the CAS checks this).
   /\ inbox[t] = <<>>
+  \* No timed wait it holds is due: with one due it is woken at once
+  \* instead, to poll and complete it (IoQueue::idle_waker).
+  /\ \A x \in timed[t] : x \notin elapsed
   \* Not already half way into going idle.
   /\ ~checking[t]
   \* How the owner goes idle depends on the bug:
@@ -997,6 +1151,8 @@ Rest(t) ==
                  done, started, woken, closedDb>>
   \* The commit side is untouched.
   /\ UNCHANGED commitVars
+  \* No timed wait is touched.
+  /\ UNCHANGED timerVars
 
 \* Bug LostIdleWakeup, second half: mark idle without looking again. A note
 \* pushed between the look and this mark saw no IDLE bit and woke nobody.
@@ -1015,6 +1171,8 @@ MarkIdle(t) ==
                  done, started, woken, closedDb>>
   \* The commit side is untouched.
   /\ UNCHANGED commitVars
+  \* No timed wait is touched.
+  /\ UNCHANGED timerVars
 
 \* An idle owner whose waker fired runs again.
 Wake(t) ==
@@ -1032,6 +1190,8 @@ Wake(t) ==
                  slot, have, done, started, checking, closedDb>>
   \* The commit side is untouched.
   /\ UNCHANGED commitVars
+  \* No timed wait is touched.
+  /\ UNCHANGED timerVars
 
 \* An idle owner runs again on its own (its executor got other work) and
 \* polls, which clears IDLE first (QueueShared::wake_up). Bug BusyWoken
@@ -1051,6 +1211,160 @@ SelfWake(t) ==
                  done, started, checking, closedDb>>
   \* The commit side is untouched.
   /\ UNCHANGED commitVars
+  \* No timed wait is touched.
+  /\ UNCHANGED timerVars
+
+-----------------------------------------------------------------------------
+\* TIMED WAITS (IoRuntime::timer, IoQueue::fire_timers, Drop for IoQueue)
+\*
+\* A task that must wait a while without blocking asks its queue for a timed
+\* wait. Nobody is woken for one and nothing sleeps for one: the owner's
+\* poll completes it once the clock has reached its due time, and each poll
+\* tells the owner how long it may idle until the next one is due
+\* (IoProgress::wake_in). The clock is not a number here: `elapsed` holds
+\* the waits whose due time has passed.
+
+\* Thread t asks its queue for timed wait x (IoRuntime::timer): a "timer"
+\* note goes to the queue's inbox, as any request does, and the task waits.
+\* On a dropped queue nothing would ever complete the wait, so it comes back
+\* ready. Bug WrongQueue puts the note on the other thread's queue.
+AskTimer(t, x) ==
+  \* The queue the note goes to: t's own, unless the WrongQueue bug.
+  LET q == IF Mutant = "WrongQueue" THEN Other(t) ELSE t
+  \* With that name, the step is:
+  IN
+  \* Only a running thread asks.
+  /\ own[t] = "busy"
+  \* The wait is t's, and t's task has not been through it yet.
+  /\ TimerOf[x] = t /\ x \notin done[t]
+  \* It is not asked for already.
+  /\ slot[t][x] = "none"
+  \* What happens depends on whether the queue is still there:
+  /\ IF t \in dropped
+       \* Gone: the wait is ready at once, on the asker's own thread.
+       THEN /\ slot' = [slot EXCEPT ![t][x] = "ready"]
+            \* Nothing is pushed anywhere.
+            /\ UNCHANGED <<inbox, idleFlag, woken>>
+       \* There: the note goes to the queue, waking an idle owner once.
+       ELSE /\ Push(q, [kind |-> "timer", u |-> x, reader |-> t])
+            \* The task waits.
+            /\ slot' = [slot EXCEPT ![t][x] = "pending"]
+  \* Nothing else changes.
+  /\ UNCHANGED <<table, what, state, outcome, waiters, shut, regd, runners, runs,
+                 toTell, told, next, taken, waiting, attached, have, done,
+                 started, own, checking, closedDb>>
+  \* The commit side is untouched.
+  /\ UNCHANGED commitVars
+  \* No held wait, the clock, or a dropped queue changes.
+  /\ UNCHANGED timerVars
+
+\* The clock reaches timed wait x's due time. The due time is fixed when the
+\* wait is asked for and lies after that moment, so only a wait asked for
+\* and not yet completed comes due.
+Elapse(x) ==
+  \* The wait is asked for and still pending.
+  /\ slot[TimerOf[x]][x] = "pending"
+  \* Its due time has not passed yet.
+  /\ x \notin elapsed
+  \* Now it has.
+  /\ elapsed' = elapsed \cup {x}
+  \* Nothing else changes.
+  /\ UNCHANGED <<table, what, state, outcome, waiters, shut, regd, runners, runs,
+                 toTell, told, next, inbox, idleFlag, taken, waiting, attached,
+                 slot, have, done, started, own, woken, checking, closedDb>>
+  \* The commit side is untouched.
+  /\ UNCHANGED commitVars
+  \* No held wait and no dropped queue changes.
+  /\ UNCHANGED <<timed, dropped>>
+
+\* The owner's poll completes timed wait x, which it holds and which is due
+\* (IoQueue::fire_timers, the last thing a poll does, after the inbox was
+\* taken in whole). Bug EarlyFire does not look at the clock.
+Fire(t, x) ==
+  \* Only a running owner polls.
+  /\ own[t] = "busy"
+  \* The owner holds the wait.
+  /\ x \in timed[t]
+  \* Every note the poll took is handled.
+  /\ taken[t] = <<>>
+  \* The clock reached the due time (the bug does not ask).
+  /\ x \in elapsed \/ Mutant = "EarlyFire"
+  \* The owner no longer holds it.
+  /\ timed' = [timed EXCEPT ![t] = @ \ {x}]
+  \* The task that asked may run again (WaitSlot::complete).
+  /\ Ready({TimerOf[x]}, x)
+  \* Ghost: a wait made ready by a poll that is not its own thread's.
+  /\ offPoll' = IF TimerOf[x] = t THEN offPoll
+                                 \* Another thread's wait: readied off its poll.
+                                 ELSE offPoll \cup {<<TimerOf[x], x>>}
+  \* Nothing else changes.
+  /\ UNCHANGED <<table, what, state, outcome, waiters, shut, regd, runners, runs,
+                 toTell, told, next, inbox, idleFlag, taken, waiting, attached,
+                 have, done, started, own, woken, checking, closedDb>>
+  \* The rest of the commit side is untouched.
+  /\ UNCHANGED <<roundUnit, joined, synced, visible, stalled, spc>>
+  \* The clock and the dropped queues are untouched.
+  /\ UNCHANGED <<elapsed, dropped>>
+
+\* An idle owner that holds a due timed wait runs again: it idled no longer
+\* than its last poll said it might (IoProgress::wake_in; IoQueue::block_on
+\* parks for that long and no longer). Nobody pushes anything for a timed
+\* wait, so this is the one way out of idle a due wait gives. Like any poll
+\* it clears IDLE first. Bug IdlePastDue is an owner that ignores what its
+\* poll said and stays idle.
+TimerWake(t) ==
+  \* It was asleep.
+  /\ own[t] = "idle"
+  \* A timed wait it holds is due.
+  /\ \E x \in timed[t] : x \in elapsed
+  \* The owner follows what its poll reported (the bug does not).
+  /\ Mutant # "IdlePastDue"
+  \* It runs.
+  /\ own' = [own EXCEPT ![t] = "busy"]
+  \* Its poll clears IDLE.
+  /\ idleFlag' = [idleFlag EXCEPT ![t] = FALSE]
+  \* A wake that fired meanwhile is used up by this run.
+  /\ woken' = [woken EXCEPT ![t] = FALSE]
+  \* Nothing else changes.
+  /\ UNCHANGED <<table, what, state, outcome, waiters, shut, regd, runners, runs,
+                 toTell, told, next, inbox, taken, waiting, attached, slot, have,
+                 done, started, checking, closedDb>>
+  \* The commit side is untouched.
+  /\ UNCHANGED commitVars
+  \* No timed wait is touched.
+  /\ UNCHANGED timerVars
+
+\* Thread t drops its queue (Drop for IoQueue). Nothing would ever complete
+\* a timed wait recorded on it, so the drop completes every one: those the
+\* owner holds (Timers::complete_all) and those still a note in the inbox.
+\* Bug DropForgets leaves them pending.
+DropQueue(t) ==
+  \* The thread may drop its queue, and has not.
+  /\ t \in Droppers \ dropped
+  \* The owner drops it, on its own thread, while running.
+  /\ own[t] = "busy"
+  \* The queue is gone.
+  /\ dropped' = dropped \cup {t}
+  \* Every timed wait of t that is pending is ready (the bug forgets them).
+  /\ slot' = [slot EXCEPT ![t] =
+                [x \in Things |-> IF x \in Timers /\ slot[t][x] = "pending"
+                                     /\ Mutant # "DropForgets"
+                                  THEN "ready" ELSE slot[t][x]]]
+  \* The owner holds none any more.
+  /\ timed' = [timed EXCEPT ![t] = {}]
+  \* Its inbox is emptied: only "timer" notes were in it, since a thread
+  \* that may drop its queue has no other wait.
+  /\ inbox' = [inbox EXCEPT ![t] = <<>>]
+  \* So are the notes it had taken.
+  /\ taken' = [taken EXCEPT ![t] = <<>>]
+  \* Nothing else changes.
+  /\ UNCHANGED <<table, what, state, outcome, waiters, shut, regd, runners, runs,
+                 toTell, told, next, idleFlag, waiting, attached, have, done,
+                 started, own, woken, checking, closedDb>>
+  \* The commit side is untouched.
+  /\ UNCHANGED commitVars
+  \* The clock is untouched.
+  /\ UNCHANGED elapsed
 
 -----------------------------------------------------------------------------
 \* CLOSE (RegolithEngine::close -> IoRuntime::close)
@@ -1058,9 +1372,12 @@ SelfWake(t) ==
 \* Close marks the gate (CloseGate::close), then sweeps the table. A miss
 \* already counted in when the mark lands releases its own unit when it
 \* counts itself out (CloseGate::leave), so Release below stands for the
-\* sweep and for that miss alike, and no unit outlives close. The loom model
-\* no_unit_outlives_close checks the gate itself, with a calibration that
-\* checks for close only when the miss starts and leaves a unit behind.
+\* sweep and for that miss alike. Close does not wait for that miss: the
+\* promise is that once close has returned and the miss has ended, no unit
+\* is left in the table. The loom model no_unit_outlives_close checks the
+\* gate itself at that boundary, witnesses that close can return with the
+\* unit still in the table, and has a calibration that checks for close
+\* only when the miss starts and leaves a unit behind.
 
 \* The database closes. Reads run after this answer Closed.
 Close ==
@@ -1074,12 +1391,14 @@ Close ==
                  slot, have, done, started, own, woken, checking>>
   \* The commit side is untouched.
   /\ UNCHANGED commitVars
+  \* No timed wait is touched.
+  /\ UNCHANGED timerVars
 
 \* Close lets a free unit in the table go without reading it: it claims it
 \* (so no runner can) and finishes it as "released", telling every
 \* registered queue. A unit someone is running finishes on its own. A
-\* group's unit is the exception: close lands it, running its fsync (the
-\* final sync covers it, so every member's ticket says committed); a stall's
+\* round's unit is the exception: close lands it, running its fsync (the
+\* final sync covers it, so every waiting commit's ticket says committed); a stall's
 \* unit lands too (close tells every stopped writer).
 Release(u) ==
   \* The database is closing.
@@ -1088,15 +1407,15 @@ Release(u) ==
   /\ state[u] = "free" /\ table[what[u]] = u
   \* u ends here.
   /\ state' = [state EXCEPT ![u] = "done"]
-  \* A block or job read nothing; a group or a stall landed.
-  /\ outcome' = [outcome EXCEPT ![u] = IF what[u] \in Groups \cup Stalls
+  \* A block or job read nothing; a round or a stall landed.
+  /\ outcome' = [outcome EXCEPT ![u] = IF what[u] \in Rounds \cup Stalls
                                          THEN "landed" ELSE "released"]
-  \* A group's fsync ran once, here.
-  /\ runs' = IF what[u] \in Groups THEN [runs EXCEPT ![u] = @ + 1] ELSE runs
-  \* So the group is durable...
-  /\ synced' = IF what[u] \in Groups THEN synced \cup {what[u]} ELSE synced
+  \* A round's fsync ran once, here.
+  /\ runs' = IF what[u] \in Rounds THEN [runs EXCEPT ![u] = @ + 1] ELSE runs
+  \* So the round's commits are durable...
+  /\ synced' = IF what[u] \in Rounds THEN synced \cup {what[u]} ELSE synced
   \* ...and then visible.
-  /\ visible' = IF what[u] \in Groups THEN visible \cup {what[u]} ELSE visible
+  /\ visible' = IF what[u] \in Rounds THEN visible \cup {what[u]} ELSE visible
   \* Its waiter list is shut.
   /\ shut' = [shut EXCEPT ![u] = TRUE]
   \* Every registered queue is owed a note.
@@ -1110,7 +1429,9 @@ Release(u) ==
                  waiting, attached, slot, have, done, started, own, woken,
                  checking, closedDb>>
   \* The rest of the commit side is untouched.
-  /\ UNCHANGED <<gunit, joined, offPoll, stalled, spc>>
+  /\ UNCHANGED <<roundUnit, joined, offPoll, stalled, spc>>
+  \* No timed wait is touched.
+  /\ UNCHANGED timerVars
 
 -----------------------------------------------------------------------------
 \* THE WHOLE SYSTEM
@@ -1124,10 +1445,10 @@ ThreadStep(t) ==
   \* A job regolith starts on t's call.
   \/ \E j \in Jobs : SelfStart(t, j)
   \* A commit_nowait returns.
-  \/ \E g \in Groups : CommitNowait(t, g)
+  \/ \E r \in Rounds : CommitNowait(t, r)
   \* A commit_nowait after close is refused.
-  \/ \E g \in Groups : CommitClosed(t, g)
-  \* t takes the pipeline and lands an owed group.
+  \/ \E r \in Rounds : CommitClosed(t, r)
+  \* t, not polling, runs a round nobody runs.
   \/ \E u \in Ids : LandHere(t, u)
   \* A write runs, or meets a stall.
   \/ \E s \in Stalls : WriteTry(t, s)
@@ -1151,11 +1472,21 @@ ThreadStep(t) ==
   \/ MarkIdle(t)
   \* A woken owner runs.
   \/ Wake(t)
+  \* A task asks for a timed wait.
+  \/ \E x \in Timers : AskTimer(t, x)
+  \* The poll completes a due timed wait.
+  \/ \E x \in Timers : Fire(t, x)
+  \* An idle owner runs again for a due timed wait.
+  \/ TimerWake(t)
+  \* The owner drops its queue.
+  \/ DropQueue(t)
 
 \* Every possible step.
 Next ==
   \* Some thread steps.
   \/ \E t \in Threads : ThreadStep(t)
+  \* The clock reaches a timed wait's due time.
+  \/ \E x \in Timers : Elapse(x)
   \* An owner wakes on its own.
   \/ \E t \in Threads : SelfWake(t)
   \* A finisher tells a queue.
@@ -1168,8 +1499,8 @@ Next ==
   \/ \E s \in Stalls : Clear(s)
 
 \* The behaviours: start at Init, take Next steps, and never stop a step
-\* that stays possible (weak fairness). An owner waking on its own and
-\* close are not forced: liveness must not lean on them.
+\* that stays possible (weak fairness). An owner waking on its own, close
+\* and the drop of a queue are not forced: liveness must not lean on them.
 Spec ==
   \* Start.
   /\ Init
@@ -1184,9 +1515,9 @@ Spec ==
        \* Its jobs.
        /\ WF_vars(\E j \in Jobs : SelfStart(t, j))
        \* Its commits.
-       /\ WF_vars(\E g \in Groups : CommitNowait(t, g))
+       /\ WF_vars(\E r \in Rounds : CommitNowait(t, r))
        \* Its commits refused after close.
-       /\ WF_vars(\E g \in Groups : CommitClosed(t, g))
+       /\ WF_vars(\E r \in Rounds : CommitClosed(t, r))
        \* Its writes.
        /\ WF_vars(\E s \in Stalls : WriteTry(t, s))
        \* Its stopped writes' registrations.
@@ -1207,6 +1538,15 @@ Spec ==
        /\ WF_vars(Wake(t))
        \* The bug's second half (the real code has none).
        /\ WF_vars(MarkIdle(t))
+       \* Asking for its timed waits.
+       /\ WF_vars(\E x \in Timers : AskTimer(t, x))
+       \* Completing the due timed waits it holds.
+       /\ WF_vars(\E x \in Timers : Fire(t, x))
+       \* Running again when a timed wait it holds is due: the owner polls
+       \* again within what its last poll reported.
+       /\ WF_vars(TimerWake(t))
+  \* Time passes: every timed wait asked for comes due in the end.
+  /\ \A x \in Timers : WF_vars(Elapse(x))
   \* Every finisher tells every queue it owes.
   /\ \A u \in Ids : WF_vars(\E q \in Threads : Tell(u, q))
   \* Close, once it began, lets every free unit go.
@@ -1239,14 +1579,20 @@ TypeOK ==
   /\ slot \in [Threads -> [Things -> {"none", "pending", "ready"}]]
   \* Owners are busy or idle.
   /\ own \in [Threads -> {"busy", "idle"}]
-  \* Each group has a unit, or none yet.
-  /\ gunit \in [Groups -> Ids \cup {NoUnit}]
-  \* Synced and visible groups are groups.
-  /\ synced \subseteq Groups /\ visible \subseteq Groups
+  \* Each round has a unit, or none yet.
+  /\ roundUnit \in [Rounds -> Ids \cup {NoUnit}]
+  \* Synced and visible rounds are rounds.
+  /\ synced \subseteq Rounds /\ visible \subseteq Rounds
   \* Stalls in force are stalls.
   /\ stalled \subseteq Stalls
   \* Stopped writes are in one of three places.
   /\ spc \in [Threads -> [Stalls -> {"none", "seen", "recheck"}]]
+  \* The waits an owner holds are timed waits.
+  /\ timed \in [Threads -> SUBSET Timers]
+  \* The waits that are due are timed waits.
+  /\ elapsed \subseteq Timers
+  \* The dropped queues are threads' queues.
+  /\ dropped \subseteq Threads
 
 \* A unit's disk read runs at most once: one claim, one run.
 \* Rules out: A and B both claiming block 7's unit and reading it twice.
@@ -1309,15 +1655,15 @@ NoOrphanUnit ==
       \* ...some queue holds it.
       Held(table[x])
 
-\* A group is visible only once its fsync ran: an Immediate commit a
-\* reader saw survives a power cut.
-\* Rules out: group 4 visible as soon as its leader wrote it, before the
-\* fsync a member's poll will run.
+\* A round's commits are visible only once its fsync ran: an Immediate
+\* commit a reader saw survives a power cut.
+\* Rules out: the commits of round 4 visible as soon as they are written,
+\* before the fsync a queue's poll will run.
 VisibleAfterSync == visible \subseteq synced
 
 \* A ticket (any wait) becomes ready only at its own thread's poll: no
 \* other thread's step makes it ready.
-\* Rules out: B landing group 4 and making A's ticket ready on B's thread,
+\* Rules out: B running round 4 and making A's ticket ready on B's thread,
 \* running A's callbacks there, while A is busy.
 DeliveredOnOwnPoll == offPoll = {}
 
@@ -1333,9 +1679,44 @@ StallLandsWhenClear ==
       \* ...some writer has registered and is about to look again.
       \E t \in Threads : spc[t][s] = "recheck"
 
-\* Over a whole run: every thread's reads, jobs, commits and writes all
-\* finish. With one thread this is the wasm case: it finishes everything
-\* by itself.
+\* A timed wait's note and its record sit only on the queue of the thread
+\* that asked for it, so only that thread's poll completes it.
+\* Rules out: A's backoff recorded on B's queue and ended by B's poll, on
+\* B's thread.
+TimerOnOwnQueue ==
+  \* On every queue:
+  \A q \in Threads :
+    \* every "timer" note in the inbox is for a wait of q's own thread...
+    /\ \A i \in 1..Len(inbox[q]) : inbox[q][i].kind = "timer" => TimerOf[inbox[q][i].u] = q
+    \* ...so is every one being handled...
+    /\ \A i \in 1..Len(taken[q]) : taken[q][i].kind = "timer" => TimerOf[taken[q][i].u] = q
+    \* ...and so is every wait the owner holds.
+    /\ \A x \in timed[q] : TimerOf[x] = q
+
+\* A timed wait is ready only once the clock reached its due time, or its
+\* queue is gone.
+\* Rules out: a retry that asked to wait until its due time running again
+\* at the very next poll.
+TimerNotEarly ==
+  \* For every timed wait:
+  \A x \in Timers :
+    \* ready means due, or dropped with its queue.
+    slot[TimerOf[x]][x] = "ready" => (x \in elapsed \/ TimerOf[x] \in dropped)
+
+\* A dropped queue holds no timed wait and leaves none pending.
+\* Rules out: a task waiting for ever on a wait whose queue is gone, which
+\* no poll will ever look at.
+DroppedHoldsNothing ==
+  \* For every dropped queue:
+  \A t \in dropped :
+    \* the owner holds no wait...
+    /\ timed[t] = {}
+    \* ...and no timed wait of its thread is still pending.
+    /\ \A x \in Timers : slot[t][x] # "pending"
+
+\* Over a whole run: every thread's reads, jobs, commits, writes and timed
+\* waits all finish. With one thread this is the wasm case: it finishes
+\* everything by itself.
 AllDone == <>(\A t \in Threads : done[t] = Goal(t))
 
 -----------------------------------------------------------------------------
@@ -1359,15 +1740,23 @@ WantSingleOne == [t \in {1} |-> {1}]
 WantSingle == [t \in {1} |-> {1, 2}]
 \* Job 3 belongs to the one thread.
 JobOfSingle == [j \in {3} |-> 1]
-\* No groups in a setup.
-MembersNone == [g \in {} |-> {}]
+\* No rounds in a setup.
+CommittersNone == [r \in {} |-> {}]
 \* No stalls in a setup.
 StoppedNone == [s \in {} |-> {}]
 \* No reads in a setup.
 WantNone == [t \in {1, 2} |-> {}]
-\* Group 4 has members on threads 1 and 2.
-MembersBoth == [g \in {4} |-> {1, 2}]
+\* Round 4 covers a commit of thread 1 and one of thread 2.
+CommittersBoth == [r \in {4} |-> {1, 2}]
 \* Stall 5 stops writes on threads 1 and 2.
 StoppedBoth == [s \in {5} |-> {1, 2}]
+\* No timed waits in a setup.
+TimerOfNone == [x \in {} |-> 1]
+\* Timed wait 6 is thread 1's.
+TimerOfOne == [x \in {6} |-> 1]
+\* Timed wait 6 is thread 1's and timed wait 7 is thread 2's.
+TimerOfEach == [x \in {6, 7} |-> IF x = 6 THEN 1 ELSE 2]
+\* One thread that reads nothing.
+WantSingleNone == [t \in {1} |-> {}]
 
 ====

@@ -1,6 +1,7 @@
 //! Public-API coverage for the zero-copy read surface: `get_slice`,
 //! its column-family and snapshot variants, and the lifetime guarantee
 //! that a returned slice keeps its owner alive.
+#![cfg(not(target_arch = "wasm32"))]
 
 use std::collections::HashSet;
 

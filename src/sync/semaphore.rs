@@ -59,7 +59,9 @@ impl Semaphore {
             .then(|| SemaphorePermit { sem: self, n })
     }
 
-    /// Waits for `n` permits.
+    /// Waits for `n` permits. Uncontended, the first poll is one atomic
+    /// read-modify-write. Contended, it is lock-free, not wait-free: see
+    /// [Progress](super#progress).
     ///
     /// # Panics
     ///
@@ -89,7 +91,8 @@ impl Semaphore {
         }
     }
 
-    /// Adds `n` permits, handing them to waiters first.
+    /// Adds `n` permits, handing them to waiters first. It makes the
+    /// progress a returned permit does (see [`SemaphorePermit`]).
     ///
     /// # Panics
     ///
@@ -109,6 +112,11 @@ impl fmt::Debug for Semaphore {
 }
 
 /// Permits taken from a [`Semaphore`], returned when dropped.
+///
+/// The release is one atomic read-modify-write when no waiter needs telling.
+/// Otherwise it is lock-free, not wait-free: it returns after one pass over
+/// the queue, plus at most one for each operation of another thread that
+/// lands on the queue meanwhile (see [Progress](super#progress)).
 #[must_use = "dropping a permit returns it at once"]
 pub struct SemaphorePermit<'a> {
     sem: &'a Semaphore,
@@ -141,7 +149,8 @@ impl fmt::Debug for SemaphorePermit<'_> {
     }
 }
 
-/// Permits taken from a [`Semaphore`] held through an `Arc`.
+/// Permits taken from a [`Semaphore`] held through an `Arc`. The release
+/// makes the progress [`SemaphorePermit`]'s does.
 #[must_use = "dropping a permit returns it at once"]
 pub struct OwnedSemaphorePermit {
     sem: Arc<Semaphore>,

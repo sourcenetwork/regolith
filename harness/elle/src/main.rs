@@ -7,6 +7,7 @@ mod faults;
 mod history;
 mod list;
 mod model;
+mod parts;
 mod runner;
 mod verify;
 
@@ -38,11 +39,12 @@ fn dispatch(cfg: &Config) -> Result<(), String> {
 
     let count = runner::run(cfg)?;
     eprintln!(
-        "wrote {} operations to {} (model {}, isolation {})",
+        "wrote {} operations to {} (model {}, isolation {}, shape {})",
         count,
         cfg.out.display(),
         cfg.model.as_str(),
-        cfg.isolation.as_str()
+        cfg.isolation.as_str(),
+        cfg.shape.as_str()
     );
     report_verification(&verify::verify(&cfg.out, cfg.model)?)
 }

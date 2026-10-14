@@ -18,16 +18,16 @@
 //!
 //! # Atomicity
 //!
-//! The implementation briefly holds the engine write-lock to flush
-//! the active memtable into an L0 SSTable and compact the live
-//! manifest. The lock is released before any files are linked.
-//! Because the captured version pins every referenced SSTable
-//! against concurrent compaction reclamation, writers running in
-//! parallel with [`Checkpoint::create`] cannot race a file unlink or
-//! tear the checkpoint.
+//! The job first drains the memtables into L0 tables, with nothing
+//! held that compaction needs. It then holds the compaction gate alone
+//! while it rewrites the manifest, captures the version and links the
+//! tables that version names, so no compaction can unlink one of them
+//! under the links. Writers run in parallel throughout: what they write
+//! after the drain is not in the checkpoint, and cannot tear it.
 
 use std::path::Path;
 
+use crate::engine::compaction_gate::Exclusive;
 use crate::engine::{CheckpointSnapshot, RegolithEngine};
 use crate::env::{Env, WriteMode};
 use crate::{Db, Error, JobTicket, Result};
@@ -35,7 +35,7 @@ use crate::{Db, Error, JobTicket, Result};
 /// A handle to a [`Db`] prepared for checkpointing. The handle itself
 /// captures no engine state - the actual flush, version snapshot,
 /// and filesystem work all happen inside [`Checkpoint::create`] under
-/// a single held compaction lock, so dropping the `Checkpoint`
+/// a single held compaction gate, so dropping the `Checkpoint`
 /// without calling `create` is free.
 pub struct Checkpoint<'db> {
     db: &'db Db,
@@ -60,7 +60,7 @@ impl<'db> Checkpoint<'db> {
     /// 4. Hard-links every captured SSTable into `target_dir/sst/`.
     /// 5. Copies the compacted manifest into `target_dir/MANIFEST`.
     ///
-    /// The engine's compaction lock is held for steps 2-5 so no
+    /// The engine's compaction gate is held for steps 2-5 so no
     /// concurrent compaction can unlink a referenced file mid-copy.
     /// It is released as soon as the job finishes - so dropping the
     /// [`Checkpoint`] or the source [`Db`] after the ticket is ready cannot
@@ -92,40 +92,86 @@ impl<'db> Checkpoint<'db> {
     }
 }
 
-/// Create a checkpoint of `engine`'s database in `target_dir`: the work of a
-/// checkpoint job, on the thread that runs it.
-pub(crate) fn create(engine: &RegolithEngine, target_dir: &Path) -> Result<()> {
-    create_inner(engine, target_dir, || {})
+/// The first thing a checkpoint job does, on the thread that runs it: ready
+/// the target directory. The drain of the memtables, so that every write
+/// acknowledged so far is in a table, follows
+/// ([`RegolithEngine::checkpoint_drain`]), and then the gate.
+pub(crate) fn prepare_target(engine: &RegolithEngine, target_dir: &Path) -> Result<()> {
+    let target_sst = target_dir.join("sst");
+    let target_wal = target_dir.join("wal");
+
+    let env = engine.env();
+    env.create_dir_all(&target_sst).map_err(Error::from)?;
+    env.create_dir_all(&target_wal).map_err(Error::from)?;
+
+    // One entry is enough to know, so the walk stops at the first.
+    let occupied = env
+        .read_dir(&target_sst)
+        .and_then(|mut walk| walk.next().transpose())
+        .map_err(Error::from)?
+        .is_some();
+    if occupied {
+        return Err(Error::Io(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "checkpoint target sst directory is not empty",
+        )));
+    }
+    Ok(())
 }
 
+/// What a checkpoint does before it takes the compaction gate, waiting on
+/// this thread: [`prepare_target`], then the drain.
+#[cfg(test)]
+fn prepare(engine: &RegolithEngine, target_dir: &Path) -> Result<()> {
+    prepare_target(engine, target_dir)?;
+    engine.checkpoint_drain().map_err(Error::from)
+}
+
+/// What a checkpoint job does holding the compaction gate alone, after its
+/// drain: capture the version and its manifest, link every table it names
+/// into `target_dir`, and write the manifest there. The gate is released
+/// when this returns.
+///
+/// `after_capture` runs between the capture and the links. The capture is
+/// a section of the version store's step, and a queue's poll holds the step
+/// for it; this is where it gives the step back, so the links, which may
+/// copy whole tables, run with the step free.
+pub(crate) fn capture_into(
+    engine: &RegolithEngine,
+    gate: Exclusive,
+    target_dir: &Path,
+    after_capture: impl FnOnce(),
+) -> Result<()> {
+    capture_into_between(engine, gate, target_dir, after_capture)
+}
+
+/// A whole checkpoint on this thread, waiting here for the gate, with a hook
+/// between the capture and the copy.
+#[cfg(test)]
 fn create_inner(
     engine: &RegolithEngine,
     target_dir: &Path,
     after_capture: impl FnOnce(),
 ) -> Result<()> {
+    prepare(engine, target_dir)?;
+    let gate = engine.compaction_gate().exclusive().map_err(Error::from)?;
+    capture_into_between(engine, gate, target_dir, after_capture)
+}
+
+fn capture_into_between(
+    engine: &RegolithEngine,
+    gate: Exclusive,
+    target_dir: &Path,
+    after_capture: impl FnOnce(),
+) -> Result<()> {
     {
         let target_sst = target_dir.join("sst");
-        let target_wal = target_dir.join("wal");
-
         let env = engine.env();
-        env.create_dir_all(&target_sst).map_err(Error::from)?;
-        env.create_dir_all(&target_wal).map_err(Error::from)?;
 
-        if !env.read_dir(&target_sst).map_err(Error::from)?.is_empty() {
-            return Err(Error::Io(std::io::Error::new(
-                std::io::ErrorKind::AlreadyExists,
-                "checkpoint target sst directory is not empty",
-            )));
-        }
-
-        // `checkpoint_capture` holds the compaction lock for the
-        // lifetime of the returned snapshot, so the captured file
-        // set cannot be unlinked while we hard-link it. The
-        // snapshot is a local - it drops before `create` returns,
-        // releasing the lock without outlasting this function.
-        // Keeping the lock scoped this way is what lets a caller
-        // safely call `db.close()` or `drop(db)` after `create`.
-        let snapshot = engine.checkpoint_capture().map_err(Error::from)?;
+        // The snapshot holds the compaction gate for its lifetime, so the
+        // captured file set cannot be unlinked while it is hard-linked. It
+        // is a local: it drops before this returns, releasing the gate.
+        let snapshot = engine.checkpoint_capture(gate).map_err(Error::from)?;
         after_capture();
 
         for level in &snapshot.version.levels {
@@ -360,7 +406,7 @@ mod tests {
             db.put(format!("k{i:04}").as_bytes(), b"v").unwrap();
         }
 
-        let snapshot = db.engine().checkpoint_capture().unwrap();
+        let snapshot = db.engine().checkpoint_capture_here().unwrap();
         drop(snapshot);
 
         assert!(
@@ -373,7 +419,7 @@ mod tests {
     /// The manifest a checkpoint writes must describe exactly the
     /// SSTables it hardlinked.
     ///
-    /// The capture holds the compaction lock, but a concurrent flush
+    /// The capture holds the compaction gate, but a concurrent flush
     /// takes only the version lock, so it can append records naming
     /// files the checkpoint will not copy. Worse, the manifest is
     /// rewritten once it grows past a multiple of its canonical size, so
@@ -430,7 +476,7 @@ mod tests {
     /// A manifest rewrite landing between the capture and the copy must
     /// not change what the checkpoint writes.
     ///
-    /// The capture holds the compaction lock, but a flush takes only the
+    /// The capture holds the compaction gate, but a flush takes only the
     /// version lock, and a rewrite replaces the manifest file wholesale.
     /// Re-reading the path at copy time would then pick up a *different*
     /// manifest, and truncating it at a length measured against the old

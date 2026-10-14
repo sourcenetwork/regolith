@@ -1,8 +1,10 @@
 //! What transaction callbacks cost in allocations.
 //!
 //! A transaction that registered nothing, under a database with no hooks, must
-//! allocate nothing for them; one that registered a few allocates once, for
-//! the queue box, and only the fifth callback of a kind spills to the heap.
+//! allocate nothing for them; one that registered up to four of a kind, each
+//! capturing a few words, allocates nothing for them either (an `on_abort`
+//! callback needs the claim `close` shares), and only the fifth of a kind
+//! spills to the heap.
 //! Measured with a counting global allocator rather than a timer, so the
 //! numbers are exact and independent of machine load.
 
@@ -81,20 +83,21 @@ fn prepare_allocates_nothing_without_callbacks() {
     assert_eq!(allocations(|| txn.prepare().unwrap()), 0);
 }
 
+/// Plan 3.16 item 8: callbacks live in a small inline vector that allocates
+/// only from the fifth callback onward. Up to four of each kind, each
+/// capturing a few words, allocate nothing; the fifth of a kind spills.
 #[test]
-fn the_first_four_callbacks_of_a_kind_share_one_allocation() {
+fn the_first_four_callbacks_of_a_kind_allocate_nothing() {
     let (db, _dir) = open();
 
     let mut txn = db.begin(&TxnOptions::new());
-    let first = allocations(|| txn.on_commit(|_| {}));
-    let next_three = allocations(|| {
-        for _ in 0..3 {
+    let four = allocations(|| {
+        for _ in 0..4 {
             txn.on_commit(|_| {});
         }
     });
     let fifth = allocations(|| txn.on_commit(|_| {}));
-    assert_eq!(first, 1, "the queue box");
-    assert_eq!(next_three, 0, "the next three live in the box");
+    assert_eq!(four, 0, "four on_commit callbacks live in the transaction");
     assert!(fifth >= 1, "the fifth spills to the heap");
     // Dropping a transaction that registered only `on_commit` callbacks runs
     // none of them and needs no claim.
@@ -106,10 +109,47 @@ fn the_first_four_callbacks_of_a_kind_share_one_allocation() {
             txn.before_commit(|_| Ok(()));
         }
     });
-    assert_eq!(before, 1, "four before_commit callbacks, one allocation");
+    assert_eq!(before, 0, "four before_commit callbacks, no allocation");
     assert_eq!(
         allocations(|| txn.prepare().unwrap()),
         0,
         "running them allocates nothing"
     );
+}
+
+/// A closure that captures more than the few words a callback keeps in
+/// place is boxed on its own: one allocation, and the ones beside it still
+/// allocate nothing.
+#[test]
+fn a_callback_that_captures_much_is_boxed_on_its_own() {
+    let (db, _dir) = open();
+    let mut txn = db.begin(&TxnOptions::new());
+    let big = [7u64; 16];
+    let boxed = allocations(|| {
+        txn.on_commit(move |_| {
+            let _held = &big;
+        })
+    });
+    let small = allocations(|| txn.on_commit(|_| {}));
+    assert_eq!((boxed, small), (1, 0));
+}
+
+/// An `on_abort` callback is shared with `close`, which may run it from
+/// another thread, so it lives in the transaction's claim: the first
+/// registration makes the claim, and the next three live in it and
+/// allocate nothing. The fifth spills.
+#[test]
+fn the_first_on_abort_makes_the_claim_and_the_next_three_allocate_nothing() {
+    let (db, _dir) = open();
+    let mut txn = db.begin(&TxnOptions::new());
+    let first = allocations(|| txn.on_abort(|_| {}));
+    let next_three = allocations(|| {
+        for _ in 0..3 {
+            txn.on_abort(|_| {});
+        }
+    });
+    let fifth = allocations(|| txn.on_abort(|_| {}));
+    assert!(first >= 1, "the claim close finds the transaction by");
+    assert_eq!(next_three, 0, "the first four live in the claim");
+    assert!(fifth >= 1, "the fifth spills to the heap");
 }

@@ -131,6 +131,7 @@ theorem replay_opens_with_right_keys (p : Provider)
     (hpre : ∀ b ∈ pre, b.fate = .whole)
     -- The provider has every key the file names.
     (hkeys : ∀ b ∈ pre ++ rest, p.has b.key = true) :
+    -- The statement: the replay opens the file, and keeps at least as many batches as were synced.
     ∃ kept, replay p (pre ++ rest) = some kept ∧ pre.length ≤ kept := by
   -- Walk the synced batches one at a time.
   induction pre with
@@ -162,6 +163,7 @@ theorem replay_opens_with_right_keys (p : Provider)
     have hb : p.has b.key = true := hkeys b (List.mem_cons_self ..)
     -- The rest of the file opens keeping the rest of the synced batches.
     obtain ⟨k, hk, hlen⟩ := ih (fun c hc => hpre c (List.mem_cons_of_mem _ hc))
+      -- (and the provider has the key of every later batch).
       (fun c hc => hkeys c (List.mem_cons_of_mem _ hc))
     -- So this batch is kept too, one more than the rest keeps.
     refine ⟨k + 1, ?_, ?_⟩
@@ -233,6 +235,7 @@ theorem wrong_key_refuses (p : Provider) (b : Batch) (rest : List Batch)
     (hwrong : p.right = false)
     -- The batch is whole.
     (hw : b.fate = .whole) :
+    -- The statement: the replay refuses the file.
     replay p (b :: rest) = none := by
   -- Its checksum holds and its tag fails, so the replay refuses at it.
   simp [replay, checksumHolds, tagHolds, hw, hwrong]
@@ -244,6 +247,7 @@ theorem missing_key_refuses (p : Provider) (b : Batch) (rest : List Batch)
     (hmissing : p.has b.key = false)
     -- The batch is whole.
     (hw : b.fate = .whole) :
+    -- The statement: the replay refuses the file.
     replay p (b :: rest) = none := by
   -- Its checksum holds and its tag cannot, so the replay refuses at it.
   simp [replay, checksumHolds, tagHolds, hw, hmissing]

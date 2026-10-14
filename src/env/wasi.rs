@@ -49,7 +49,7 @@ use std::path::Path;
 
 use super::std_env::StdEnv;
 use super::{
-    Capabilities, DirEntry, Env, FileLock, FileMeta, JoinHandle, ReadFile, WriteFile, WriteMode,
+    Capabilities, Env, FileLock, FileMeta, JoinHandle, ReadDir, ReadFile, WriteFile, WriteMode,
 };
 
 /// The WASI host: `std::fs` over a preopened directory, with no
@@ -76,7 +76,7 @@ impl Env for WasiEnv {
         self.fs.create_dir_all(path)
     }
 
-    fn read_dir(&self, path: &Path) -> io::Result<Vec<DirEntry>> {
+    fn read_dir(&self, path: &Path) -> io::Result<ReadDir<'_>> {
         self.fs.read_dir(path)
     }
 
@@ -86,6 +86,10 @@ impl Env for WasiEnv {
 
     fn open_write(&self, path: &Path, mode: WriteMode) -> io::Result<Box<dyn WriteFile>> {
         self.fs.open_write(path, mode)
+    }
+
+    fn open_log(&self, path: &Path, mode: WriteMode) -> io::Result<Box<dyn super::LogFile>> {
+        self.fs.open_log(path, mode)
     }
 
     fn metadata(&self, path: &Path) -> io::Result<FileMeta> {

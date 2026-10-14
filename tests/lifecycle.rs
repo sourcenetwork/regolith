@@ -15,6 +15,7 @@
 //!
 //! The upgrade-path half - reopening a populated database under changed
 //! [`Options`] - lives in the [`options`] submodule.
+#![cfg(not(target_arch = "wasm32"))]
 
 mod common;
 

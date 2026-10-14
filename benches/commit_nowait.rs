@@ -22,8 +22,8 @@
 mod common;
 
 use std::collections::VecDeque;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Barrier};
 use std::time::{Duration, Instant};
 
 use regolith::{
@@ -68,11 +68,11 @@ fn env_u64(name: &str, default: u64) -> u64 {
 }
 
 /// A memtable large enough that a repetition never rotates, so the number is
-/// the commit path and not a flush.
+/// the commit path and not a flush; each repetition checks that it did not.
 fn opts(durability: DurabilityMode) -> Options {
     common::default_opts()
         .durability(durability)
-        .write_buffer_size(256 * 1024 * 1024)
+        .write_buffer_size(1 << 30)
         .block_cache_size(8 * 1024 * 1024)
         .block_cache_num_shard_bits(0)
 }
@@ -165,12 +165,12 @@ fn run_rep(durability: DurabilityMode, mode: Mode, writers: usize, dur: Duration
         OptimisticTransactionDb::open(tmp.path(), opts(durability))
             .unwrap_or_else(|e| panic!("open db at {}: {e}", tmp.path().display())),
     );
-    let barrier = Arc::new(Barrier::new(writers + 1));
+    let line = Arc::new(common::start::StartLine::new(writers));
     let committed = Arc::new(AtomicU64::new(0));
     let mut handles = Vec::with_capacity(writers);
     for w in 0..writers {
         let db = Arc::clone(&db);
-        let barrier = Arc::clone(&barrier);
+        let line = Arc::clone(&line);
         let committed = Arc::clone(&committed);
         handles.push(std::thread::spawn(move || {
             let mut rng = common::Rng::new(0x0C0_17A1 ^ w as u64);
@@ -189,8 +189,7 @@ fn run_rep(durability: DurabilityMode, mode: Mode, writers: usize, dur: Duration
             writer.drain(&mut warmup);
             // Sized for a fast run so the measured loop does not reallocate.
             let mut latencies: Vec<u32> = Vec::with_capacity(1 << 16);
-            barrier.wait();
-            let deadline = Instant::now() + dur;
+            let deadline = line.wait() + dur;
             let first = writer.next;
             while Instant::now() < deadline {
                 writer.one(mode, &mut latencies);
@@ -200,8 +199,7 @@ fn run_rep(durability: DurabilityMode, mode: Mode, writers: usize, dur: Duration
             latencies
         }));
     }
-    barrier.wait();
-    let start = Instant::now();
+    let start = line.start();
     let mut latencies: Vec<u32> = Vec::new();
     for h in handles {
         latencies.extend(h.join().expect("writer thread panicked"));
@@ -209,6 +207,10 @@ fn run_rep(durability: DurabilityMode, mode: Mode, writers: usize, dur: Duration
     let elapsed = start.elapsed().as_secs_f64();
     latencies.sort_unstable();
     let commits = committed.load(Ordering::Relaxed) as f64;
+    assert!(
+        !common::rotated(db.db()),
+        "a memtable was sealed inside a timed repetition: raise write_buffer_size so every row times the write path alone"
+    );
     db.db().close().expect("close db");
     drop(db);
     drop(tmp);

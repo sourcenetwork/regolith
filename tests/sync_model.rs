@@ -23,6 +23,7 @@
 //!
 //! Single-threaded schedules cover the protocol's decisions; the loom
 //! models in `tests/loom_sync.rs` cover the interleavings.
+#![cfg(not(target_arch = "wasm32"))]
 
 use std::collections::VecDeque;
 use std::future::Future;

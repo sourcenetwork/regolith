@@ -79,61 +79,74 @@ fn open_pair(
 }
 
 fn callback_commits(per_op: PerOp<'_>, report: Report<'_>) {
-    let (opt, _, _dirs) = open_pair("callbacks", Options::default());
-    report(
-        "commit, one on_commit, write, optimistic",
-        per_op(&mut |n| {
-            let mut txn = opt.begin(&TxnOptions::new());
-            txn.put(b"k", &n.to_le_bytes()).expect("put");
-            txn.on_commit(|receipt| {
-                std::hint::black_box(receipt.seq());
-            });
-            txn.commit().expect("commit");
-        }),
-    );
-    report(
-        "commit, one on_commit, read-only, optimistic",
-        per_op(&mut |_| {
-            let mut txn = opt.begin(&TxnOptions::new());
-            txn.get(b"seed").expect("get");
-            txn.on_commit(|receipt| {
-                std::hint::black_box(receipt.seq());
-            });
-            txn.commit().expect("commit");
-        }),
-    );
-    report(
-        "commit, one before_commit, write, optimistic",
-        per_op(&mut |n| {
-            let mut txn = opt.begin(&TxnOptions::new());
-            txn.put(b"k", &n.to_le_bytes()).expect("put");
-            txn.before_commit(|_| Ok(()));
-            txn.commit().expect("commit");
-        }),
-    );
-    report(
-        "commit, one on_abort (tracked), write, optimistic",
-        per_op(&mut |n| {
-            let mut txn = opt.begin(&TxnOptions::new());
-            txn.put(b"k", &n.to_le_bytes()).expect("put");
-            txn.on_abort(|reason| {
-                std::hint::black_box(reason);
-            });
-            txn.commit().expect("commit");
-        }),
-    );
-    let (hooked, _, _dirs) = open_pair(
-        "hooked",
-        Options::default().transaction_hooks(Arc::new(CountingHook)),
-    );
-    report(
-        "commit, database hook, write, optimistic",
-        per_op(&mut |n| {
-            let txn = hooked.begin(&TxnOptions::new());
-            txn.put(b"k", &n.to_le_bytes()).expect("put");
-            txn.commit().expect("commit");
-        }),
-    );
+    {
+        let (opt, _, _dirs) = open_pair("on-commit-write", Options::default());
+        report(
+            "commit, one on_commit, write, optimistic",
+            per_op(&mut |n| {
+                let mut txn = opt.begin(&TxnOptions::new());
+                txn.put(b"k", &n.to_le_bytes()).expect("put");
+                txn.on_commit(|receipt| {
+                    std::hint::black_box(receipt.seq());
+                });
+                txn.commit().expect("commit");
+            }),
+        );
+    }
+    {
+        let (opt, _, _dirs) = open_pair("on-commit-read", Options::default());
+        report(
+            "commit, one on_commit, read-only, optimistic",
+            per_op(&mut |_| {
+                let mut txn = opt.begin(&TxnOptions::new());
+                txn.get(b"seed").expect("get");
+                txn.on_commit(|receipt| {
+                    std::hint::black_box(receipt.seq());
+                });
+                txn.commit().expect("commit");
+            }),
+        );
+    }
+    {
+        let (opt, _, _dirs) = open_pair("before-commit", Options::default());
+        report(
+            "commit, one before_commit, write, optimistic",
+            per_op(&mut |n| {
+                let mut txn = opt.begin(&TxnOptions::new());
+                txn.put(b"k", &n.to_le_bytes()).expect("put");
+                txn.before_commit(|_| Ok(()));
+                txn.commit().expect("commit");
+            }),
+        );
+    }
+    {
+        let (opt, _, _dirs) = open_pair("on-abort", Options::default());
+        report(
+            "commit, one on_abort (tracked), write, optimistic",
+            per_op(&mut |n| {
+                let mut txn = opt.begin(&TxnOptions::new());
+                txn.put(b"k", &n.to_le_bytes()).expect("put");
+                txn.on_abort(|reason| {
+                    std::hint::black_box(reason);
+                });
+                txn.commit().expect("commit");
+            }),
+        );
+    }
+    {
+        let (hooked, _, _dirs) = open_pair(
+            "hooked",
+            Options::default().transaction_hooks(Arc::new(CountingHook)),
+        );
+        report(
+            "commit, database hook, write, optimistic",
+            per_op(&mut |n| {
+                let txn = hooked.begin(&TxnOptions::new());
+                txn.put(b"k", &n.to_le_bytes()).expect("put");
+                txn.commit().expect("commit");
+            }),
+        );
+    }
 }
 
 fn main() {
@@ -156,39 +169,51 @@ fn main() {
     };
 
     println!("txn callbacks: median microseconds per transaction");
-    let (opt, pes, _dirs) = open_pair("plain", Options::default());
-    report(
-        "commit, no callbacks, write, optimistic",
-        per_op(&mut |n| {
-            let txn = opt.begin(&TxnOptions::new());
-            txn.put(b"k", &n.to_le_bytes()).expect("put");
-            txn.commit().expect("commit");
-        }),
-    );
-    report(
-        "commit, no callbacks, write, pessimistic",
-        per_op(&mut |n| {
-            let txn = pes.begin(&TxnOptions::new());
-            txn.put(b"k", &n.to_le_bytes()).expect("put");
-            txn.commit().expect("commit");
-        }),
-    );
-    report(
-        "commit, no callbacks, read-only, optimistic",
-        per_op(&mut |_| {
-            let txn = opt.begin(&TxnOptions::new());
-            txn.get(b"seed").expect("get");
-            txn.commit().expect("commit");
-        }),
-    );
-    report(
-        "commit, no callbacks, read-only, pessimistic",
-        per_op(&mut |_| {
-            let txn = pes.begin(&TxnOptions::new());
-            txn.get(b"seed").expect("get");
-            txn.commit().expect("commit");
-        }),
-    );
+    // Every row on databases of its own: a row that wrote into the memtable
+    // another row then reads or writes would hand that row a bigger one.
+    {
+        let (opt, _, _dirs) = open_pair("plain-write", Options::default());
+        report(
+            "commit, no callbacks, write, optimistic",
+            per_op(&mut |n| {
+                let txn = opt.begin(&TxnOptions::new());
+                txn.put(b"k", &n.to_le_bytes()).expect("put");
+                txn.commit().expect("commit");
+            }),
+        );
+    }
+    {
+        let (_, pes, _dirs) = open_pair("plain-write", Options::default());
+        report(
+            "commit, no callbacks, write, pessimistic",
+            per_op(&mut |n| {
+                let txn = pes.begin(&TxnOptions::new());
+                txn.put(b"k", &n.to_le_bytes()).expect("put");
+                txn.commit().expect("commit");
+            }),
+        );
+    }
+    {
+        // Read-only commits write nothing, so the two flavours' rows may
+        // share this pair.
+        let (opt, pes, _dirs) = open_pair("plain-read", Options::default());
+        report(
+            "commit, no callbacks, read-only, optimistic",
+            per_op(&mut |_| {
+                let txn = opt.begin(&TxnOptions::new());
+                txn.get(b"seed").expect("get");
+                txn.commit().expect("commit");
+            }),
+        );
+        report(
+            "commit, no callbacks, read-only, pessimistic",
+            per_op(&mut |_| {
+                let txn = pes.begin(&TxnOptions::new());
+                txn.get(b"seed").expect("get");
+                txn.commit().expect("commit");
+            }),
+        );
+    }
     if plain_only {
         return;
     }

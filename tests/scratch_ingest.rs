@@ -1,3 +1,5 @@
+#![cfg(not(target_arch = "wasm32"))]
+
 use regolith::{Db, IngestOptions, Options, SstFileWriter};
 use tempfile::TempDir;
 

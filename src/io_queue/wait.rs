@@ -2,10 +2,11 @@
 
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::task::{Context, Poll};
 
 use super::QueueId;
+use crate::engine::RegolithEngine;
 use crate::engine::io::atomic_waker::AtomicWaker;
 use crate::engine::io::job::Job;
 use crate::engine::io::shared::{QueueShared, WaitSlot};
@@ -22,14 +23,16 @@ use crate::engine::io::unit::UnitKey;
 pub enum WouldBlock {
     /// A `CacheOnly` read needs a block the cache does not hold. The read is
     /// recorded on the queue the handle's [`ReadMode`](crate::ReadMode)
-    /// names; poll that queue, then run the read again.
-    #[error("the read needs a block that is not cached; poll its I/O queue and run the read again")]
+    /// names; poll that queue, then run the read again. Also what
+    /// [`Db::allocate_nowait`](crate::Db::allocate_nowait) hands back when
+    /// device work is in its way: the wait is recorded on the queue it names.
+    #[error("the call needs I/O that is not done yet; poll its I/O queue and run the call again")]
     Io(IoWait),
     /// A write met a write stall: too many level-0 tables, too many memtables
     /// waiting to be flushed, or too much data waiting to be compacted. The
     /// write applied nothing. Wait for the stall to clear, then run the write
     /// again.
-    #[error("writes are stalled behind background work ({}); wait for the stall to clear and run the write again", .0.reason())]
+    #[error("{}", .0.describe())]
     Stall(StallWait),
     /// A pessimistic transaction's
     /// [`try_get_for_update`](crate::Transaction::try_get_for_update) found
@@ -132,8 +135,9 @@ pub struct IoWait {
 }
 
 impl IoWait {
-    /// A wait on `slot`, recorded on `queue` for `unit` (`None` for a wait for
-    /// room in the queue's byte bound).
+    /// A wait on `slot`, recorded on `queue` for `unit` (`None` for a wait
+    /// that names no block: room in the queue's byte bound, or work of the
+    /// commit pipeline in an allocation's way).
     pub(crate) fn new(queue: &QueueShared, unit: Option<UnitKey>, slot: Arc<WaitSlot>) -> Self {
         Self {
             listen: Listen::new(slot),
@@ -150,7 +154,10 @@ impl IoWait {
 
     /// The device read this wait waits on. `None` for a read that found its
     /// queue's byte bound full: it waits until the queue owes less, and then
-    /// records its read when it is run again.
+    /// records its read when it is run again. `None` too for a
+    /// [`Db::allocate_nowait`](crate::Db::allocate_nowait) that found other
+    /// work of the commit pipeline in its way: it waits until that work is
+    /// done.
     pub fn unit(&self) -> Option<IoUnit> {
         self.unit
     }
@@ -200,9 +207,11 @@ impl Future for IoWait {
 ///
 /// On a database with no compaction worker, nothing clears a stall unless a
 /// caller compacts: with [`Options::inline_compaction`](crate::Options::inline_compaction)
-/// on, the stopped write also leaves the step that clears it on its thread's
-/// queue (or runs it inline when the thread has none); otherwise call
-/// [`Db::compact_step`](crate::Db::compact_step) or [`Db::flush`](crate::Db::flush).
+/// on, as it is there unless it was turned off, the stopped write also
+/// leaves the step that clears it on its thread's queue (or runs it inline
+/// when the thread has none); with it turned off, call
+/// [`Db::compact_step`](crate::Db::compact_step) or [`Db::flush`](crate::Db::flush),
+/// which this wait's message says too.
 ///
 /// It is a [`Future`] with output `()`. Clones wait on the same stall.
 /// Dropping a wait cancels nothing.
@@ -215,6 +224,15 @@ pub struct StallWait {
     stall: Arc<Job>,
     queue: Option<QueueId>,
     reason: &'static str,
+    /// Nothing relieves the stall but the caller: no compaction worker, and
+    /// inline compaction turned off.
+    self_driven: bool,
+    /// The database, for the blocking wait: it steps the calling thread's
+    /// own jobs through it, and counts the time blocked in its statistics.
+    /// Read only by that wait, which `wasm32` lacks: there it is set and
+    /// never read. The compiler raises no dead-code lint for it there, so
+    /// it carries no expectation of one, unlike `stall`.
+    engine: Weak<RegolithEngine>,
 }
 
 impl StallWait {
@@ -229,6 +247,39 @@ impl StallWait {
             stall,
             queue,
             reason,
+            self_driven: false,
+            engine: Weak::new(),
+        }
+    }
+
+    /// Say whether nothing relieves this stall but the caller, which the
+    /// wait's message then says how to do.
+    pub(crate) fn left_to_the_caller(mut self, self_driven: bool) -> Self {
+        self.self_driven = self_driven;
+        self
+    }
+
+    /// Name the database the stall is on, for [`StallWait::wait`].
+    pub(crate) fn on(mut self, engine: Weak<RegolithEngine>) -> Self {
+        self.engine = engine;
+        self
+    }
+
+    /// What a write this stall stopped is told: what holds it, and what to
+    /// do.
+    pub(crate) fn describe(&self) -> String {
+        let reason = self.reason;
+        if self.self_driven {
+            format!(
+                "writes are stalled behind background work ({reason}) that this database \
+                 leaves to its caller; call compact_step until the stall clears, or turn \
+                 inline_compaction on, then run the write again"
+            )
+        } else {
+            format!(
+                "writes are stalled behind background work ({reason}); wait for the stall to \
+                 clear and run the write again"
+            )
         }
     }
 
@@ -253,10 +304,32 @@ impl StallWait {
     /// wait was recorded on a queue; a wait on a queue still becomes ready
     /// only at that queue's poll.
     ///
+    /// On a thread that owns an [`IoQueue`](crate::IoQueue), the jobs that
+    /// queue holds are stepped here while the thread waits, as its poll
+    /// would step them: the step that relieves the stall, or a
+    /// [`JobTicket`](crate::JobTicket)'s job that holds what that step
+    /// needs, may be among them, and nothing else would run it. A block
+    /// read pending on the queue is not run here; it holds nothing a stall
+    /// waits for.
+    ///
     /// Not on `wasm32`, whose one thread would wait for work only it can do.
+    ///
+    /// The time spent blocked here is counted in
+    /// [`Ticker::WriteStallMicros`](crate::Ticker::WriteStallMicros).
     #[cfg(not(target_arch = "wasm32"))]
     pub fn wait(&self) {
-        self.stall.wait_landed();
+        let blocked = std::time::Instant::now();
+        let engine = self.engine.upgrade();
+        match &engine {
+            Some(engine) => engine.io().wait_landed(&self.stall),
+            // Every handle on the database is gone: there is no queue of it
+            // to step, and the wait is for the stall alone.
+            None => self.stall.wait_landed(),
+        }
+        if let Some(stats) = engine.as_ref().and_then(|engine| engine.statistics()) {
+            let micros = u64::try_from(blocked.elapsed().as_micros()).unwrap_or(u64::MAX);
+            stats.add(crate::Ticker::WriteStallMicros, micros);
+        }
     }
 }
 
@@ -348,6 +421,33 @@ impl Future for LockWait {
     }
 }
 
+/// A timed wait recorded on a queue ([`IoRuntime::timer`]): ready once the
+/// queue's poll finds the database's clock at the wait's due time. Not
+/// handed to a caller: it is the pause a
+/// [`transact_async`](crate::OptimisticTransactionDb::transact_async)
+/// attempt takes before a re-run.
+///
+/// [`IoRuntime::timer`]: crate::engine::io::IoRuntime::timer
+pub(crate) struct Pause {
+    listen: Listen,
+}
+
+impl Pause {
+    pub(crate) fn new(slot: Arc<WaitSlot>) -> Self {
+        Self {
+            listen: Listen::new(slot),
+        }
+    }
+}
+
+impl Future for Pause {
+    type Output = ();
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        self.get_mut().listen.poll(cx)
+    }
+}
+
 /// Run a write `call` until no write stall stops it: on
 /// [`WouldBlock::Stall`], block this thread until the stall clears
 /// ([`StallWait::wait`]) and call again. Any other outcome is returned.
@@ -360,10 +460,11 @@ impl Future for LockWait {
 /// on a thread with no queue relieves it inside the write itself, and
 /// otherwise this waits until another thread compacts.
 ///
-/// ```no_run
+/// ```
 /// # use regolith::{Db, Options, through_stalls};
-/// # let db = Db::open("/tmp/through_stalls_doc", Options::default())?;
+/// # let db = Db::open("rows", Options::memory())?;
 /// through_stalls(|| db.put(b"key", b"value"))?;
+/// # assert_eq!(db.get(b"key")?.as_deref(), Some(&b"value"[..]));
 /// # Ok::<(), regolith::Error>(())
 /// ```
 #[cfg(not(target_arch = "wasm32"))]

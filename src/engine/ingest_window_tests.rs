@@ -18,7 +18,6 @@ use std::time::{Duration, Instant};
 use tempfile::TempDir;
 
 use crate::engine::ingest::after_next_ingest_seq;
-use crate::portability::Ordering;
 use crate::{
     Db, IngestOptions, IsolationLevel, OptimisticTransactionDb, Options, SstFileWriter,
     TransactionError, TxnOptions, WriteBatch,
@@ -57,13 +56,15 @@ impl Window {
     /// it has committed or is queued in the commit ring, whichever the
     /// engine allows.
     fn open(db: &Db, write: impl FnOnce() -> crate::Result<u64> + Send + 'static) -> Self {
-        // The hook runs right after the ingest's allocation and nothing
-        // else writes, so this is the ingest's sequence.
-        let ingest_seq = db.engine.latest_seq.load(Ordering::Acquire);
+        // The hook runs right after the ingest's allocation, inside its
+        // ordered step, and nothing else writes: the ingest took the
+        // sequence after the last one decided before its step.
+        let ingest_seq = db.engine.last_decided_seq() + 1;
+        let taken = db.engine.pipeline_slots_taken();
         let writer = thread::spawn(write);
         let deadline = Instant::now() + Duration::from_secs(30);
         let mut backoff = Duration::from_micros(100);
-        while !writer.is_finished() && db.engine.commit_ring.is_empty() {
+        while !writer.is_finished() && db.engine.pipeline_slots_taken() == taken {
             assert!(
                 Instant::now() < deadline,
                 "the write neither committed nor queued"

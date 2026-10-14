@@ -108,9 +108,10 @@
 \*                  (sealed::open_batch) before it reads the batch's flag.
 \*
 \* WHAT THE MODEL LEAVES OUT, and why that loses nothing.
-\*   - Bytes inside a batch: a batch is whole or damaged. tail.rs finds whole
-\*     batches past a damaged one by testing every offset; its unit tests
-\*     check that search (tail_tests.rs).
+\*   - Bytes inside a batch: a batch is whole or damaged. The code in
+\*     src/engine/manifest/tail.rs finds whole batches past a damaged one by
+\*     testing every offset; its unit tests check that search
+\*     (src/engine/manifest/tail_tests.rs).
 \*   - The log's own torn tail: every write is synced here (Immediate), and
 \*     the log rules are WalRecovery.tla's.
 \*   - The open's own retirement batch and later runs: one crash, one
@@ -270,7 +271,8 @@ Refuses(img) ==
             \* The old guard: refuse when the kept batches name no table while
             \* a table file holds data, whatever proves what.
             /\ \A j \in 1..Len(Replayed(img)) : Replayed(img)[j].table = 0
-            /\ \E t \in DOMAIN files : files[t] # {} \* some table file holds writes
+            \* Some table file holds writes
+            /\ \E t \in DOMAIN files : files[t] # {}
        \* The RED that never refuses.
        [] Mutant = "IgnoreProof" ->
             \* Never refuse: every damaged end is dropped.
@@ -449,8 +451,10 @@ FlushInstall ==
          retire == [Reserve EXCEPT !.minWal = flushing.log + 1]
          \* What this step appends.
          bs == IF Mutant = "RetireBeforeTable" THEN <<retire, table>> ELSE <<table>>
-     IN \* The manifest has room for it.
-        /\ Len(man) + Len(bs) <= MaxBatches \* the manifest has room for it
+     \* With those names:
+     IN
+        \* The manifest has room for it
+        /\ Len(man) + Len(bs) <= MaxBatches
         \* Append it.
         /\ man' = man \o bs
         \* The flush remembers where its batch ends, to wait for its sync.
@@ -488,7 +492,8 @@ FlushRetire ==
   /\ flushing.at <= synced
   \* Some of the flushed logs go; the rest failed to unlink and stay.
   /\ \E gone \in SUBSET {l \in onDisk : l <= flushing.log} :
-       onDisk' = onDisk \ gone \* those files leave the wal/ folder
+       \* Those files leave the wal/ folder
+       onDisk' = onDisk \ gone
   \* The flushed memtable leaves the queue, found by its log
   \* (ReadViewCell::retire_memtable, by identity, not by position).
   /\ frozen' = SelectSeq(frozen, LAMBDA f : f.log # flushing.log)
@@ -527,13 +532,20 @@ Ingest(k) ==
 
 \* Every step the engine can take.
 Next ==
-  \/ \E k \in Keys : Put(k)    \* a caller writes some key
-  \/ Seal                       \* the memtable freezes behind a new log
-  \/ FlushTable                 \* the flush writes its table file
-  \/ FlushInstall               \* the flush appends its table's batch
-  \/ SyncManifest               \* the pending manifest sync finishes
-  \/ FlushRetire                \* the flush retires its memtable and logs
-  \/ \E k \in Keys : Ingest(k) \* a caller ingests a table of some key
+  \* A caller writes some key
+  \/ \E k \in Keys : Put(k)
+  \* The memtable freezes behind a new log
+  \/ Seal
+  \* The flush writes its table file
+  \/ FlushTable
+  \* The flush appends its table's batch
+  \/ FlushInstall
+  \* The pending manifest sync finishes
+  \/ SyncManifest
+  \* The flush retires its memtable and logs
+  \/ FlushRetire
+  \* A caller ingests a table of some key
+  \/ \E k \in Keys : Ingest(k)
 
 \* Every run: start in Init, then take steps or stutter.
 Spec == Init /\ [][Next]_vars

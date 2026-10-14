@@ -11,7 +11,14 @@
 //! Waiting is the other locks' waiting (`contend`, `queue`, `waiter`):
 //! barging with bounded bypass (D49), a handoff that names the waiter's
 //! owner in the state word, a cancellation that passes a handoff on, and no
-//! lost wakeup. What a waiter is woken through is its caller's `Waker`;
+//! lost wakeup.
+//!
+//! A handoff is two steps: the pass writes the waiter's name, then grants the
+//! waiter, and a waiter that withdrew in between is not granted and the name
+//! is cleared again. So the name a handoff writes carries [`GRANTING`] until
+//! the grant is through, and while it does it is nobody's name: neither the
+//! waiter's own poll nor another call of its owner can take it for a hold
+//! (defect F1, `LockTable.tla`'s two-step pass). What a waiter is woken through is its caller's `Waker`;
 //! the lock table makes that a completion on the waiter's own I/O queue.
 //!
 //! Proved for every size in `proofs/lean/Regolith/LockTable.lean`, and
@@ -29,8 +36,28 @@ use super::queue::{
 };
 use super::waiter::WakeList;
 
+#[cfg(test)]
+std::thread_local! {
+    /// Run once by the next handoff on this thread, after it wrote the
+    /// waiter's name and before it granted the waiter: what another thread
+    /// could do between the two.
+    static BETWEEN_TAKE_AND_GRANT: core::cell::Cell<Option<Box<dyn FnOnce()>>> =
+        const { core::cell::Cell::new(None) };
+}
+
+/// Have the next handoff on this thread run `hook` between writing the
+/// waiter's name and granting it.
+#[cfg(test)]
+pub(crate) fn between_take_and_grant(hook: impl FnOnce() + 'static) {
+    BETWEEN_TAKE_AND_GRANT.set(Some(Box::new(hook)));
+}
+
 /// The queue's bits; the holder's name is everything above them.
 const FLAGS: usize = (1 << FIRST_BIT) - 1;
+
+/// Beside a name a handoff wrote and has not granted yet: the lowest name bit,
+/// which [`OwnerId::ALIGN`] keeps clear in every name.
+const GRANTING: usize = 1 << FIRST_BIT;
 
 /// The name of a lock holder: a nonzero address whose low bits are clear,
 /// so it fits above the wait queue's bits in the state word.
@@ -38,8 +65,9 @@ const FLAGS: usize = (1 << FIRST_BIT) - 1;
 pub(crate) struct OwnerId(usize);
 
 impl OwnerId {
-    /// The alignment a holder's address needs.
-    pub(crate) const ALIGN: usize = 1 << FIRST_BIT;
+    /// The alignment a holder's address needs: past the queue's bits and
+    /// [`GRANTING`].
+    pub(crate) const ALIGN: usize = GRANTING << 1;
 
     /// The name of `owner`, whose address names it for as long as it lives.
     /// The caller keeps `owner` alive while the name is in any lock.
@@ -89,7 +117,9 @@ impl OwnedLock {
         }
     }
 
-    /// The holder's name as the state word carries it, `0` when free.
+    /// The holder's name as the state word carries it, `0` when free. While a
+    /// handoff is granting, the name carries [`GRANTING`] and equals no
+    /// owner's name.
     pub(crate) fn holder(&self) -> usize {
         self.queue.state.load(Ordering::Acquire) & !FLAGS
     }
@@ -105,13 +135,25 @@ impl OwnedLock {
         }
     }
 
+    /// Whether the state word carries `owner`'s name, a handoff's marked one
+    /// included: what a poll must not take for a hold (the loom calibration
+    /// of defect F1 does).
+    #[cfg(loom)]
+    pub(crate) fn names(&self, owner: OwnerId) -> bool {
+        self.holder() & !GRANTING == owner.word()
+    }
+
     /// Let go of the lock if `owner` holds it, waking the waiters a release
     /// should. `false`, changing nothing, when `owner` does not hold it.
+    ///
+    /// A waiter granted the lock may let it go before the pass that granted
+    /// it lifts [`GRANTING`], so the marked name is the owner's here too: only
+    /// the granted waiter, or its cancel giving the grant back, unlocks it.
     pub(crate) fn unlock(&self, owner: OwnerId) -> bool {
         let state = &self.queue.state;
         let mut current = state.load(Ordering::Acquire);
         loop {
-            if current & !FLAGS != owner.word() {
+            if current & !FLAGS & !GRANTING != owner.word() {
                 return false;
             }
             match state.compare_exchange_weak(
@@ -136,6 +178,24 @@ impl OwnedLock {
     pub(crate) fn wake_all(&self) {
         self.wake_all.store(1, Ordering::Release);
         self.transition(Step::Drain);
+    }
+
+    /// Lift [`GRANTING`] from the name a pass wrote for `owner`, once the
+    /// grant is through. Nothing when the granted waiter already let go.
+    fn granted(&self, owner: usize) {
+        let state = &self.queue.state;
+        let mut current = state.load(Ordering::Acquire);
+        while current & !FLAGS == owner | GRANTING {
+            match state.compare_exchange_weak(
+                current,
+                current & !GRANTING,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return,
+                Err(actual) => current = actual,
+            }
+        }
     }
 
     /// Clear the holder a pass just named for a waiter that had withdrawn.
@@ -171,6 +231,12 @@ impl Default for OwnedLock {
 }
 
 impl Lock for OwnedLock {
+    /// A transaction keeps its key locks until it commits or aborts, across
+    /// its own reads, writes and log sync, so a holder is seldom about to
+    /// let go when another owner asks: a spin would only burn the asker's
+    /// time. Its waiters queue at once, as `LockTable.tla` models them.
+    const SPINS: bool = false;
+
     /// A waiter's `need` is its owner's name: the lock is admitted to it
     /// only while free, and then names it.
     fn admit(&self, state: usize, need: usize) -> Option<usize> {
@@ -211,14 +277,19 @@ impl Policy for OwnedLock {
                 // ends there.
                 while let Some(node) = waiting.front(queue) {
                     let owner = node.as_ref().payload();
-                    if !self.take_for_waiter(owner) {
+                    if !self.take_for_waiter(owner | GRANTING) {
                         break;
+                    }
+                    #[cfg(test)]
+                    if let Some(hook) = BETWEEN_TAKE_AND_GRANT.take() {
+                        hook();
                     }
                     waiting.pop_front();
                     if woken.grant(node) {
+                        self.granted(owner);
                         handed = true;
                     } else {
-                        self.clear_holder(owner);
+                        self.clear_holder(owner | GRANTING);
                     }
                 }
             }
@@ -306,7 +377,7 @@ mod tests {
 
     /// An owner: aligned for its name, and one byte so each has its own
     /// address.
-    #[repr(align(64))]
+    #[repr(align(128))]
     struct Token(#[allow(dead_code)] u8);
 
     fn polled_wait<'a>(

@@ -84,7 +84,7 @@ pub fn a_unit_is_claimed_once_and_runs_once() {
                 thread::spawn(move || {
                     let won = unit.claim();
                     if won {
-                        unit.run(&cache);
+                        unit.run(&cache, || false);
                     }
                     usize::from(won)
                 })
@@ -92,7 +92,7 @@ pub fn a_unit_is_claimed_once_and_runs_once() {
             .collect();
         let mut won = usize::from(unit.claim());
         if won == 1 {
-            unit.run(&cache);
+            unit.run(&cache, || false);
         }
         for racer in racers {
             won += racer.join().expect("racer");
@@ -413,9 +413,12 @@ pub fn calibration_a_wait_without_a_second_look_hangs() {
 /// A read that checked the database open goes on to miss while close runs:
 /// the miss counts itself in at the production `CloseGate`, puts its unit in
 /// the table and counts itself out, while close marks the gate and then
-/// sweeps the table. In every interleaving the unit is released once both
-/// are done, by close's sweep or by the miss itself, and the witness counts
-/// the runs where the sweep came too early and the miss let its own unit go.
+/// sweeps the table. In every interleaving the unit is released once close
+/// has returned and the miss has ended (the reader is joined), by close's
+/// sweep or by the miss itself. That is the boundary the contract states,
+/// not the instant close returns: the witness counts the runs where close
+/// returned with the unit still in the table, because the sweep came before
+/// the insert, and the miss let it go when it counted out.
 /// The table is one flag here, standing for the map's insert and its
 /// iteration, which loom does not see inside the map.
 pub fn no_unit_outlives_close() {
@@ -443,10 +446,16 @@ pub fn no_unit_outlives_close() {
         if in_table.load(Ordering::Acquire) {
             unit.release();
         }
+        // Close has returned; the miss may still be under way.
+        let done_when_close_returned = unit.is_done();
         let (inserted, released_here) = reader.join().expect("reader");
         assert!(!inserted || unit.is_done(), "a unit outlived close");
         assert_eq!(runs.load(Ordering::SeqCst), 0, "a released unit never runs");
-        if released_here {
+        assert!(
+            !inserted || done_when_close_returned || released_here,
+            "a unit close left behind was not let go by its miss"
+        );
+        if inserted && !done_when_close_returned {
             witness.record();
         }
     });
