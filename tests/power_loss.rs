@@ -94,7 +94,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use common::fault::{
-    self, ChildOutcome, ChildSpec, CrashRun, CutPoint, History, Phase, PowerLossOptions,
+    self, ChildOutcome, ChildSpec, CrashRun, CutPoint, History, OpKind, Phase, PowerLossOptions,
     PowerLossReport, Recovery, TearMode, Trigger,
 };
 use regolith::{Db, DurabilityMode, Options};
@@ -158,7 +158,9 @@ fn compact_only(spec: &ChildSpec) {
         manual_compaction_opts(spec.write_buffer_size),
     )
     .expect("child: open db");
-    db.compact_range(None, None).expect("child: compact_range");
+    db.compact_range(None, None)
+        .wait()
+        .expect("child: compact_range");
     db.close().expect("child: close");
 }
 
@@ -257,7 +259,7 @@ fn immediate_durability_loses_no_acknowledged_write_at_any_cut_point() {
 
         match fault::recover_and_validate(&db, write_buffered_opts(1 << 20), &out.history) {
             Recovery::Recovered(r) => {
-                fault::assert_acked_survived(&r, &out.acked);
+                fault::assert_acked_survived(&r, &out.acked());
                 summary.push(format!(
                     "kill at WAL write {nth}: acked {}, recovered prefix {}",
                     out.acked_count(),
@@ -366,10 +368,11 @@ fn eventual_durability_recovers_to_a_valid_prefix_and_the_loss_is_measured() {
 /// The proof: the whole run wrote to exactly `nth` SSTable files, which is
 /// fewer than `l0_compaction_trigger` (4 by default), so no level compaction
 /// can have started and every SSTable write in the run belongs to a flush;
-/// and the fatal record is a write to the newest of those files. regolith
-/// flushes synchronously on the thread that filled the memtable
-/// (`rotate_memtable` calls `flush_frozen_memtable` in `src/engine/mod.rs`),
-/// so the cut lands with the SSTable written but not yet `fsync`ed and its
+/// and the fatal record is a write to the newest of those files. A rotation
+/// seals the memtable and the compaction worker flushes it (E9), so the
+/// writer can record a log write or two between the worker's fatal write and
+/// the process's death: the fatal record is the last SSTable record, and the
+/// cut lands with that SSTable written but not yet `fsync`ed and its
 /// MANIFEST `AddFile` record not yet appended.
 fn cut_power_inside_flush(db: &Path, nth: u64) -> (ChildOutcome, PowerLossReport) {
     let spec = ChildSpec::new(Phase::DuringFlush, db).durability(DurabilityMode::Immediate);
@@ -399,13 +402,24 @@ fn cut_power_inside_flush(db: &Path, nth: u64) -> (ChildOutcome, PowerLossReport
     let last = out
         .journal
         .records
-        .last()
+        .iter()
+        .rev()
+        .find(|r| r.path.to_string_lossy().ends_with(".sst"))
         .expect("journal must contain the fatal operation");
     let newest = written.last().expect("written is non-empty");
     assert!(
-        last.path.to_string_lossy().ends_with(newest),
-        "the crash landed on {:?} rather than inside the flush's SSTable write\n{}",
+        last.path.to_string_lossy().ends_with(newest) && last.kind == OpKind::Write,
+        "the crash landed on {:?} ({:?}) rather than inside the flush's SSTable write\n{}",
         last.path,
+        last.kind,
+        out.journal,
+    );
+    assert!(
+        !out.journal
+            .records
+            .iter()
+            .any(|r| r.seq > last.seq && r.path.to_string_lossy().ends_with("MANIFEST")),
+        "the manifest moved after the fatal SSTable write\n{}",
         out.journal,
     );
     assert!(
@@ -438,7 +452,7 @@ fn a_power_cut_during_a_memtable_flush_keeps_every_acknowledged_write() {
     let (out, report) = cut_power_inside_flush(&db, 3);
 
     match fault::recover_and_validate(&db, write_buffered_opts(8 * 1024), &out.history) {
-        Recovery::Recovered(r) => fault::assert_acked_survived(&r, &out.acked),
+        Recovery::Recovered(r) => fault::assert_acked_survived(&r, &out.acked()),
         Recovery::RefusedToOpen(e) => panic!(
             "a power cut inside a flush left a database that refuses to open, after {} \
              acknowledged writes: {e}\n{}",
@@ -488,7 +502,7 @@ fn a_power_cut_during_the_first_memtable_flush_keeps_every_acknowledged_write() 
     let (out, report) = cut_power_inside_flush(&db, 1);
 
     match fault::recover_and_validate(&db, write_buffered_opts(8 * 1024), &out.history) {
-        Recovery::Recovered(r) => fault::assert_acked_survived(&r, &out.acked),
+        Recovery::Recovered(r) => fault::assert_acked_survived(&r, &out.acked()),
         Recovery::RefusedToOpen(e) => {
             let salvage = tmp.path().join("salvage");
             fault::copy_tree(&db, &salvage);
@@ -555,7 +569,7 @@ fn a_power_cut_during_a_compaction_keeps_every_write_it_was_merging() {
         for i in 0..KEYS {
             let key = format!("key_{:06}", (i * STRIDE) % KEYS).into_bytes();
             let value = fault::garbage(i as u64, 128);
-            d.put(&key, &value).expect("fill put");
+            regolith::through_stalls(|| d.put(&key, &value)).expect("fill put");
             history.put(key, value);
         }
         d.close().expect("close after fill");
@@ -676,7 +690,7 @@ fn a_power_cut_during_a_manifest_append_keeps_every_acknowledged_write() {
     );
 
     match fault::recover_and_validate(&db, write_buffered_opts(8 * 1024), &out.history) {
-        Recovery::Recovered(r) => fault::assert_acked_survived(&r, &out.acked),
+        Recovery::Recovered(r) => fault::assert_acked_survived(&r, &out.acked()),
         Recovery::RefusedToOpen(e) => panic!(
             "a power cut inside a MANIFEST append left a database that refuses to open, \
              after {} acknowledged writes: {e}\n{}",
@@ -726,7 +740,7 @@ fn a_power_cut_during_recovery_from_an_earlier_cut_loses_nothing_more() {
         "the first cut discarded nothing\n{}",
         first_report.summary(),
     );
-    let acked = first.acked.clone();
+    let acked = first.acked();
     assert!(!acked.is_empty(), "the first run acknowledged no write");
 
     // Recover a copy, so the yardstick is measured without disturbing the
@@ -893,7 +907,7 @@ fn a_write_batch_is_all_or_nothing_at_every_cut_point() {
                     r.k,
                 );
                 if cut == CutPoint::End {
-                    fault::assert_acked_survived(&r, &out.acked);
+                    fault::assert_acked_survived(&r, &out.acked());
                 }
             }
             Recovery::RefusedToOpen(e) => {

@@ -33,17 +33,17 @@ fn read_all(file: &dyn ReadFile) -> Vec<u8> {
 /// What the device sees: descriptors open now and at most, reads in flight,
 /// and whether a descriptor was ever closed under a read.
 #[derive(Default)]
-struct Device {
-    open: AtomicUsize,
-    most_open: AtomicUsize,
-    closed_in_use: AtomicBool,
+pub(super) struct Device {
+    pub(super) open: AtomicUsize,
+    pub(super) most_open: AtomicUsize,
+    pub(super) closed_in_use: AtomicBool,
 }
 
 /// An `Env` over [`MemEnv`] whose table descriptors report to a [`Device`].
 #[derive(Clone)]
-struct Counted {
+pub(super) struct Counted {
     inner: MemEnv,
-    device: Arc<Device>,
+    pub(super) device: Arc<Device>,
 }
 
 struct CountedFile {
@@ -83,7 +83,7 @@ impl std::fmt::Debug for Counted {
 }
 
 impl Counted {
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
         Self {
             inner: MemEnv::new(),
             device: Arc::new(Device::default()),
@@ -102,13 +102,16 @@ impl Env for Counted {
             in_use: AtomicUsize::new(0),
         }))
     }
+    fn open_log(&self, path: &Path, mode: WriteMode) -> io::Result<Box<dyn crate::env::LogFile>> {
+        self.inner.open_log(path, mode)
+    }
     fn open_write(&self, path: &Path, mode: WriteMode) -> io::Result<Box<dyn WriteFile>> {
         self.inner.open_write(path, mode)
     }
     fn create_dir_all(&self, path: &Path) -> io::Result<()> {
         self.inner.create_dir_all(path)
     }
-    fn read_dir(&self, path: &Path) -> io::Result<Vec<DirEntry>> {
+    fn read_dir(&self, path: &Path) -> io::Result<ReadDir<'_>> {
         self.inner.read_dir(path)
     }
     fn metadata(&self, path: &Path) -> io::Result<FileMeta> {
@@ -145,9 +148,6 @@ impl Env for Counted {
     ) -> io::Result<Box<dyn JoinHandle>> {
         self.inner.spawn(name, body)
     }
-    fn sleep(&self, dur: Duration) {
-        self.inner.sleep(dur)
-    }
 }
 
 /// Every name in `dir`, sorted.
@@ -155,8 +155,7 @@ fn names(env: &dyn Env, dir: &Path) -> Vec<String> {
     let mut names: Vec<String> = env
         .read_dir(dir)
         .unwrap()
-        .iter()
-        .map(|entry| entry.file_name())
+        .map(|entry| entry.unwrap().file_name())
         .collect();
     names.sort();
     names

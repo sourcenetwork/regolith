@@ -1,9 +1,14 @@
+use crate::conflict::RedactedKey;
 use crate::io_queue::WouldBlock;
 use crate::io_queue::wait::{copy_would_block, take_would_block};
 
 /// Errors returned by regolith operations.
+///
+/// No message and no `Debug` output prints the bytes of a key or a value,
+/// since either can hold user data. A variant that names a key carries it as
+/// data and shows its length and a short hash.
 #[non_exhaustive]
-#[derive(Debug, thiserror::Error)]
+#[derive(thiserror::Error)]
 pub enum Error {
     /// A caller supplied an invalid option, key, value, range, or
     /// other API argument.
@@ -29,20 +34,22 @@ pub enum Error {
     /// different database handle.
     #[error("invalid column family: {0}")]
     InvalidColumnFamily(String),
-    /// The engine refused to block the caller and returned early.
-    /// Returned when [`crate::WriteOptions::no_slowdown`] is set and
-    /// the engine is currently stalling writes (too many L0 files,
-    /// too many unflushed memtables, or pending compaction bytes
-    /// over the hard limit). The included string names the active
-    /// stall condition for diagnostics.
+    /// A write stall refused the write, and no wait would end it. Returned
+    /// when [`crate::WriteOptions::no_slowdown`] is set and the engine is
+    /// stalling writes (too many L0 files, too many unflushed memtables, or
+    /// pending compaction bytes over a limit), and when inline compaction
+    /// ([`crate::Options::inline_compaction`]) ran its bound of steps
+    /// without relieving a stop. The included string names the stall
+    /// condition for diagnostics.
     #[error("engine busy: {0}")]
     Busy(&'static str),
     /// The configured [`crate::MergeOperator`] returned `None` when
     /// asked to combine a value with one or more merge operands,
     /// indicating that the operands were corrupt or the merge
-    /// semantics failed. The offending user key is included for
-    /// diagnostics.
-    #[error("merge operator failed for key {0:?}")]
+    /// semantics failed. The payload is the key, as the caller wrote it;
+    /// neither the message nor the `Debug` output prints its bytes, only
+    /// its length and a short hash, since a key can hold user data.
+    #[error("merge operator failed for a {}", RedactedKey(.0))]
     MergeFailed(Vec<u8>),
     /// A merge was written to a database that has no
     /// [`crate::MergeOperator`] configured. Set [`crate::Options::merge_operator`]
@@ -103,13 +110,83 @@ pub enum Error {
     LogKeyWrite,
     /// The call returned instead of waiting. A read through a
     /// [`crate::ReadMode::CacheOnly`] handle needed a block the cache does
-    /// not hold: poll the queue the wait names, then run the call again. The
-    /// call left nothing half done; a scan resumes where it stopped.
+    /// not hold ([`WouldBlock::Io`]), or a write met a write stall
+    /// ([`WouldBlock::Stall`]): poll the queue the wait names, or await the
+    /// wait, then run the call again. The call left nothing half done; a
+    /// scan resumes where it stopped, and a stalled write applied nothing.
     #[error("{0}")]
     WouldBlock(WouldBlock),
+    /// The database is encrypted at rest and was opened without a key
+    /// provider. Set [`crate::Options::key_provider`] to the provider it was
+    /// written with.
+    #[error("this database is encrypted; open it with Options::key_provider")]
+    KeyProviderRequired,
+    /// A file names a key the [`crate::KeyProvider`] does not provide, or the
+    /// provider's current key is one it does not provide. Nothing sealed
+    /// under that key can be read, and no file can be sealed, until the
+    /// provider provides it.
+    #[error("the key provider does not provide key id {id}, which this database needs")]
+    UnknownKey {
+        /// The key id the provider returned no key for.
+        id: crate::KeyId,
+    },
     /// An underlying I/O error from the filesystem or operating system.
     #[error("I/O error: {0}")]
     Io(#[source] std::io::Error),
+}
+
+// A hand-written `Debug`, because the derived one would print a `MergeFailed`
+// key's bytes into a log or a panic message. Every other variant prints what
+// the derive would.
+impl std::fmt::Debug for Error {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidArgument(message) => {
+                f.debug_tuple("InvalidArgument").field(message).finish()
+            }
+            Self::DataBlockLimitExceeded {
+                max_data_block_bytes,
+            } => f
+                .debug_struct("DataBlockLimitExceeded")
+                .field("max_data_block_bytes", max_data_block_bytes)
+                .finish(),
+            Self::Corruption(source) => f.debug_tuple("Corruption").field(source).finish(),
+            Self::ReadOnly => f.write_str("ReadOnly"),
+            Self::Closed => f.write_str("Closed"),
+            Self::InvalidColumnFamily(message) => {
+                f.debug_tuple("InvalidColumnFamily").field(message).finish()
+            }
+            Self::Busy(reason) => f.debug_tuple("Busy").field(reason).finish(),
+            Self::MergeFailed(key) => f
+                .debug_tuple("MergeFailed")
+                .field(&format_args!("{}", RedactedKey(key)))
+                .finish(),
+            Self::NoMergeOperator => f.write_str("NoMergeOperator"),
+            Self::ContentMismatch => f.write_str("ContentMismatch"),
+            Self::CallbackPanicked { callback, latched } => f
+                .debug_struct("CallbackPanicked")
+                .field("callback", callback)
+                .field("latched", latched)
+                .finish(),
+            Self::BackgroundFailed {
+                job,
+                hazard,
+                source,
+            } => f
+                .debug_struct("BackgroundFailed")
+                .field("job", job)
+                .field("hazard", hazard)
+                .field("source", source)
+                .finish(),
+            Self::LogKeyWrite => f.write_str("LogKeyWrite"),
+            Self::WouldBlock(would_block) => {
+                f.debug_tuple("WouldBlock").field(would_block).finish()
+            }
+            Self::KeyProviderRequired => f.write_str("KeyProviderRequired"),
+            Self::UnknownKey { id } => f.debug_struct("UnknownKey").field("id", id).finish(),
+            Self::Io(source) => f.debug_tuple("Io").field(source).finish(),
+        }
+    }
 }
 
 impl Error {
@@ -142,12 +219,26 @@ impl Error {
     pub(crate) fn into_io_error(self) -> std::io::Error {
         match self {
             Self::Io(io) | Self::Corruption(io) => io,
-            Self::BackgroundFailed { source, .. } => source,
+            // Carried typed, under the failure's own kind: a commit told
+            // that the relief of its stop is failing reaches the caller as
+            // this variant, as a plain write does.
+            Self::BackgroundFailed {
+                job,
+                hazard,
+                source,
+            } => std::io::Error::new(
+                source.kind(),
+                Self::BackgroundFailed {
+                    job,
+                    hazard,
+                    source,
+                },
+            ),
             Self::InvalidArgument(message) => {
                 std::io::Error::new(std::io::ErrorKind::InvalidInput, message)
             }
-            // Carried typed, so a write the commit leader refuses for a
-            // dropped family reaches the caller as this variant.
+            // Carried typed, so a write refused for a dropped family when
+            // it is decided reaches the caller as this variant.
             typed @ Self::InvalidColumnFamily(_) => {
                 std::io::Error::new(std::io::ErrorKind::InvalidInput, typed)
             }
@@ -161,7 +252,9 @@ impl Error {
             typed @ (Self::DataBlockLimitExceeded { .. }
             | Self::Busy(_)
             | Self::ContentMismatch
-            | Self::CallbackPanicked { .. }) => std::io::Error::other(typed),
+            | Self::CallbackPanicked { .. }
+            | Self::KeyProviderRequired
+            | Self::UnknownKey { .. }) => std::io::Error::other(typed),
             other => std::io::Error::other(other.to_string()),
         }
     }
@@ -189,11 +282,28 @@ fn carried(err: &std::io::Error) -> Option<Error> {
             callback,
             latched: *latched,
         }),
+        Error::KeyProviderRequired => Some(Error::KeyProviderRequired),
+        Error::UnknownKey { id } => Some(Error::UnknownKey { id: *id }),
+        Error::BackgroundFailed {
+            job,
+            hazard,
+            source,
+        } => Some(Error::BackgroundFailed {
+            job,
+            hazard,
+            source: Error::clone_io(source),
+        }),
         _ => None,
     }
 }
 
 impl Error {
+    /// Whether `err` carries a typed variant, which context added around it
+    /// must not flatten into a plain message.
+    pub(crate) fn is_typed(err: &std::io::Error) -> bool {
+        carried(err).is_some()
+    }
+
     /// The trait named by the [`Error::CallbackPanicked`] that `err` carries,
     /// if it carries one.
     pub(crate) fn callback_panic_of(err: &std::io::Error) -> Option<&'static str> {
@@ -203,10 +313,55 @@ impl Error {
         }
     }
 
+    /// A copy of this error, for an outcome several readers are handed: a
+    /// ticket's callbacks and the task that awaits it. An I/O error keeps its
+    /// kind, message and OS code (see [`Error::clone_io`]); every other
+    /// variant stays itself.
+    pub(crate) fn duplicate(&self) -> Self {
+        match self {
+            Self::InvalidArgument(message) => Self::InvalidArgument(message.clone()),
+            Self::DataBlockLimitExceeded {
+                max_data_block_bytes,
+            } => Self::DataBlockLimitExceeded {
+                max_data_block_bytes: *max_data_block_bytes,
+            },
+            Self::Corruption(err) => Self::Corruption(Self::clone_io(err)),
+            Self::ReadOnly => Self::ReadOnly,
+            Self::Closed => Self::Closed,
+            Self::InvalidColumnFamily(message) => Self::InvalidColumnFamily(message.clone()),
+            Self::Busy(reason) => Self::Busy(reason),
+            Self::MergeFailed(key) => Self::MergeFailed(key.clone()),
+            Self::NoMergeOperator => Self::NoMergeOperator,
+            Self::ContentMismatch => Self::ContentMismatch,
+            Self::CallbackPanicked { callback, latched } => Self::CallbackPanicked {
+                callback,
+                latched: *latched,
+            },
+            Self::BackgroundFailed {
+                job,
+                hazard,
+                source,
+            } => Self::BackgroundFailed {
+                job,
+                hazard,
+                source: Self::clone_io(source),
+            },
+            Self::LogKeyWrite => Self::LogKeyWrite,
+            Self::WouldBlock(would_block) => Self::WouldBlock(would_block.clone()),
+            Self::KeyProviderRequired => Self::KeyProviderRequired,
+            Self::UnknownKey { id } => Self::UnknownKey { id: *id },
+            Self::Io(err) => Self::Io(Self::clone_io(err)),
+        }
+    }
+
     /// A copy of `err`, for a failure handed to several callers:
-    /// `io::Error` is not `Clone`. Kind and message are rebuilt, and a typed
-    /// variant the error carries stays that variant.
+    /// `io::Error` is not `Clone`. An OS error keeps its code, a typed
+    /// variant the error carries stays that variant, and anything else keeps
+    /// its kind and message.
     pub(crate) fn clone_io(err: &std::io::Error) -> std::io::Error {
+        if let Some(code) = err.raw_os_error() {
+            return std::io::Error::from_raw_os_error(code);
+        }
         match carried(err) {
             Some(typed) => typed.into_io_error(),
             None => std::io::Error::new(err.kind(), err.to_string()),
@@ -282,6 +437,15 @@ mod tests {
             Error::DataBlockLimitExceeded {
                 max_data_block_bytes: 4096,
             },
+            Error::KeyProviderRequired,
+            Error::UnknownKey {
+                id: crate::KeyId(9),
+            },
+            Error::BackgroundFailed {
+                job: "flush",
+                hazard: "disk full",
+                source: std::io::Error::new(std::io::ErrorKind::StorageFull, "no space"),
+            },
         ] {
             let text = typed.to_string();
             let io = typed.into_io_error();
@@ -290,6 +454,34 @@ mod tests {
             assert_eq!(back.to_string(), text);
             assert!(!matches!(back, Error::Io(_)), "{back:?} lost its variant");
         }
+    }
+
+    /// A background failure keeps its job, its class and the failure's own
+    /// kind across the I/O boundary, and its `Debug` output there and back
+    /// is its three fields.
+    #[test]
+    fn a_background_failure_crosses_an_io_error_with_its_fields() {
+        let source = || std::io::Error::new(std::io::ErrorKind::StorageFull, "no space");
+        let failed = || Error::BackgroundFailed {
+            job: "compaction",
+            hazard: "disk full",
+            source: source(),
+        };
+        let shown = format!(
+            "BackgroundFailed {{ job: \"compaction\", hazard: \"disk full\", source: {:?} }}",
+            source()
+        );
+        assert_eq!(format!("{:?}", failed()), shown);
+
+        let io = failed().into_io_error();
+        assert_eq!(io.kind(), std::io::ErrorKind::StorageFull);
+        let back = Error::from(io);
+        assert_eq!(format!("{back:?}"), shown);
+        assert!(matches!(
+            back,
+            Error::BackgroundFailed { job: "compaction", hazard: "disk full", source }
+                if source.kind() == std::io::ErrorKind::StorageFull
+        ));
     }
 
     #[test]
@@ -438,11 +630,67 @@ mod tests {
     }
 
     #[test]
-    fn merge_failed_display_contains_key_bytes() {
-        let e = Error::MergeFailed(b"k".to_vec());
-        let msg = format!("{e}");
-        assert!(msg.contains("merge"));
-        // Debug-printed key bytes show up as `[107]`.
-        assert!(msg.contains("107"));
+    fn a_failed_merge_shows_its_key_by_length_and_hash_never_by_bytes() {
+        let e = Error::MergeFailed(b"SECRET".to_vec());
+        let shown = RedactedKey(b"SECRET").to_string();
+        assert_eq!(
+            e.to_string(),
+            format!("merge operator failed for a {shown}")
+        );
+        assert_eq!(format!("{e:?}"), format!("MergeFailed({shown})"));
+        // The text a caller on an `io::Result` boundary reads is the same one.
+        let through_io = e.duplicate().into_io_error().to_string();
+        for text in [
+            e.to_string(),
+            format!("{e:?}"),
+            format!("{e:#?}"),
+            through_io,
+        ] {
+            assert!(text.contains("6-byte key (hash "), "{text}");
+            let squeezed: String = text.chars().filter(|c| !c.is_whitespace()).collect();
+            for leaked in ["SECRET", "83,69,67"] {
+                assert!(!squeezed.contains(leaked), "{leaked} leaked into {text}");
+            }
+        }
+        assert!(matches!(e, Error::MergeFailed(key) if key == b"SECRET"));
+    }
+
+    /// The hand-written `Debug` prints every other variant as a derive would:
+    /// a unit variant by name, a tuple variant with its field, a struct
+    /// variant with its named fields.
+    #[test]
+    fn the_other_variants_debug_as_a_derive_prints_them() {
+        assert_eq!(format!("{:?}", Error::Closed), "Closed");
+        assert_eq!(format!("{:?}", Error::NoMergeOperator), "NoMergeOperator");
+        assert_eq!(format!("{:?}", Error::Busy("stalled")), "Busy(\"stalled\")");
+        assert_eq!(
+            format!("{:?}", Error::invalid_argument("bad")),
+            "InvalidArgument(\"bad\")"
+        );
+        assert_eq!(
+            format!(
+                "{:?}",
+                Error::DataBlockLimitExceeded {
+                    max_data_block_bytes: 4096
+                }
+            ),
+            "DataBlockLimitExceeded { max_data_block_bytes: 4096 }"
+        );
+        assert_eq!(
+            format!(
+                "{:?}",
+                Error::CallbackPanicked {
+                    callback: "KeyClassifier",
+                    latched: true
+                }
+            ),
+            "CallbackPanicked { callback: \"KeyClassifier\", latched: true }"
+        );
+        let io = || std::io::Error::other("disk");
+        assert_eq!(format!("{:?}", Error::Io(io())), format!("Io({:?})", io()));
+        assert_eq!(
+            format!("{:?}", Error::Corruption(io())),
+            format!("Corruption({:?})", io())
+        );
     }
 }

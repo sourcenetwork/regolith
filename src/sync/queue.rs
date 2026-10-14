@@ -32,17 +32,26 @@
 //! later one, and every change made after the role is given up claims it
 //! afresh: no wakeup is lost, and no call waits on another thread.
 //!
-//! # A drain ends
+//! # What a drain costs its thread
 //!
-//! The holder of the role returns after bounded work, whatever the other
-//! threads release. With nobody queued, a release leaves no dirty bit and
-//! its request is void, so the drain does not pass again for it. With
-//! somebody queued, the pass a release asks for nudges the front waiter or
-//! finds it nudged already; either way [`NUDGE_OUT`] stays up until that
-//! waiter looks, and the releases that follow skip the drain altogether.
-//! While a handoff is owed every release asks for a pass, but nobody can
-//! barge then, so only the holders there were can release. What is left is
-//! one pass for each waiter that queues or withdraws meanwhile.
+//! The drain is lock-free, not wait-free. The holder of the role runs one
+//! pass. It runs another only if, since that pass began, a waiter queued,
+//! withdrew or claimed the handoff it is owed (each sets the dirty bit),
+//! or a release found a waiter queued (it leaves [`WAKE_FRONT`]). So a
+//! drain runs at most one pass plus one for each such operation of another
+//! thread.
+//!
+//! Releases alone never keep it at work. With nobody queued, a release
+//! leaves no dirty bit and its request is void, so the drain does not pass
+//! again for it. With somebody queued, the pass a release asks for nudges
+//! the front waiter or finds it nudged already; either way [`NUDGE_OUT`]
+//! stays up until that waiter looks, and the releases that follow skip the
+//! drain altogether. While a handoff is owed every release asks for a
+//! pass, but nobody can barge then, so only the holders there were can
+//! release.
+//!
+//! Waiters that keep queueing or withdrawing can keep it at work, one pass
+//! each: there is no cap on the passes of one call.
 //!
 //! Arrivals push onto a Treiber stack. Pushing is ABA-safe because nothing
 //! pops single nodes: a pass takes the whole stack with one swap and
@@ -75,6 +84,7 @@
 use core::ptr::{self, NonNull};
 
 use super::internal::{AtomicPtr, AtomicUsize, Ordering};
+use super::spin::Budget;
 use super::waiter::{Pool, Wait, Waiter, WakeList, release_queued};
 
 /// The drain role is held.
@@ -96,8 +106,18 @@ pub(super) const FIRST_BIT: u32 = 6;
 
 /// Whether a release that saw `prev` must run a drain pass: waiters are
 /// queued and no nudge is already on its way, or a handoff is owed.
+#[inline]
 pub(super) fn wants_drain(prev: usize) -> bool {
     prev & QUEUED != 0 && (prev & NUDGE_OUT == 0 || prev & HANDOFF != 0)
+}
+
+/// Whether a contender that saw `state` stops spinning and queues: a
+/// handoff is owed, or waiters are queued and nobody is changing the queue.
+/// A queue with the drain role taken may be emptying (a waiter that won its
+/// retry is withdrawing), so a spinner looks again after its next gap.
+#[inline]
+pub(super) fn stops_spin(state: usize) -> bool {
+    state & HANDOFF != 0 || state & (QUEUED | DRAINING) == QUEUED
 }
 
 /// The nudges of one pass. It raises [`NUDGE_OUT`] before the first nudge
@@ -165,17 +185,33 @@ pub(super) struct WaitQueue {
     /// Queued waiters marked owed a handoff.
     owed: AtomicUsize,
     pool: Pool,
+    /// How many rounds a contended acquire spins (see `spin`).
+    pub(super) spin: Budget,
 }
 
 impl WaitQueue {
     loom_const_fn! {
         pub(super) fn new(state: usize) -> Self {
+            Self::with_spin(state, Budget::new())
+        }
+    }
+
+    loom_const_fn! {
+        /// A queue whose contended acquires never spin (see `spin::Budget::never`).
+        pub(super) fn without_spin(state: usize) -> Self {
+            Self::with_spin(state, Budget::never())
+        }
+    }
+
+    loom_const_fn! {
+        fn with_spin(state: usize, spin: Budget) -> Self {
             Self {
                 state: AtomicUsize::new(state),
                 arrivals: AtomicPtr::new(ptr::null_mut()),
                 cancels: AtomicUsize::new(0),
                 owed: AtomicUsize::new(0),
                 pool: Pool::new(),
+                spin,
             }
         }
     }

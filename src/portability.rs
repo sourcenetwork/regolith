@@ -72,22 +72,29 @@
 //!
 //! ## Locks, specifically
 //!
-//! Every `Mutex`, `RwLock` and `Gate` in the engine comes from
+//! Every blocking `Mutex` left in the engine comes from
 //! [`crate::sync::internal`], which is `std::sync` on a normal build and
 //! `loom::sync` under `--cfg loom`. That is one seam rather than sixty
 //! call sites, so the remaining work for tier B is to add a third arm
-//! to that module backed by `spin` or `critical-section`.
+//! to that module backed by `spin` or `critical-section`. The engine's
+//! background state (the compaction gate, the flush exclusion, the claims
+//! on tables, the scheduler, the background health), its close, its failure
+//! latch and the directory registry hold no such lock: they are atomics and
+//! the lock-free [`crate::sync`] primitives.
 //!
-//! The `Condvar` half is more subtle than the `Mutex` half: on a
-//! single-threaded target there is no other thread to wake, so a
-//! blocking wait has to be replaced by the caller doing the work itself
-//! rather than by a different condvar. Four condvar waits exist today: the
-//! rate limiter's refill wait, the pessimistic transaction lock table's
-//! acquisition wait, the snapshot registry's wait for snapshots to drain,
-//! and the compaction gate, which `compact_range`, an external file ingest,
-//! a checkpoint and `drop_all` wait on. A commit follower parks on its slot
-//! and a stalled writer parks on a kovan signal, neither on a condvar.
+//! Waiting is more subtle than locking: on a single-threaded target there
+//! is no other thread to wake, so a blocking wait has to be replaced by the
+//! caller doing the work itself. No condvar wait is left today. The
+//! rate limiter sleeps in slices until its bytes are due, a commit follower
+//! parks on its slot, a stalled writer parks on a kovan signal, a wait for
+//! snapshots to drain parks on a `regolith::sync::Notify` its releases
+//! wake, and a blocking wait for a key's lock parks until the lock table's
+//! release wakes it. A thread that waits for the compaction gate,
+//! the flush exclusion or a close in flight parks itself until the
+//! [`crate::sync`] primitive wakes it; on `wasm32`, where the one thread
+//! could only be waiting for itself, that wait is an error instead
+//! (`sync::internal::wait_here`).
 
 pub(crate) use portable_atomic::{
-    AtomicBool, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering,
+    AtomicBool, AtomicPtr, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering,
 };

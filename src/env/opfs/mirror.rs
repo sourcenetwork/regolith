@@ -29,6 +29,7 @@ use kovan_map::HashMap;
 
 use crate::env::mem_file::{Charge, MemFile};
 use crate::env::persist_order::persist_rank;
+use crate::env::{ReadDir, flat_children};
 use crate::portability::{AtomicU64, AtomicUsize, Ordering};
 use wasm_bindgen::JsValue;
 
@@ -186,6 +187,15 @@ impl std::fmt::Debug for MirrorFs {
     }
 }
 
+/// What [`MirrorFs::load`] found in an OPFS directory.
+pub(super) enum Loaded {
+    /// Every mirror file, read whole, within the limit.
+    Files(Vec<(PathBuf, Vec<u8>)>),
+    /// The mirror files hold this many bytes, more than the limit; none of
+    /// them is kept.
+    OverLimit(usize),
+}
+
 fn removed_while_open() -> io::Error {
     io::Error::new(io::ErrorKind::NotFound, "file was removed while open")
 }
@@ -218,17 +228,35 @@ impl MirrorFs {
         fs
     }
 
-    /// Read every mirror file out of an OPFS directory.
-    pub(super) async fn load(directory: &JsValue) -> Result<Vec<(PathBuf, Vec<u8>)>, JsValue> {
-        let entries = js::list_files(directory).await?;
+    /// Read every mirror file out of an OPFS directory, walking it one
+    /// entry at a time, as long as the files fit in `limit` bytes.
+    ///
+    /// Each file's size is read before its bytes. Once the total passes
+    /// `limit` the walk drops what it read and only sums the sizes of the
+    /// rest, so a stored database too large to mirror is refused without
+    /// ever being held: wasm linear memory, once grown, is never returned
+    /// to the host.
+    pub(super) async fn load(directory: &JsValue, limit: usize) -> Result<Loaded, JsValue> {
+        let mut walk = js::FileWalk::new(directory)?;
         let mut loaded = Vec::new();
-        for (name, handle) in entries {
+        let mut resident = 0usize;
+        while let Some((name, handle)) = walk.next_file().await? {
             let Some(path) = decode_name(&name) else {
                 continue;
             };
+            let size = usize::try_from(js::file_size(&handle).await?).unwrap_or(usize::MAX);
+            resident = resident.saturating_add(size);
+            if resident > limit {
+                loaded = Vec::new();
+                continue;
+            }
             loaded.push((path, js::read_whole_file(&handle).await?));
         }
-        Ok(loaded)
+        Ok(if resident > limit {
+            Loaded::OverLimit(resident)
+        } else {
+            Loaded::Files(loaded)
+        })
     }
 
     pub(super) fn resident_bytes(&self) -> usize {
@@ -374,11 +402,11 @@ impl MirrorFs {
         Err(super::not_found(path))
     }
 
-    pub(super) fn read_dir(&self, path: &Path) -> io::Result<Vec<(PathBuf, bool)>> {
+    pub(super) fn read_dir(&self, path: &Path) -> io::Result<ReadDir<'_>> {
         if !self.dirs.contains_key(path) {
             return Err(super::not_found(path));
         }
-        Ok(super::children(path, self.files.keys(), self.dirs.keys()))
+        Ok(flat_children(path, self.files.keys(), self.dirs.keys()))
     }
 
     pub(super) fn remove_file(&self, path: &Path) -> io::Result<()> {
@@ -391,22 +419,59 @@ impl MirrorFs {
         Ok(())
     }
 
+    /// Move `from` to `to`, replacing `to`. Atomic to a concurrent open, as
+    /// `MemEnv`'s rename is: the file is published at `to` before it leaves
+    /// `from`, so one of the two names always holds it.
     pub(super) fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
         if from == to {
             return self.entry(from).map(|_| ());
         }
-        let entry = self
-            .files
-            .remove(from)
-            .ok_or_else(|| super::not_found(from))?;
-        entry.touch(self.version());
-        if let Some(replaced) = self.files.insert(to.to_path_buf(), entry) {
-            self.resident.release(replaced.data.len());
+        loop {
+            let entry = self.entry(from)?;
+            // Dirty under its new name before anyone can see it there, so a
+            // persist that finds it at `to` writes it.
+            entry.touch(self.version());
+            // `to` stops being a pending deletion before it names a file
+            // again, so a persist never writes it and then deletes it.
+            let was_deleted = self.deleted.remove(to).is_some();
+            let replaced = self.files.insert(to.to_path_buf(), Arc::clone(&entry));
+            if self
+                .files
+                .remove_if(from, |held| Arc::ptr_eq(held, &entry))
+                .is_some()
+            {
+                if let Some(replaced) = replaced {
+                    self.resident.release(replaced.data.len());
+                }
+                self.deleted.insert(from.to_path_buf(), ());
+                super::register_ancestors(&self.dirs, to);
+                return Ok(());
+            }
+            // Another rename or a removal took `from` first: put `to` back
+            // as it was, unless something replaced it since, and look again.
+            // The namespace is exact whatever races; the resident byte
+            // count is exact unless two renames or a rename and a removal
+            // race on one source, which regolith never issues (a mirror runs
+            // on one thread, and the open-file table serializes moves).
+            match replaced {
+                Some(previous) => {
+                    let bytes = previous.data.len();
+                    if self
+                        .files
+                        .replace_if(to.to_path_buf(), previous, |held| Arc::ptr_eq(held, &entry))
+                        .is_err()
+                    {
+                        self.resident.release(bytes);
+                    }
+                }
+                None => {
+                    self.files.remove_if(to, |held| Arc::ptr_eq(held, &entry));
+                    if was_deleted && !self.files.contains_key(to) {
+                        self.deleted.insert(to.to_path_buf(), ());
+                    }
+                }
+            }
         }
-        self.deleted.insert(from.to_path_buf(), ());
-        self.deleted.remove(to);
-        super::register_ancestors(&self.dirs, to);
-        Ok(())
     }
 }
 

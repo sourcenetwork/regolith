@@ -2,37 +2,42 @@
 //!
 //! The registry ([`CfRegistry`]) is read without a lock everywhere. What
 //! keeps a family's life consistent with the data is *where* it changes and
-//! where it is checked: both happen in the ordered commit step, under the
-//! pipeline mutex every write group already holds.
+//! where it is checked: both happen in ring order, in the commit pipeline.
 //!
-//! - **A write is fenced at admission.** Before a request joins a group (it
-//!   takes no sequence until then), [`RegolithEngine::cf_fence`] checks every
-//!   family its keys name. A request naming a dropped family is refused
-//!   whole, with nothing logged and no sequence taken.
-//! - **A drop is a group of its own, then a retire.** [`RegolithEngine::drop_family`]
-//!   commits the family's range tombstone and meta delete as a group of one,
-//!   and only after that group is durable and applied removes the family from
-//!   the registry, still holding the mutex. Every write admitted before it
-//!   took a lower sequence, so the tombstone deletes it; every write admitted
-//!   after sees the family gone.
-//! - **A create is a group of its own, then a publish.** [`RegolithEngine::create_family`]
-//!   draws the next id, commits the meta entry, and publishes the family only
-//!   once that commit succeeded, so no handle exists for a family the log
-//!   does not hold.
+//! - **Every commit is fenced when it is decided, before it takes a
+//!   sequence.** Whatever kind of slot it is (a plain write, an optimistic
+//!   transaction, a create's or a drop's own commit), deciding it begins
+//!   with [`RegolithEngine::cf_fence`]: a commit naming a family that is not
+//!   live is refused whole, with nothing logged and no sequence taken. One
+//!   place, so no path can miss it. An ingest's install fences the families
+//!   its table holds in its own ordered step, before it takes its sequence
+//!   (`ingest.rs`).
+//! - **A drop is an ordered unit: a commit, then a retire.**
+//!   [`RegolithEngine::drop_family`] runs in the ordered step
+//!   (`ordered.rs`): with every earlier commit published and no later one
+//!   decided, it commits the family's range tombstone and meta delete, and
+//!   only once that commit is durable and applied removes the family from
+//!   the registry, before any later slot is decided. Every write decided
+//!   before it took a lower sequence, so the tombstone deletes it; every
+//!   write decided after is fenced against the retired family.
+//! - **A create is an ordered unit: a commit, then a publish.**
+//!   [`RegolithEngine::create_family`] draws the next id, commits the meta
+//!   entry, and publishes the family only once that commit succeeded, so no
+//!   handle exists for a family the log does not hold.
 //!
 //! So a write to a family lands only while the family is live, and a write
 //! racing a drop is either deleted by the drop or refused: never committed
 //! after the tombstone, where it would be invisible to every handle and never
 //! reclaimed. `proofs/tla/CfRegistry.tla` and `proofs/lean/Regolith/CfRegistry.lean`
-//! model exactly this order, with the fence moved out of the ordered step as
-//! the bug they rule out.
+//! model exactly this order, with the fence moved out of the ordered step, or
+//! skipped on one path, as the bugs they rule out.
 
 use std::collections::BTreeMap;
 use std::io;
 use std::sync::Arc;
 
 use super::super::{DurabilityMode, RegolithEngine, grouped_batch_ops};
-use super::{GroupTicket, WriteRequest, release_stranded};
+use super::WriteRequest;
 use crate::WriteBatchOp;
 use crate::column_family::{
     CF_PREFIX_LEN, CfRegistry, ColumnFamilyHandle, DEFAULT_CF_ID, META_CF_ID, cf_lower_bound,
@@ -57,13 +62,13 @@ impl RegolithEngine {
     }
 
     /// Refuse `request` when a key in it names a column family that is not
-    /// live. Runs in the ordered step, under the pipeline mutex, before the
-    /// request joins a group: that is what orders it against a drop.
+    /// live. A transaction is fenced by the writes it carries; the appends it
+    /// numbers later write the default family, which is never dropped.
     pub(super) fn cf_fence(&self, request: &WriteRequest) -> io::Result<()> {
         match request {
-            WriteRequest::Idle => Ok(()),
             WriteRequest::Put { key, .. } => self.cf_fence_keys(std::iter::once(key.as_slice())),
             WriteRequest::Batch { ops, .. } => self.cf_fence_ops(ops),
+            WriteRequest::Txn(txn) => self.cf_fence_ops(&txn.ops),
         }
     }
 
@@ -94,7 +99,10 @@ impl RegolithEngine {
     }
 
     /// [`Self::cf_fence`] over a run of keys.
-    fn cf_fence_keys<'a>(&self, keys: impl IntoIterator<Item = &'a [u8]>) -> io::Result<()> {
+    pub(super) fn cf_fence_keys<'a>(
+        &self,
+        keys: impl IntoIterator<Item = &'a [u8]>,
+    ) -> io::Result<()> {
         let Some(families) = self.families.get() else {
             return Ok(());
         };
@@ -115,90 +123,80 @@ impl RegolithEngine {
 
     /// Create the column family `name`, or return the live one of that name.
     ///
-    /// Draws the next id, commits its meta entry and the advanced id counter
-    /// as a group of one, and publishes the family only once that group is
-    /// durable and applied. Concurrent creates of one name are ordered by
-    /// the pipeline mutex, so the second finds the first's family.
+    /// In the ordered step: draws the next id, commits its meta entry and
+    /// the advanced id counter, and publishes the family only once that
+    /// commit is durable and applied. Concurrent creates of one name take
+    /// their turns through the ring, so the second finds the first's family.
     pub(crate) fn create_family(
         &self,
         name: &str,
         durability: DurabilityMode,
     ) -> io::Result<ColumnFamilyHandle> {
-        let families = self.families()?;
+        self.families()?;
         self.ensure_writable()?;
-        let mut pipe = self.pipeline.lock();
-        if let Some(existing) = families.get(name) {
-            return Ok(existing);
-        }
-        let Some(id) = families.next_id() else {
-            return Err(
-                crate::Error::invalid_argument("the column-family id space is exhausted")
-                    .into_io_error(),
-            );
-        };
-        let mut point_ops = BTreeMap::new();
-        point_ops.insert(meta::name_key(name), Some(id.to_be_bytes().to_vec()));
-        point_ops.insert(meta::next_id_key(), Some((id + 1).to_be_bytes().to_vec()));
-        let request = WriteRequest::Batch {
-            ops: grouped_batch_ops(point_ops, Vec::new(), Vec::new()),
-            durability,
-            disable_wal: false,
-        };
-        release_stranded(&mut pipe.group);
-        pipe.group.push(GroupTicket {
-            slot: None,
-            request,
+        let name = name.to_string();
+        let created = self.ordered(move |engine, ord| {
+            let families = engine.families()?;
+            if let Some(existing) = families.get(&name) {
+                return Ok(existing);
+            }
+            let Some(id) = families.next_id() else {
+                return Err(crate::Error::invalid_argument(
+                    "the column-family id space is exhausted",
+                )
+                .into_io_error());
+            };
+            let mut point_ops = BTreeMap::new();
+            point_ops.insert(meta::name_key(&name), Some(id.to_be_bytes().to_vec()));
+            point_ops.insert(meta::next_id_key(), Some((id + 1).to_be_bytes().to_vec()));
+            let ops = grouped_batch_ops(point_ops, Vec::new(), Vec::new());
+            ord.commit_alone(&ops, durability)?;
+            // Published inside the ordered step, before any later commit is
+            // decided.
+            Ok(families.publish(id, &name))
         });
-        let view = self.view.load();
-        let result = self.run_and_complete(&mut pipe, view);
-        // Published inside the ordered step, before any later group runs.
-        let created = result.map(|_| families.publish(id, name));
-        self.drain_locked(&mut pipe);
+        // Off the pipeline, as every commit runs the step it left owing.
+        self.run_owed_step();
         created
     }
 
     /// Drop the column family `cf`.
     ///
-    /// Commits a range tombstone over the family's keys and the delete of
-    /// its meta entry as a group of one, then retires the family from the
-    /// registry before releasing the pipeline mutex. A handle that is not
-    /// live when the drop reaches the ordered step (another drop won) is
-    /// refused there.
+    /// In the ordered step: commits a range tombstone over the family's keys
+    /// and the delete of its meta entry, then retires the family from the
+    /// registry before any later commit is decided. A handle that is not
+    /// live when the drop's turn comes (another drop won) is refused there.
     pub(crate) fn drop_family(
         &self,
         cf: &ColumnFamilyHandle,
         durability: DurabilityMode,
     ) -> io::Result<()> {
-        let families = self.families()?;
+        self.families()?;
         self.ensure_writable()?;
-        let mut pipe = self.pipeline.lock();
-        if !families.is_live_handle(cf) {
-            return Err(invalid_handle_error(cf).into_io_error());
-        }
-        let mut point_ops = BTreeMap::new();
-        point_ops.insert(meta::name_key(cf.name()), None);
-        let range = (cf_lower_bound(cf.id()), cf_upper_bound(cf.id()));
-        let request = WriteRequest::Batch {
-            ops: grouped_batch_ops(point_ops, vec![range], Vec::new()),
-            durability,
-            disable_wal: false,
-        };
-        release_stranded(&mut pipe.group);
-        pipe.group.push(GroupTicket {
-            slot: None,
-            request,
-        });
-        let view = self.view.load();
-        let result = self.run_and_complete(&mut pipe, view);
-        if result.is_ok() {
+        let cf = cf.clone();
+        let dropped = self.ordered(move |engine, ord| {
+            let families = engine.families()?;
+            if !families.is_live_handle(&cf) {
+                return Err(invalid_handle_error(&cf).into_io_error());
+            }
+            let mut point_ops = BTreeMap::new();
+            point_ops.insert(meta::name_key(cf.name()), None);
+            let range = (cf_lower_bound(cf.id()), cf_upper_bound(cf.id()));
+            let ops = grouped_batch_ops(point_ops, vec![range], Vec::new());
+            ord.commit_alone(&ops, durability)?;
             // The tombstone is durable and applied: from this retire on, the
             // fence refuses every write to the family.
             families.retire(cf.id());
-        }
-        self.drain_locked(&mut pipe);
-        result.map(|_| ())
+            Ok(())
+        });
+        self.run_owed_step();
+        dropped
     }
 }
+
+#[cfg(test)]
+#[path = "families_tests.rs"]
+mod tests;
 
 /// The family a prefixed key belongs to, or `None` for a key too short to
 /// carry one.

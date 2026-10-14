@@ -28,6 +28,9 @@
 //! - **Cancellation at every await point**: a future polled once and then
 //!   dropped races the release that may hand it the lock or nudge it;
 //!   whatever it was given must reach the next waiter.
+//! - **No access after free**: a waiter node handed back to the allocator
+//!   counts as written (`Waiter::retire`), so a party that touches a node
+//!   after letting go of its reference fails every model as a race.
 //! - **Reentrancy depth**: an owner nests and unwinds while another owner
 //!   waits.
 //! - **The upgradable read**: it shares with readers, upgrades while they
@@ -38,9 +41,22 @@
 //!
 //! - **A drain that ends**: a waiter that serves the queue itself while the
 //!   holder lets go and barges back runs a bounded number of passes and is
-//!   served. That model counts passes, which the public API cannot see, so
-//!   it lives in `src/sync/loom_model.rs`, with a calibration that writes
-//!   the nudge marker the wrong way and must fail.
+//!   served; and a thread that holds the drain role over an empty queue
+//!   runs one pass, whatever another thread releases. Those models count
+//!   passes, which the public API cannot see, so they live in
+//!   `src/sync/loom_model.rs`, each with a calibration that writes its step
+//!   the wrong way and must fail.
+//!
+//! - **The spins (E48)**: under loom a spin has one round. Every model here
+//!   runs the spin before queueing; the spin on the waiter's node is
+//!   reached only where a model makes sure of it, because a spin that runs
+//!   out halves the budget to zero rounds. Two models check the spins
+//!   directly on the production semaphore: the Mutex's inline first attempt
+//!   refuses a lock owed to a queued waiter, and a nudge that lands while
+//!   the waiter spins on its node, calling no waker, or just after the
+//!   spin's last read, is never lost; the second counts the spins on the
+//!   node and the marks each way and fails if any count is below its floor.
+//!   Each has a calibration that takes the guard away and must fail.
 //!
 //! The waiter-node free list is a pass-through to the allocator under loom
 //! (see `Pool`), so node recycling itself is covered by miri and the unit
@@ -620,6 +636,43 @@ fn notify_waiters_reaches_a_registered_waiter() {
     });
 }
 
+/// A `Notified` created before a `notify_waiters` passes its generation
+/// check and is held up before it queues; the broadcast runs, and a newer
+/// waiter queues ahead of it. The older one is still owed the broadcast
+/// wherever it lands in the queue: a pass that only looks at the front
+/// stops at the newer waiter and leaves the older one parked for good,
+/// which loom reports as a deadlock.
+#[test]
+fn an_older_notified_queued_behind_a_newer_one_gets_the_broadcast() {
+    explore(
+        "an_older_notified_queued_behind_a_newer_one_gets_the_broadcast",
+        3,
+        5,
+        || {
+            let notify = Arc::new(Notify::new());
+            let created = Arc::new(AtomicBool::new(false));
+            let older = {
+                let (notify, created) = (Arc::clone(&notify), Arc::clone(&created));
+                thread::spawn(move || {
+                    let waiting = notify.notified();
+                    created.store(true, Ordering::Release);
+                    block_on(waiting);
+                })
+            };
+            wait_for(&created);
+            notify.notify_waiters();
+            // Created after the broadcast, so it is not this one's.
+            let mut newer = Box::pin(notify.notified());
+            let polled = newer
+                .as_mut()
+                .poll(&mut Context::from_waker(std::task::Waker::noop()));
+            assert!(polled.is_pending(), "nothing notified it");
+            older.join().expect("older");
+            drop(newer);
+        },
+    );
+}
+
 #[test]
 fn a_dropped_notified_passes_its_notify_one_on() {
     // SHRUNK: one preemption where there were two (1.2 million interleavings,
@@ -644,6 +697,40 @@ fn a_dropped_notified_passes_its_notify_one_on() {
         }
         waiter.join().expect("waiter");
     });
+}
+
+/// A queued `Notified` is dropped on its own thread while a broadcast's
+/// wake list takes its waker. The grant let go of the queue's reference,
+/// so once the wake list lets go of its own the dropped future frees the
+/// node; the wake list must be done with the node by then. Under loom a
+/// freed node counts as written (`Waiter::retire`), so a wake list that
+/// reads the node's link after letting it go fails this model.
+#[test]
+fn a_notified_dropped_while_its_broadcast_wakes_it_outlives_the_wake_list() {
+    explore(
+        "a_notified_dropped_while_its_broadcast_wakes_it_outlives_the_wake_list",
+        3,
+        5,
+        || {
+            let notify = Arc::new(Notify::new());
+            let queued = Arc::new(AtomicBool::new(false));
+            let dropper = {
+                let (notify, queued) = (Arc::clone(&notify), Arc::clone(&queued));
+                thread::spawn(move || {
+                    let mut waiting = Box::pin(notify.notified());
+                    let polled = waiting
+                        .as_mut()
+                        .poll(&mut Context::from_waker(std::task::Waker::noop()));
+                    assert!(polled.is_pending(), "nothing notified it yet");
+                    queued.store(true, Ordering::Release);
+                    drop(waiting);
+                })
+            };
+            wait_for(&queued);
+            notify.notify_waiters();
+            dropper.join().expect("dropper");
+        },
+    );
 }
 
 #[test]
@@ -909,6 +996,36 @@ fn calibration_a_marker_lowered_on_a_pending_nudge_keeps_the_drain_passing() {
     regolith::loom_exports::sync::calibration_a_marker_lowered_on_a_pending_nudge_keeps_the_drain_passing();
 }
 
+/// E48. The Mutex's inline first attempt never takes a lock owed to a
+/// queued waiter (TLA+ HandoffExclusive and BoundedBypass, with the spins);
+/// its calibration drops the attempt's HANDOFF test and must fail.
+#[test]
+fn the_first_attempt_refuses_a_lock_owed_to_a_waiter() {
+    regolith::loom_exports::sync::the_first_attempt_refuses_a_lock_owed_to_a_waiter();
+}
+
+#[test]
+#[should_panic(expected = "the holder took a lock owed to the queued waiter")]
+fn calibration_a_first_attempt_that_ignores_handoff_barges_past_an_owed_waiter() {
+    regolith::loom_exports::sync::calibration_a_first_attempt_that_ignores_handoff_barges_past_an_owed_waiter();
+}
+
+/// E48. A release that nudges a waiter spinning on its node calls no waker,
+/// and the waiter is served all the same (TLA+ NoLostWakeup and
+/// Lean `no_lost_wakeup_spinning`), with floors on the spins it must reach;
+/// the calibration is the production spin with its look taken away and
+/// must leave the waiter armed beside an unread mark.
+#[test]
+fn a_nudge_while_the_waiter_spins_is_never_lost() {
+    regolith::loom_exports::sync::a_nudge_while_the_waiter_spins_is_never_lost();
+}
+
+#[test]
+#[should_panic(expected = "the waiter armed and slept beside an unread mark")]
+fn calibration_a_node_spin_that_skips_its_look_sleeps_beside_the_mark() {
+    regolith::loom_exports::sync::calibration_a_node_spin_that_skips_its_look_sleeps_beside_the_mark();
+}
+
 /// E33. An upgrade waits for a reader and is dropped. While its drop is
 /// under way the reader leaves, which runs a drain pass, and a second task
 /// takes the upgradable read; then the first task tries to write. The
@@ -1046,6 +1163,17 @@ fn calibration_a_pass_that_takes_the_write_for_a_dropped_upgrade_lets_a_writer_i
             second.join().expect("second");
         },
     );
+}
+
+#[test]
+fn a_drain_that_found_nobody_queued_ends_while_another_thread_releases() {
+    regolith::loom_exports::sync::a_drain_that_found_nobody_queued_ends_while_another_thread_releases();
+}
+
+#[test]
+#[should_panic(expected = "over a queue with nobody in it")]
+fn calibration_a_release_that_dirties_keeps_an_empty_drain_passing() {
+    regolith::loom_exports::sync::calibration_a_release_that_dirties_keeps_an_empty_drain_passing();
 }
 
 #[test]

@@ -17,7 +17,9 @@ use std::time::{Duration, Instant};
 use clap::Parser;
 use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};
-use regolith::{CompressionType, Db, Options, WriteOptions};
+use regolith::{
+    CompressionType, Db, KeyId, KeyMaterial, KeyProvider, Options, WriteOptions, through_stalls,
+};
 
 /// Simple benchmark driver for regolith.
 #[derive(Parser)]
@@ -72,6 +74,34 @@ struct Args {
     /// results into external comparison scripts.
     #[arg(long, default_value_t = false)]
     json: bool,
+
+    /// Encrypt the database at rest under a fixed benchmark key.
+    #[arg(long, default_value_t = false)]
+    encrypt: bool,
+
+    /// Block cache size in bytes; 0 disables the cache, so every read
+    /// decodes its block from the file. Unset keeps the engine default.
+    #[arg(long)]
+    block_cache_size: Option<usize>,
+
+    /// Flush the memtable after a read workload's prefill, so the reads
+    /// that follow come from tables rather than the memtable.
+    #[arg(long, default_value_t = false)]
+    flush_after_fill: bool,
+}
+
+/// One fixed key, for measuring what encryption at rest costs. Not a
+/// key to protect anything with.
+struct BenchKey;
+
+impl KeyProvider for BenchKey {
+    fn current(&self) -> KeyId {
+        KeyId(1)
+    }
+
+    fn key(&self, id: KeyId) -> Option<KeyMaterial> {
+        (id == KeyId(1)).then(|| KeyMaterial::new([0x42; 32]))
+    }
 }
 
 fn main() {
@@ -83,11 +113,17 @@ fn main() {
         _ => CompressionType::Lz4,
     };
 
-    let opts = Options::default()
+    let mut opts = Options::default()
         .write_buffer_size(args.write_buffer_size)
         .block_size(args.block_size)
         .bloom_bits_per_key(args.bloom_bits)
         .compression(compression);
+    if args.encrypt {
+        opts = opts.key_provider(Arc::new(BenchKey));
+    }
+    if let Some(bytes) = args.block_cache_size {
+        opts = opts.block_cache_size(bytes);
+    }
 
     let seed = if args.seed == 0 {
         rand::random()
@@ -102,11 +138,12 @@ fn main() {
         args.key_size, args.value_size, args.num
     );
     println!(
-        "Compression: {:?}    WriteBuffer: {} MB    BlockSize: {} B    Seed: {}",
+        "Compression: {:?}    WriteBuffer: {} MB    BlockSize: {} B    Seed: {}    Encrypted: {}",
         compression,
         args.write_buffer_size / (1024 * 1024),
         args.block_size,
         seed,
+        args.encrypt,
     );
     println!("{:-<72}", "");
 
@@ -209,7 +246,7 @@ fn run_fillseq(db: &Db, args: &Args, _seed: u64) {
     let start = Instant::now();
     for i in 0..args.num {
         let key = sequential_key(i, args.key_size);
-        db.put(&key, &val).unwrap();
+        through_stalls(|| db.put(&key, &val)).unwrap();
     }
     let elapsed = start.elapsed();
     let bytes = args.num * (args.key_size + args.value_size) as u64;
@@ -222,7 +259,7 @@ fn run_fillrandom(db: &Db, args: &Args, seed: u64) {
     for _ in 0..args.num {
         let key = random_key(&mut rng, args.key_size);
         let val = random_value(&mut rng, args.value_size);
-        db.put(&key, &val).unwrap();
+        through_stalls(|| db.put(&key, &val)).unwrap();
     }
     let elapsed = start.elapsed();
     let bytes = args.num * (args.key_size + args.value_size) as u64;
@@ -236,13 +273,13 @@ fn run_overwrite(db: &Db, args: &Args, seed: u64) {
         .map(|_| random_key(&mut rng, args.key_size))
         .collect();
     for k in &keys {
-        db.put(k, &vec![0u8; args.value_size]).unwrap();
+        through_stalls(|| db.put(k, &vec![0u8; args.value_size])).unwrap();
     }
     let mut rng2 = SmallRng::seed_from_u64(seed + 1);
     let start = Instant::now();
     for k in &keys {
         let val = random_value(&mut rng2, args.value_size);
-        db.put(k, &val).unwrap();
+        through_stalls(|| db.put(k, &val)).unwrap();
     }
     let elapsed = start.elapsed();
     let bytes = args.num * (args.key_size + args.value_size) as u64;
@@ -309,7 +346,7 @@ fn run_deleterandom(db: &Db, args: &Args, seed: u64) {
     for _ in 0..args.num {
         let i = rng.random_range(0..args.num);
         let key = sequential_key(i, args.key_size);
-        let _ = db.delete(&key);
+        let _ = through_stalls(|| db.delete(&key));
     }
     let elapsed = start.elapsed();
     report("deleterandom", args, elapsed, args.num, 0);
@@ -334,7 +371,7 @@ fn run_compact(db: &Db, args: &Args, _seed: u64) {
     prefill_sequential(db, args);
 
     let start = Instant::now();
-    db.compact_range(None, None).unwrap();
+    db.compact_range(None, None).wait().unwrap();
     let elapsed = start.elapsed();
     report("compact", args, elapsed, 1, 0);
 }
@@ -344,7 +381,10 @@ fn prefill_sequential(db: &Db, args: &Args) {
     let val = random_value(&mut rng, args.value_size);
     for i in 0..args.num {
         let key = sequential_key(i, args.key_size);
-        db.put(&key, &val).unwrap();
+        through_stalls(|| db.put(&key, &val)).unwrap();
+    }
+    if args.flush_after_fill {
+        db.flush().unwrap();
     }
 }
 
@@ -363,7 +403,7 @@ fn run_fillsync(db: &Db, args: &Args, _seed: u64) {
     let n = args.num.min(args.num.max(1) / 10).max(1000);
     for i in 0..n {
         let key = sequential_key(i, args.key_size);
-        db.put_opt(&wo, &key, &val).unwrap();
+        through_stalls(|| db.put_opt(&wo, &key, &val)).unwrap();
     }
     let elapsed = start.elapsed();
     let bytes = n * (args.key_size + args.value_size) as u64;
@@ -398,7 +438,7 @@ fn run_updaterandom(db: &Db, args: &Args, seed: u64) {
         let key = sequential_key(i, args.key_size);
         let _ = db.get(&key).unwrap();
         let val = random_value(&mut rng, args.value_size);
-        db.put(&key, &val).unwrap();
+        through_stalls(|| db.put(&key, &val)).unwrap();
     }
     let elapsed = start.elapsed();
     let bytes = args.num * (args.key_size + args.value_size) as u64;
@@ -464,7 +504,7 @@ fn run_readrandomwriterandom(db: &Db, args: &Args, seed: u64) {
             let _ = db.get(&key).unwrap();
         } else {
             let val = random_value(&mut rng, args.value_size);
-            db.put(&key, &val).unwrap();
+            through_stalls(|| db.put(&key, &val)).unwrap();
         }
     }
     let elapsed = start.elapsed();

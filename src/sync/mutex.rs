@@ -18,7 +18,9 @@ use super::raw_semaphore::{PermitWait, RawSemaphore};
 /// Uncontended, [`try_lock`](Self::try_lock) and a guard's drop are one
 /// atomic read-modify-write each and allocate nothing. A caller takes the
 /// lock whenever it is free, even while others wait; under contention
-/// [`lock`](Self::lock) queues and returns `Pending`.
+/// [`lock`](Self::lock) spins briefly within the poll (see the
+/// [module docs](super#what-every-primitive-guarantees)), then queues and
+/// returns `Pending`.
 /// An unlock wakes the oldest waiter to try again; a waiter that loses
 /// [`MAX_BYPASS`](super::MAX_BYPASS) times is handed the lock directly,
 /// and `try_lock` fails until it has had it.
@@ -49,19 +51,50 @@ impl<T> Mutex<T> {
         }
     }
 
+    loom_const_fn! {
+        /// An unlocked mutex holding `value` whose contended acquires never
+        /// spin: they queue at once. For a mutex its holders keep across
+        /// long waits of their own (I/O, a flush, a close), where a spin
+        /// could only burn the caller's time.
+        pub(crate) fn new_without_spin(value: T) -> Self {
+            Self { sem: RawSemaphore::without_spin(1), value: UnsafeCell::new(value) }
+        }
+    }
+
     /// Consumes the mutex and returns its value.
     pub fn into_inner(self) -> T {
         self.value.into_inner()
     }
 }
 
+#[cfg(all(test, not(loom)))]
+impl<T: ?Sized> Mutex<T> {
+    /// The rounds a contended acquire of this mutex would spin now.
+    pub(crate) fn spin_rounds(&self) -> u32 {
+        use super::queue::Policy;
+        self.sem.queue().spin.rounds()
+    }
+}
+
 impl<T: ?Sized> Mutex<T> {
     /// Locks the mutex if it is free and no handoff is owed.
+    #[inline]
     pub fn try_lock(&self) -> Option<MutexGuard<'_, T>> {
-        self.sem.try_acquire(1).then(|| MutexGuard::new(self))
+        match self.sem.take_one() {
+            Ok(()) => Some(MutexGuard::new(self)),
+            Err(seen) => self
+                .sem
+                .try_acquire_one_from(seen)
+                .then(|| MutexGuard::new(self)),
+        }
     }
 
-    /// Waits for the lock.
+    /// Waits for the lock. Uncontended, the first poll is one load and one
+    /// atomic read-modify-write. Contended, a poll may spin for up to the
+    /// lock's spin budget before it queues, and again after a retry it lost,
+    /// before it returns `Pending`; it is lock-free, not wait-free: see
+    /// [Progress](super#progress).
+    #[inline]
     pub fn lock(&self) -> Lock<'_, T> {
         Lock {
             mutex: self,
@@ -99,6 +132,11 @@ impl<T: ?Sized> fmt::Debug for Mutex<T> {
 }
 
 /// Exclusive access to a [`Mutex`]'s value; unlocks on drop.
+///
+/// The release is one atomic read-modify-write when no waiter needs telling.
+/// Otherwise it is lock-free, not wait-free: it returns after one pass over
+/// the queue, plus at most one for each operation of another thread that
+/// lands on the queue meanwhile (see [Progress](super#progress)).
 #[must_use = "dropping the guard unlocks the mutex at once"]
 pub struct MutexGuard<'a, T: ?Sized> {
     mutex: &'a Mutex<T>,
@@ -132,6 +170,7 @@ impl<T: ?Sized> DerefMut for MutexGuard<'_, T> {
 }
 
 impl<T: ?Sized> Drop for MutexGuard<'_, T> {
+    #[inline]
     fn drop(&mut self) {
         self.mutex.sem.release(1);
     }
@@ -144,6 +183,7 @@ impl<T: ?Sized + fmt::Debug> fmt::Debug for MutexGuard<'_, T> {
 }
 
 /// Exclusive access to a [`Mutex`] held through an `Arc`; unlocks on drop.
+/// The release makes the progress [`MutexGuard`]'s does.
 #[must_use = "dropping the guard unlocks the mutex at once"]
 pub struct OwnedMutexGuard<T: ?Sized> {
     mutex: Arc<Mutex<T>>,
@@ -178,6 +218,7 @@ impl<T: ?Sized> DerefMut for OwnedMutexGuard<T> {
 }
 
 impl<T: ?Sized> Drop for OwnedMutexGuard<T> {
+    #[inline]
     fn drop(&mut self) {
         self.mutex.sem.release(1);
     }
@@ -199,15 +240,17 @@ pub struct Lock<'a, T: ?Sized> {
 impl<'a, T: ?Sized> Future for Lock<'a, T> {
     type Output = MutexGuard<'a, T>;
 
+    #[inline]
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<MutexGuard<'a, T>> {
         let this = self.get_mut();
         this.wait
-            .poll(&this.mutex.sem, 1, cx.waker())
+            .poll_one(&this.mutex.sem, cx.waker())
             .map(|()| MutexGuard::new(this.mutex))
     }
 }
 
 impl<T: ?Sized> Drop for Lock<'_, T> {
+    #[inline]
     fn drop(&mut self) {
         self.wait.cancel(&self.mutex.sem, 1);
     }
@@ -229,10 +272,11 @@ pub struct LockOwned<T: ?Sized> {
 impl<T: ?Sized> Future for LockOwned<T> {
     type Output = OwnedMutexGuard<T>;
 
+    #[inline]
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<OwnedMutexGuard<T>> {
         let this = self.get_mut();
         this.wait
-            .poll(&this.mutex.sem, 1, cx.waker())
+            .poll_one(&this.mutex.sem, cx.waker())
             .map(|()| OwnedMutexGuard {
                 mutex: Arc::clone(&this.mutex),
                 _value: PhantomData,
@@ -241,6 +285,7 @@ impl<T: ?Sized> Future for LockOwned<T> {
 }
 
 impl<T: ?Sized> Drop for LockOwned<T> {
+    #[inline]
     fn drop(&mut self) {
         self.wait.cancel(&self.mutex.sem, 1);
     }
@@ -258,6 +303,24 @@ mod tests {
     use crate::sync::test_support::{Polled, block_on};
 
     const ITERATIONS: usize = if cfg!(miri) { 20 } else { 5_000 };
+
+    /// A mutex built without spin queues its contended callers at once:
+    /// its budget is zero from the start and stays zero through a contended
+    /// wait, its wake and its retry, where a spinning mutex's starts above
+    /// zero.
+    #[test]
+    fn a_mutex_built_without_spin_never_spins() {
+        assert!(Mutex::new(()).spin_rounds() > 0, "a plain mutex spins");
+        let mutex = Mutex::new_without_spin(0u8);
+        assert_eq!(mutex.spin_rounds(), 0);
+        let held = mutex.try_lock().expect("free");
+        let mut waiter = Polled::new(mutex.lock());
+        waiter.pending();
+        drop(held);
+        assert_eq!(waiter.wakes(), 1);
+        *waiter.ready() += 1;
+        assert_eq!(mutex.spin_rounds(), 0, "the mutex never spins");
+    }
 
     #[test]
     fn releases_wake_waiters_in_arrival_order() {

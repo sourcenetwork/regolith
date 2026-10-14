@@ -24,6 +24,8 @@ use regolith::{
 };
 use tempfile::TempDir;
 
+mod common;
+
 const LEVELS: [IsolationLevel; 5] = [
     IsolationLevel::ReadCommitted,
     IsolationLevel::SnapshotIsolation,
@@ -1114,7 +1116,14 @@ fn close_and_commit_racing_run_every_callback_exactly_once() {
         let results = std::thread::scope(|scope| {
             let committer = scope.spawn(|| {
                 txns.into_iter()
-                    .map(|txn| txn.commit().is_ok())
+                    .map(|txn| match txn.commit() {
+                        Ok(_) => true,
+                        // Close won this transaction.
+                        Err(TransactionError::Engine(Error::Closed)) => false,
+                        Err(other) => {
+                            panic!("round {round}: a commit failed, and not on close: {other}")
+                        }
+                    })
                     .collect::<Vec<_>>()
             });
             if round % 2 == 0 {
@@ -1227,7 +1236,7 @@ proptest! {
                 Op::Poke(slot) => fixture.db().put(&key(slot), b"poke").unwrap(),
                 Op::Commit(slot) => {
                     if let Some((txn, record)) = live[slot].take() {
-                        let committed = txn.commit().is_ok();
+                        let committed = common::committed(&txn.commit());
                         let mut record = record;
                         record.committed = Some(committed);
                         done.push(record);

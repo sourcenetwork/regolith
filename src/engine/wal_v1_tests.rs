@@ -45,7 +45,7 @@ fn replay_at(
     path: &Path,
     position: WalPosition,
 ) -> io::Result<(Vec<WalEntry>, Option<TailVerdict>)> {
-    let mut iter = WalReplayIter::open(&crate::env::std_env(), path, position)?;
+    let mut iter = WalReplayIter::open(&crate::env::std_env(), path, position, None)?;
     let mut entries = Vec::new();
     while let Some(entry) = iter.next_entry()? {
         entries.push(entry);

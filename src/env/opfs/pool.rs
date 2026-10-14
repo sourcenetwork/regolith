@@ -29,7 +29,8 @@ use kovan_queue::seg_queue::SegQueue;
 use crate::portability::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use super::sah::{self, MountId, Slot, SlotHeader};
-use super::{children, not_found, register_ancestors};
+use super::{not_found, register_ancestors};
+use crate::env::{ReadDir, flat_children};
 
 /// Buckets each map starts with; they grow on demand.
 const BUCKETS: usize = 64;
@@ -215,11 +216,11 @@ impl SahPool {
         Ok(())
     }
 
-    pub(super) fn read_dir(&self, path: &Path) -> io::Result<Vec<(PathBuf, bool)>> {
+    pub(super) fn read_dir(&self, path: &Path) -> io::Result<ReadDir<'_>> {
         if !self.dirs.contains_key(path) {
             return Err(not_found(path));
         }
-        Ok(children(path, self.by_path.keys(), self.dirs.keys()))
+        Ok(flat_children(path, self.by_path.keys(), self.dirs.keys()))
     }
 
     pub(super) fn exists(&self, path: &Path) -> bool {
@@ -387,9 +388,18 @@ impl SahPool {
     /// The new binding is made durable before the old one is dropped, so
     /// a crash in the window leaves two slots claiming `to` and mount
     /// keeps the one with the higher generation. That is what makes
-    /// rename atomic on a filesystem with no atomic rename.
+    /// rename atomic on a filesystem with no atomic rename. In memory the
+    /// slot is published at `to` before `from` lets it go, so a concurrent
+    /// open always finds it under one of the two names.
     pub(super) fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
         sah::check_path_fits(to)?;
+        if from == to {
+            return self
+                .by_path
+                .get(from)
+                .map(|_| ())
+                .ok_or_else(|| not_found(from));
+        }
         let index = self.by_path.get(from).ok_or_else(|| not_found(from))?;
         let slot = self.slot(index)?;
 
@@ -406,8 +416,11 @@ impl SahPool {
         }
         slot.synced_through(changes);
 
-        self.by_path.remove(from);
-        if let Some(replaced) = self.by_path.insert(to.to_path_buf(), index) {
+        let replaced = self.by_path.insert(to.to_path_buf(), index);
+        // Only while `from` still names this slot: a removal of `from`
+        // that came first already let the name go.
+        self.by_path.remove_if(from, |held| *held == index);
+        if let Some(replaced) = replaced {
             self.release_slot(replaced)?;
         }
         register_ancestors(&self.dirs, to);

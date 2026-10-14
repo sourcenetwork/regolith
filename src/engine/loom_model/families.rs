@@ -2,18 +2,20 @@
 //!
 //! A protocol model, and deliberately so. The production registry
 //! (`column_family::CfRegistry`) keeps liveness in a kovan map, whose
-//! atomics loom does not see, and the ordered step is the commit leader
-//! under the pipeline mutex, which needs a whole engine. What is reproduced
+//! atomics loom does not see, and the ordered step is the commit
+//! pipeline's, which needs a whole engine. What is reproduced
 //! here is the part loom can decide, each piece standing in for one line of
 //! `engine::commit::families`:
 //!
 //! - the family's liveness is one atomic word that moves unborn, live, dead
 //!   and never back (`CfRegistry::publish`, `retire`: one map write each,
 //!   and ids are never reused);
-//! - the ordered step is one mutex, and inside it a write takes the next
-//!   sequence (`run_group`'s `fetch_add`);
+//! - the ordered step is one mutex here, and inside it a write takes the
+//!   next sequence (in the engine: slots decided one at a time, in ring
+//!   order);
 //! - a write checks the family in the ordered step before it takes a
-//!   sequence (`cf_fence` at admission);
+//!   sequence (`cf_fence`, the first act of deciding every commit, whatever
+//!   kind of slot it is);
 //! - a drop takes the tombstone's sequence in the ordered step and retires
 //!   the family before it leaves it (`drop_family`);
 //! - a create publishes the family in the ordered step after its meta

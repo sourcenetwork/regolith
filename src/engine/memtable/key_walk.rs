@@ -5,9 +5,7 @@
 use std::ops::ControlFlow;
 
 use super::super::MergeChain;
-use super::{
-    DbSlice, LookupKey, MemTable, NodeRef, Ordering, VALUE_TYPE_MERGE, decode_internal_key,
-};
+use super::{DbSlice, LookupKey, MemTable, NodeRef, VALUE_TYPE_MERGE, decode_internal_key};
 
 /// Visits one entry of a key in a memtable: its node, sequence and value type.
 pub(crate) trait VisitNode<'mem, R>:
@@ -96,14 +94,16 @@ impl MemTable {
 
 impl MemTable {
     /// The first entry, in key order, whose user key lies in `[lo, hi)` and
-    /// whose sequence is above `floor`: its user key, sequence and value
-    /// type. Reads in place, and walks every entry of the range, old versions
-    /// included, since a skip list has no order by sequence.
+    /// whose sequence is above `floor` and at or below `ceil`: its user key,
+    /// sequence and value type. Reads in place, and walks every entry of the
+    /// range, old versions included, since a skip list has no order by
+    /// sequence. `u64::MAX` as `ceil` bounds nothing.
     pub(crate) fn newer_in_range(
         &self,
         lo: &[u8],
         hi: &[u8],
         floor: u64,
+        ceil: u64,
     ) -> Option<(Vec<u8>, u64, u8)> {
         let start = LookupKey::from_prefixed(lo, u64::MAX);
         let mut node = self.list.seek_ge(start.internal());
@@ -112,7 +112,7 @@ impl MemTable {
             if user_key >= hi {
                 return None;
             }
-            if seq > floor {
+            if seq > floor && seq <= ceil {
                 return Some((user_key.to_vec(), seq, value_type));
             }
             node = current.next();
@@ -132,11 +132,9 @@ impl MemTable {
         {
             return true;
         }
-        self.range_tombstone_bytes.load(Ordering::Acquire) != 0
+        self.has_range_tombstones()
             && self
                 .range_tombstones
-                .lock()
-                .iter()
                 .any(|rt| rt.start.as_slice() <= last && first < rt.end.as_slice())
     }
 
