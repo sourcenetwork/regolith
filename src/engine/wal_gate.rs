@@ -131,12 +131,6 @@ impl Gate {
         }
     }
 
-    /// Whether no write is counted in now: one load, a hint that may be
-    /// stale by the time the caller acts on it.
-    pub(crate) fn idle(&self) -> bool {
-        self.word.load(Ordering::Acquire) & WRITERS == 0
-    }
-
     /// The epoch a write must have been decided in to be let in now.
     pub(crate) fn epoch(&self) -> u64 {
         self.word.load(Ordering::SeqCst) >> WRITER_BITS

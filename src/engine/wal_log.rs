@@ -306,12 +306,6 @@ impl Log {
         (HEADER_LEN + payload_len + overhead) as u64
     }
 
-    /// Whether no write of a record is in flight now (a hint: see
-    /// [`Gate::idle`]).
-    pub(crate) fn writes_idle(&self) -> bool {
-        self.gate.idle()
-    }
-
     /// The log's write epoch: the one a record decided now is written in.
     pub(crate) fn epoch(&self) -> u64 {
         self.gate.epoch()

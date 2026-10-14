@@ -88,12 +88,12 @@
 //!   publishes what its run made publishable before it wakes the run's
 //!   owners ([`RegolithEngine::publish_ready`]).
 //! - **WU8, an uncontended write skips the unit.** An owner whose record
-//!   nobody has in hand, finding the unit free with no note on it and no
-//!   write in flight, encodes its record and writes it by itself, through
-//!   the gate as a copy is ([`RegolithEngine::write_alone`]): what a lone
-//!   writer did before the unit, with no claim, gather or wake. The guard is
-//!   two loads and only about speed; the copy's look again once counted in
-//!   is what keeps it safe (WG4).
+//!   nobody has in hand, finding the unit free with no note on it, encodes
+//!   its record and writes it by itself, through the gate as a copy is
+//!   ([`RegolithEngine::write_alone`]): what a writer did before the unit,
+//!   with no claim, gather or wake. The guard is one load and only about
+//!   speed; the copy's look again once counted in is what keeps it safe
+//!   (WG4).
 
 use std::io::{self, IoSlice};
 use std::sync::Arc;
@@ -702,10 +702,10 @@ impl RegolithEngine {
 
     /// The uncontended fast path (WU8): slot `desc`'s owner encodes its
     /// record and writes it by itself, through the gate as a copy is, when
-    /// the unit is free with no note on it, no write is in flight, and nobody
-    /// has the record in hand. Two loads decide it; a commit that finds
-    /// either busy goes through the unit, whose runs pay off only when writes
-    /// meet. `true` when it wrote, or found the record written or discarded
+    /// the unit is free with no note on it and nobody has the record in
+    /// hand. One load of the unit decides it; a commit that finds the unit
+    /// busy goes through it, since its runs pay off once writes meet there.
+    /// `true` when it wrote, or found the record written or discarded
     /// meanwhile.
     pub(super) fn write_alone(&self, pipe: &Pipeline, desc: &Descriptor) -> bool {
         let Some(decision) = desc.decision() else {
@@ -713,7 +713,6 @@ impl RegolithEngine {
         };
         if decision.place.is_none()
             || !pipe.writes.quiet()
-            || !decision.after.log.writes_idle()
             || desc.flags() & (FILLING | FILLED | WRITTEN | FAILED) != 0
         {
             return false;

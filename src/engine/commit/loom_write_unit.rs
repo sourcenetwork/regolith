@@ -634,8 +634,8 @@ fn write_through_gate(gate: &Gate, desc: &Descriptor) -> bool {
     wrote
 }
 
-/// WU8, the fast path racing a claimer: the owner finds the unit quiet and
-/// no write in flight (`WriteUnit::quiet`, `Gate::idle`), encodes its record
+/// WU8, the fast path racing a claimer: the owner finds the unit quiet
+/// (`WriteUnit::quiet`), encodes its record
 /// and writes it by itself, while another thread claims the unit and writes
 /// a run of the filled records it finds. Whoever writes reads the whole
 /// record: the buffer is a tracked cell, encoded under the claim of its
@@ -666,9 +666,9 @@ pub fn the_fast_path_racing_a_claimer_writes_only_whole_records() {
                     wrote
                 })
             };
-            // The owner: the fast path when the unit is quiet and nothing is
-            // in flight, else the unit's way, here a copy (Await::Copy).
-            let fast = unit.quiet() && gate.idle();
+            // The owner: the fast path when the unit is quiet, else the
+            // unit's way, here a copy (Await::Copy).
+            let fast = unit.quiet();
             let _ = desc.fill(encode).expect("the owner's encoding");
             let owner_wrote = write_through_gate(&gate, &desc);
             let claimer_wrote = claimer.join().expect("the claimer");
