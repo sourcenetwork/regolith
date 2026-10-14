@@ -241,14 +241,16 @@ impl WriteUnit {
 
     /// Add `note` to the claim `seen`. `false` when that claim was let go
     /// meanwhile: the caller looks again instead of waiting on it.
+    ///
+    /// Always a compare-and-swap, even when the note is there already: only
+    /// a read-modify-write reads the word as it is now. A plain load may
+    /// return the claim with its note after the holder's swap let it go,
+    /// and a waiter trusting it would sleep on a note nobody reads (WU4).
     pub(super) fn note(&self, seen: u64, note: u64) -> bool {
         let mut word = self.word.load(Ordering::Acquire);
         loop {
             if word & !NOTES != seen & !NOTES {
                 return false;
-            }
-            if word & note != 0 {
-                return true;
             }
             match self.word.compare_exchange_weak(
                 word,
