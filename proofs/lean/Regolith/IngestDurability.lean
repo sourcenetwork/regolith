@@ -12,9 +12,11 @@ Under `Eventual` durability a commit's record goes into the write-ahead log
 and nobody waits for it to reach the disk. A power cut must still leave a
 gap-free prefix of commit order: if commit 5 survives, commits 0 to 4 do too.
 
-An ingest is a commit in that order too: it draws its place under the
-commit pipeline's mutex, like any commit. But it is made durable by its own
-channel, the synced manifest batch that adds its table, not by the log.
+An ingest is a commit in that order too: its install is an ordered unit of
+the commit ring (`src/engine/commit/ordered.rs`), which runs with every
+earlier commit written and no later one decided, and takes its place there
+like any commit. But it is made durable by its own channel, the synced
+manifest batch that adds its table, not by the log.
 
 Example: commit `c0` writes `a = 1` into the log, unsynced. Then an ingest
 takes its place after `c0` and syncs its manifest batch. If the power goes
@@ -22,9 +24,9 @@ out now, the ingest survives (its batch is on the disk) while `c0` is lost
 (its log record never was). Reads would show the ingest but not the commit
 ordered before it: a gap.
 
-The fix (`RegolithEngine::sync_active_wal` in `src/engine/ingest.rs`): under
-the mutex, before its manifest batch, the ingest syncs the log, so every
-commit ordered before it is on the disk first.
+The fix (`Ordered::sync_log`, called by `RegolithEngine::install_ordered` in
+`src/engine/ingest.rs`): in its ordered unit, before its manifest batch, the
+ingest syncs the log, so every commit ordered before it is on the disk first.
 
 ## What is proved, in plain words
 
@@ -43,15 +45,15 @@ commit ordered before it is on the disk first.
 namespace Regolith.IngestDurability
 
 /-- What the protocol works on. Commits are numbered `0, 1, 2, ...` in commit
-order, which is their order of arrival, since the mutex serializes them. -/
+order: slots are decided in ring order, and none while a unit runs. -/
 structure St where
   /-- How many commits have drawn their place; all are in the log. -/
   commits : Nat
   /-- How many leading commits the log has synced: commits `0 .. synced - 1`
   survive a power cut now. -/
   synced : Nat
-  /-- The ingest holds the pipeline mutex, between its log sync and its
-  install. -/
+  /-- The ingest's ordered unit is running, between its log sync and its
+  install: it has the pipeline to itself. -/
   holding : Bool
   /-- `some p` once the ingest is installed, with `p` the number of commits
   ordered before it; `none` before. Its synced manifest batch makes it
@@ -64,22 +66,26 @@ def init : St := ⟨0, 0, false, none⟩
 /-- One step. `sync` says whether the ingest syncs the log before its batch:
 `true` is the fix, `false` the RED `NoLogSync`. -/
 inductive Step (sync : Bool) : St → St → Prop
-  /-- A commit takes the mutex, which the ingest must not hold, and appends
-  its record to the log, unsynced. -/
+  /-- A commit is decided, which it is not while the ingest's unit runs, and
+  its record is written to the log, unsynced. -/
   | commit (s : St) (h : s.holding = false) :
-      Step sync s { s with commits := s.commits + 1 } -- one more commit, nothing else changes
-  /-- The log syncs (a rotation, or a group with an `Immediate` member):
-  every commit in it becomes durable. -/
+      -- After the step: one more commit; nothing else changes.
+      Step sync s { s with commits := s.commits + 1 }
+  /-- The log syncs (a rotation, or a sync round for a commit that asked for
+  `Immediate`): every commit in it becomes durable. -/
   | syncLog (s : St) (h : s.holding = false) :
-      Step sync s { s with synced := s.commits } -- synced catches up with the commits
-  /-- The ingest takes the mutex and, in the fix, syncs the log. -/
+      -- After the step: the synced count catches up with the commits.
+      Step sync s { s with synced := s.commits }
+  /-- The ingest's unit begins and, in the fix, syncs the log. -/
   | ingestSync (s : St) (h : s.holding = false) (hn : s.ingestAt = none) :
-      Step sync s { s with holding := true, -- the ingest now holds the mutex,
+      -- After the step: the ingest's unit is running,
+      Step sync s { s with holding := true,
                            synced := if sync then s.commits else s.synced } -- and the fix syncs every commit so far
-  /-- Still holding the mutex, the ingest takes its place after every commit
-  so far, its synced manifest batch installs it, and it lets go. -/
+  /-- Still in its unit, the ingest takes its place after every commit so
+  far, its synced manifest batch installs it, and the unit ends. -/
   | ingestInstall (s : St) (h : s.holding = true) :
-      Step sync s { s with holding := false, ingestAt := some s.commits } -- the ingest lets go, installed after every commit so far
+      -- After the step: the unit is over, the ingest installed after every commit so far.
+      Step sync s { s with holding := false, ingestAt := some s.commits }
 
 /-- Any number of steps, one after another. -/
 inductive Steps (sync : Bool) : St → St → Prop
@@ -92,8 +98,8 @@ inductive Steps (sync : Bool) : St → St → Prop
 structure Inv (s : St) : Prop where
   /-- The synced commits are among those made. -/
   synced_le : s.synced ≤ s.commits
-  /-- While the ingest holds the mutex, the log is synced through every
-  commit, and the ingest is not installed yet. -/
+  /-- While the ingest's unit runs, the log is synced through every commit,
+  and the ingest is not installed yet. -/
   holding_synced : s.holding = true → s.synced = s.commits ∧ s.ingestAt = none
   /-- Once installed, every commit ordered before the ingest is synced. -/
   installed_synced : ∀ p, s.ingestAt = some p → p ≤ s.synced
@@ -113,12 +119,14 @@ theorem step_inv {s t : St}
   obtain ⟨hle, hhold, hinst⟩ := hinv
   -- Look at which step it was.
   cases hstep with
-  | commit h => -- a commit step:
+  -- Case: a commit.
+  | commit h =>
     -- A commit adds to `commits` only: synced stays below, nothing is held.
     refine ⟨by simp only; omega, fun h' => absurd h' (by simp [h]), ?_⟩
     -- The ingest's place and the synced count are unchanged.
     exact fun p hp => hinst p hp
-  | syncLog h => -- a log sync step:
+  -- Case: a log sync.
+  | syncLog h =>
     -- Syncing makes `synced = commits`, which is at least the old `synced`.
     refine ⟨by simp only; omega, fun h' => absurd h' (by simp [h]), ?_⟩
     -- An installed ingest's place was at most the old count, hence the new.
@@ -127,8 +135,9 @@ theorem step_inv {s t : St}
     have := hinst p hp
     -- and the old count is at most the new one.
     simp only; omega
-  | ingestSync h hn => -- the ingest taking the mutex and syncing:
-    -- The fix syncs everything and takes the mutex; nothing is installed.
+  -- Case: the ingest's unit begins and syncs.
+  | ingestSync h hn =>
+    -- The fix syncs everything and the unit runs; nothing is installed.
     refine ⟨by simp, fun _ => ⟨by simp, hn⟩, ?_⟩
     -- Not installed, so the last part holds vacuously.
     intro p hp
@@ -136,7 +145,8 @@ theorem step_inv {s t : St}
     simp only [hn] at hp
     -- `none = some p` is false.
     exact absurd hp (by simp)
-  | ingestInstall h => -- the ingest installing:
+  -- Case: the ingest installs.
+  | ingestInstall h =>
     -- While holding, the log was synced through every commit.
     obtain ⟨hsyn, _⟩ := hhold h
     -- Letting go keeps the counts; nothing is held now.
@@ -154,8 +164,10 @@ theorem reachable_inv {s : St}
     (h : Steps true init s) : Inv s := by
   -- Walk the steps from the start.
   induction h with
-  | refl => exact init_inv -- no step: the start satisfies the invariant
-  | tail _ hstep ih => exact step_inv ih hstep -- one more step: the invariant carries over it
+  -- No step: the start satisfies the invariant
+  | refl => exact init_inv
+  -- One more step: the invariant carries over it
+  | tail _ hstep ih => exact step_inv ih hstep
 
 /-- What a power cut leaves of commit `c`: it survives iff it is synced. -/
 def CommitSurvives (s : St) (c : Nat) : Prop := c < s.synced
@@ -176,13 +188,17 @@ theorem surviving_ingest_keeps_prefix {s : St}
   have hinv := reachable_inv h
   -- Two claims.
   refine ⟨?_, ?_⟩
-  · -- Take the ingest's place `p` and a commit `c` before it.
+  -- Take the ingest's place `p` and a commit `c` before it.
+  ·
+    -- Name them.
     intro p hp c hc
     -- The invariant bounds `p` by the synced count,
     have := hinv.installed_synced p hp
     -- so `c < p ≤ synced`.
     unfold CommitSurvives; omega
-  · -- A prefix: `c' < c < synced`.
+  -- A prefix: `c' < c < synced`.
+  ·
+    -- Take a surviving commit c and an earlier commit c'.
     intro c hc c' hc'
     -- Unfold and compare.
     unfold CommitSurvives at *; omega
@@ -191,11 +207,14 @@ theorem surviving_ingest_keeps_prefix {s : St}
 steps, and a power cut leave the ingest installed (surviving) while commit 0,
 ordered before it, is not synced and is lost. -/
 theorem no_log_sync_loses_commit :
-    ∃ s, Steps false init s ∧ s.ingestAt = some 1 ∧ ¬ CommitSurvives s 0 := by -- some run without the log sync ends with the ingest installed and commit 0 lost
+    -- The statement: some run without the log sync ends with the ingest installed after one commit,
+    -- and commit 0 lost.
+    ∃ s, Steps false init s ∧ s.ingestAt = some 1 ∧ ¬ CommitSurvives s 0 := by
   -- The state after: one commit, nothing synced, the ingest installed after it.
   refine ⟨⟨1, 0, false, some 1⟩, ?_, rfl, by unfold CommitSurvives; decide⟩
   -- Commit 0, then the ingest's (skipped) sync, then its install.
   exact .tail (.tail (.tail (.refl _) (.commit _ rfl))
     (.ingestSync _ rfl rfl)) (.ingestInstall _ rfl) -- the ingest skips its sync, then installs
 
+-- End of the namespace opened at the top.
 end Regolith.IngestDurability

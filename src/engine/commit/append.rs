@@ -1,25 +1,27 @@
 //! Numbering a commit's appends in the ordered step.
 //!
 //! A transaction's `append` calls queue as [`PendingAppend`]s and are not
-//! read or validated for. The ordered step, which holds the pipeline mutex
-//! and has already validated the commit's reads, gives each one the log's
-//! next position and turns it into plain puts of the same atomic commit, so
-//! the WAL carries final bytes. These rules follow `CommitOrderedAppend.tla`
+//! read or validated for. Deciding the commit's slot, in ring order and once
+//! the commit's reads are validated, gives each one the log's next position
+//! and turns it into plain puts of the same atomic commit, so the WAL
+//! carries final bytes. These rules follow `CommitOrderedAppend.tla`
 //! and `Append.lean`:
 //!
 //! - Positions are assigned after validation, never before: a commit that
 //!   fails validation reaches [`AppendOrder::number`] with nothing, so it
 //!   takes no position.
 //! - The head and the once keys come from the view plus the appends already
-//!   numbered by this [`AppendOrder`], never from the view alone. One
-//!   [`AppendOrder`] spans a commit group, so a later member counts from the
-//!   head an earlier member left and sees the once keys it set.
-//! - Nothing outlives the group: no cached head, no remembered once key. A
-//!   group that fails drops its [`AppendOrder`] and the next group reads the
-//!   view again, so a failure leaves no hole. A member that fails inside a
-//!   group gives back what it took, so the members after it leave no hole
-//!   either.
-//! - Each member writes the head of every log it moved in its own record.
+//!   numbered by this [`AppendOrder`], never from the view alone. The view
+//!   holds every commit decided before this one: a slot is applied to the
+//!   memtable before the next is decided (`pipeline.rs`, P2), so a later
+//!   commit counts from the head an earlier one left and sees the once keys
+//!   it set. One [`AppendOrder`] spans one commit's own appends.
+//! - Nothing outlives the commit: no cached head, no remembered once key. A
+//!   commit a failure discards is taken out of the memtable with what it
+//!   numbered, and the next reads the view again, so a failure leaves no
+//!   hole. A commit that fails while it is numbered gives back what it
+//!   took, so the commits after it leave no hole either.
+//! - Each commit writes the head of every log it moved in its own record.
 //!
 //! A commit that carries no append never reaches this module.
 
@@ -66,10 +68,10 @@ struct LogHead {
     position: u64,
 }
 
-/// The running state of the ordered step across one commit group's appends.
+/// The running state of numbering one commit's appends.
 ///
-/// Create one per group, number every member against it in group order, and
-/// drop it with the group.
+/// Create one per commit, number the commit against it when its slot is
+/// decided, and drop it with the decision.
 #[derive(Default)]
 pub(crate) struct AppendOrder {
     logs: Vec<LogHead>,

@@ -4,6 +4,7 @@
 //! became an iterator: a corrupt log fails the open loud, an intact log
 //! recovers every acknowledged write, and no corruption is ever silently
 //! skipped. "Opened with the wrong data" is the failure these tests hunt.
+#![cfg(not(target_arch = "wasm32"))]
 
 use std::fs;
 use std::fs::OpenOptions;
@@ -80,7 +81,7 @@ fn a_zero_length_wal_opens_clean() {
         for i in 0..200 {
             db.put(format!("s{i:04}").as_bytes(), b"v").unwrap();
         }
-        db.compact_range(None, None).unwrap();
+        db.compact_range(None, None).wait().unwrap();
         db.close().unwrap();
     }
     for path in wal_files(dir.path()) {

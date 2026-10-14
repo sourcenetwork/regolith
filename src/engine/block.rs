@@ -442,7 +442,7 @@ pub(crate) fn encoded_entry_size(data: &[u8], pos: usize) -> usize {
         .consumed
 }
 
-fn encode_varint(buf: &mut Vec<u8>, mut value: u64) {
+pub(crate) fn encode_varint(buf: &mut Vec<u8>, mut value: u64) {
     while value >= 0x80 {
         buf.push((value as u8) | 0x80);
         value >>= 7;
@@ -593,7 +593,7 @@ fn decode_entry_header(data: &[u8], pos: usize) -> io::Result<EntryHeader> {
     })
 }
 
-fn read_varint(data: &[u8], offset: &mut usize) -> io::Result<usize> {
+pub(crate) fn read_varint(data: &[u8], offset: &mut usize) -> io::Result<usize> {
     let mut result: u64 = 0;
     for i in 0..10 {
         let Some(&byte) = data.get(*offset) else {

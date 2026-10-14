@@ -28,14 +28,14 @@
 //! `write`/`fsync` calls and raises `SIGKILL` on the nth one, so the crash
 //! lands at the same byte on a fast machine and a slow one.
 
-use std::fs::{File, OpenOptions};
-use std::io::Write;
+use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use regolith::{Db, DurabilityMode, Options, WriteBatch};
 
+use super::acks::{Acked, Acks, read_acks};
 use super::journal::{Journal, journal_path_for, root_filter_for};
 use super::prefix::{History, OpValue};
 use super::shim;
@@ -213,6 +213,9 @@ pub struct ChildSpec {
     pub durability: DurabilityMode,
     pub write_buffer_size: usize,
     pub ack_path: PathBuf,
+    /// The database is encrypted at rest under [`crate::common::keys::Keys`]
+    /// key 1.
+    pub encrypted: bool,
     /// Compaction workers, when the run needs a number other than the
     /// default. With none, the writing thread runs every flush itself.
     pub workers: Option<usize>,
@@ -250,6 +253,7 @@ impl ChildSpec {
             durability,
             write_buffer_size,
             ack_path,
+            encrypted: false,
             workers: None,
         }
     }
@@ -259,6 +263,13 @@ impl ChildSpec {
     /// that thread's flush and in no other.
     pub fn workers(mut self, n: usize) -> Self {
         self.workers = Some(n);
+        self
+    }
+
+    /// Encrypt the database at rest, under the key [`ChildSpec::options`]
+    /// installs.
+    pub fn encrypted(mut self, encrypted: bool) -> Self {
+        self.encrypted = encrypted;
         self
     }
 
@@ -298,7 +309,11 @@ impl ChildSpec {
         if let Some(workers) = self.workers {
             options = options.max_background_compactions(workers);
         }
-        options
+        if self.encrypted {
+            options.key_provider(crate::common::keys::Keys::new(&[1]))
+        } else {
+            options
+        }
     }
 
     /// The exact ordered history this spec produces, computed identically
@@ -337,6 +352,10 @@ impl ChildSpec {
                 self.ack_path.display().to_string(),
             ),
             (
+                "REGOLITH_CRASH_KEYS".into(),
+                if self.encrypted { "1" } else { "0" }.into(),
+            ),
+            (
                 "REGOLITH_CRASH_WORKERS".into(),
                 self.workers.map(|n| n.to_string()).unwrap_or_default(),
             ),
@@ -368,6 +387,7 @@ impl ChildSpec {
             },
             write_buffer_size: num("REGOLITH_CRASH_WBS", 1 << 20),
             ack_path: PathBuf::from(std::env::var("REGOLITH_CRASH_ACK").unwrap_or_default()),
+            encrypted: num("REGOLITH_CRASH_KEYS", 0) == 1,
             workers: std::env::var("REGOLITH_CRASH_WORKERS")
                 .ok()
                 .and_then(|v| v.parse().ok()),
@@ -407,10 +427,10 @@ pub struct ChildOutcome {
     pub stderr: String,
     /// The recorded syscall stream, empty when the shim did not run.
     pub journal: Journal,
-    /// Indices of write operations that returned `Ok` before the crash.
+    /// What the child acknowledged before the crash, read once it died.
     /// Durable by construction: written outside the database directory, so
-    /// a power-loss reconstruction leaves them alone.
-    pub acked: Vec<usize>,
+    /// a power-loss reconstruction leaves it alone.
+    pub acks: Acked,
     /// The history the workload intended to apply.
     pub history: History,
     pub trigger: Trigger,
@@ -422,7 +442,14 @@ impl ChildOutcome {
     }
 
     pub fn acked_count(&self) -> usize {
-        self.acked.len()
+        self.acks.len()
+    }
+
+    /// Indices of the write operations that returned `Ok` before the
+    /// crash, for a workload that acknowledges one index a record (the
+    /// built-in ones do).
+    pub fn acked(&self) -> Vec<usize> {
+        self.acks.of().into_iter().map(|[i]| i as usize).collect()
     }
 
     /// Fail unless the child really died by signal. A crash test whose
@@ -638,7 +665,7 @@ impl CrashRun {
             stdout: std::fs::read_to_string(&stdout_path).unwrap_or_default(),
             stderr: std::fs::read_to_string(&stderr_path).unwrap_or_default(),
             journal: recorded,
-            acked: read_acks(&spec.ack_path),
+            acks: read_acks(&spec.ack_path),
             history: spec.history(),
             trigger: self.trigger,
             spec,
@@ -669,13 +696,6 @@ fn wait_with_deadline(
                 backoff = (backoff * 2).min(Duration::from_millis(20));
             }
         }
-    }
-}
-
-fn read_acks(path: &Path) -> Vec<usize> {
-    match std::fs::read_to_string(path) {
-        Ok(t) => t.lines().filter_map(|l| l.trim().parse().ok()).collect(),
-        Err(_) => Vec::new(),
     }
 }
 
@@ -798,36 +818,12 @@ pub fn child_entrypoint(dispatch: fn(&ChildSpec)) {
     std::process::exit(0);
 }
 
-struct Acker(Option<File>);
-
-impl Acker {
-    fn open(path: &Path) -> Acker {
-        if path.as_os_str().is_empty() {
-            return Acker(None);
-        }
-        Acker(OpenOptions::new().create(true).append(true).open(path).ok())
-    }
-    /// One unbuffered write per acknowledgement, so a `SIGKILL` a
-    /// microsecond later cannot lose the record of what the caller was
-    /// told.
-    fn ack(&mut self, indices: impl IntoIterator<Item = usize>) {
-        if let Some(f) = self.0.as_mut() {
-            let mut line = String::new();
-            for i in indices {
-                line.push_str(&i.to_string());
-                line.push('\n');
-            }
-            let _ = f.write_all(line.as_bytes());
-        }
-    }
-}
-
 /// The built-in workloads, one per [`Phase`]. Pass this to
 /// [`child_entrypoint`] unless the test crate needs its own.
 pub fn builtin_workload(spec: &ChildSpec) {
     let db = Db::open(&spec.db_path, spec.options()).expect("child: open db");
     let history = plan(spec);
-    let mut acker = Acker::open(&spec.ack_path);
+    let mut acks = Acks::open(&spec.ack_path);
 
     let mut i = 0usize;
     let ops = history.ops();
@@ -841,8 +837,8 @@ pub fn builtin_workload(spec: &ChildSpec) {
         let group = &ops[i..end];
         let result = if group.len() == 1 {
             match &group[0].value {
-                OpValue::Put(v) => db.put(&group[0].key, v),
-                OpValue::Delete => db.delete(&group[0].key),
+                OpValue::Put(v) => regolith::through_stalls(|| db.put(&group[0].key, v)),
+                OpValue::Delete => regolith::through_stalls(|| db.delete(&group[0].key)),
             }
         } else {
             let mut wb = WriteBatch::new();
@@ -852,10 +848,10 @@ pub fn builtin_workload(spec: &ChildSpec) {
                     OpValue::Delete => wb.delete(&op.key),
                 }
             }
-            db.write(wb)
+            regolith::through_stalls(|| db.write(wb.clone()))
         };
         result.expect("child: write failed");
-        acker.ack(i..end);
+        acks.ack_all((i..end).map(|i| [i as u64]));
         i = end;
     }
 

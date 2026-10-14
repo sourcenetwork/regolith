@@ -1,11 +1,11 @@
 //! Containing a panic in code the caller supplied while regolith runs it on
 //! its own account.
 //!
-//! A commit is the ordered step: the validation that precedes the write
-//! pipeline and the group the pipeline's leader writes. A panic that unwinds
-//! out of a caller's implementation there leaves the shared state of that step
-//! half done, so [`contain`] catches it, names the trait, and the step's
-//! boundary latches the database read-only.
+//! A commit is the ordered step: the check a slot of the commit ring runs
+//! when it is decided, and what the thread that decides it applies and
+//! writes. A panic that unwinds out of a caller's implementation there leaves
+//! the shared state of that step half done, so [`contain`] catches it, names
+//! the trait, and the step's boundary latches the database read-only.
 //!
 //! A background step, a flush regolith runs off any caller's call (on a
 //! worker, or as the step a write owes on a database with no worker, E9), is
@@ -86,6 +86,32 @@ impl Drop for InBackground {
     }
 }
 
+/// Run `f`, code the caller attached to an outcome already decided: a
+/// transaction's `on_commit` and `on_abort` callbacks and hooks, a ticket's
+/// `on_complete`. A panic cannot change the outcome, so it is caught, reported
+/// to the listeners of `engine` (when it is still open to tell), and the
+/// outcome stands. The one function every such point calls.
+///
+/// `engine` is asked for only once `f` has panicked. A callback may run on a
+/// worker after the caller it answers was woken, and a worker holding the
+/// engine there would keep the database, and its directory lock, alive past
+/// the caller's drop of its handle.
+pub(crate) fn survive<E: std::ops::Deref<Target = super::RegolithEngine>>(
+    engine: impl FnOnce() -> Option<E>,
+    callback: &'static str,
+    f: impl FnOnce(),
+) {
+    if catch_unwind(AssertUnwindSafe(f)).is_err() {
+        tracing::error!(
+            callback,
+            "a callback panicked after its outcome was decided"
+        );
+        if let Some(engine) = engine() {
+            engine.notify_callback_panic(callback);
+        }
+    }
+}
+
 /// Run `f`, a call into the caller's implementation of the trait `callback`.
 ///
 /// Inside a commit or a background step a panic is caught and returned as
@@ -115,6 +141,22 @@ pub(crate) fn contain<T>(callback: &'static str, f: impl FnOnce() -> T) -> Resul
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A callback that returns holds no engine: a worker running it after
+    /// its caller was woken must not keep the database alive past the
+    /// caller's drop of it.
+    #[test]
+    fn the_engine_is_asked_for_only_when_a_callback_panics() {
+        let asked = std::cell::Cell::new(0);
+        let engine = || -> Option<&crate::engine::RegolithEngine> {
+            asked.set(asked.get() + 1);
+            None
+        };
+        survive(engine, "on_complete", || {});
+        assert_eq!(asked.get(), 0);
+        survive(engine, "on_complete", || panic!("boom"));
+        assert_eq!(asked.get(), 1);
+    }
 
     #[test]
     fn a_panic_inside_a_commit_is_caught_and_named() {

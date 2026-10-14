@@ -60,7 +60,7 @@ fn a_hot_counter_stays_folded_under_rolling_transactions() {
             db.db().flush().unwrap();
         }
         if commit % COMPACT_EVERY == 0 {
-            db.db().compact_range(None, None).unwrap();
+            db.db().compact_range(None, None).wait().unwrap();
             // One stripe per live snapshot, and the top one above them all.
             let bound = pins() as usize + 1;
             let kept = entries();

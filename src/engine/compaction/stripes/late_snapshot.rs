@@ -75,7 +75,7 @@ fn compact_range_keeps_a_snapshot_registered_after_its_live_read() {
     let (_dir, db) = two_tables(CompactionStyle::Level);
     let landed = register_then_overwrite(&db);
 
-    db.compact_range(None, None).unwrap();
+    db.compact_range(None, None).wait().unwrap();
 
     assert_snapshot_kept_its_version(&db, &landed);
 }
@@ -85,7 +85,7 @@ fn a_universal_compact_range_keeps_a_snapshot_registered_after_its_live_read() {
     let (_dir, db) = two_tables(CompactionStyle::Universal);
     let landed = register_then_overwrite(&db);
 
-    db.compact_range(None, None).unwrap();
+    db.compact_range(None, None).wait().unwrap();
 
     assert_snapshot_kept_its_version(&db, &landed);
 }

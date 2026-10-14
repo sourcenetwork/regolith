@@ -6,7 +6,8 @@
 //!
 //! 1. [`shim`] + [`child`]: a subprocess crash harness. The workload runs
 //!    in a real child process that really dies, at a kill point chosen by
-//!    meaning rather than by wall clock.
+//!    meaning rather than by wall clock. [`acks`] holds what the child was
+//!    told, in records a kill cannot cut.
 //! 2. [`power`]: power-loss simulation, which is a different failure from
 //!    a process crash and is the one that actually tests durability.
 //! 3. [`prefix`]: the valid-prefix validator, the property these tests
@@ -33,7 +34,7 @@
 //! `strace` is not installed on this machine and there is no way to
 //! install it, so option (a) of the ALICE-style approaches was
 //! unavailable. Option (b) was chosen: a **pure-Rust `LD_PRELOAD`
-//! interposer** over `write`, `pwrite64`, `writev`, `fsync`, `fdatasync`,
+//! interposer** over `write`, `pwrite64`, `pwritev`, `writev`, `fsync`, `fdatasync`,
 //! `open`/`openat`, `ftruncate`, `close`, `rename` and `unlink`. It
 //! records the real syscall stream of the child, including the kernel
 //! thread id and the exact byte offset of every write, and
@@ -43,9 +44,10 @@
 //!
 //! This is the ALICE model driven by what regolith actually did, not by an
 //! assumption about what regolith does. Interposition is sound here because
-//! regolith performs all data I/O through `std::fs`, which calls the glibc
-//! symbols; it uses `rustix` raw syscalls only for `flock` and `fadvise`,
-//! which move no file data, and it has no `mmap` write path.
+//! regolith performs every write through `std::fs`, which calls the glibc
+//! symbols; it uses `rustix` raw syscalls only for `flock`, `fadvise` and
+//! the positional reads of its tables (`pread`), none of which writes file
+//! data, and it has no `mmap` write path.
 //!
 //! The weaker option (c) exists as [`power::simulate_power_loss_modelled`]
 //! for platforms where the shim cannot run. **It is not used on this
@@ -65,6 +67,7 @@
 
 #![allow(dead_code, unused_imports)]
 
+pub mod acks;
 pub mod bytes;
 pub mod child;
 pub mod journal;
@@ -72,6 +75,7 @@ pub mod power;
 pub mod prefix;
 pub mod shim;
 
+pub use acks::{ACK_BYTES, Acked, Acks, read_acks};
 pub use bytes::{
     copy_tree, file_len, find_manifest, find_ssts, find_wals, first_sst, flip_bit, garbage,
     newest_wal, overwrite_range, truncate_at,

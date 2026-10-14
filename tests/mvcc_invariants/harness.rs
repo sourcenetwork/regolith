@@ -198,9 +198,9 @@ pub fn run_snapshot_stability(scale: &StabilityScale) -> StabilityCounts {
     let db = Arc::new(db);
 
     for i in 0..scale.keys {
-        db.put(&key_at(i), &stamped_value(0)).unwrap();
+        regolith::through_stalls(|| db.put(&key_at(i), &stamped_value(0))).unwrap();
     }
-    db.compact_range(None, None).unwrap();
+    db.compact_range(None, None).wait().unwrap();
 
     let snap = db.snapshot();
     let baseline = snap.scan(None, None).unwrap();
@@ -229,9 +229,9 @@ pub fn run_snapshot_stability(scale: &StabilityScale) -> StabilityCounts {
             for n in 1..=ops as u64 {
                 let k = key_at(next_rand(&mut seed) as usize % keys);
                 if next_rand(&mut seed).is_multiple_of(4) {
-                    db.delete(&k).unwrap();
+                    regolith::through_stalls(|| db.delete(&k)).unwrap();
                 } else {
-                    db.put(&k, &stamped_value(n)).unwrap();
+                    regolith::through_stalls(|| db.put(&k, &stamped_value(n))).unwrap();
                 }
             }
             live.done_one();
@@ -248,7 +248,7 @@ pub fn run_snapshot_stability(scale: &StabilityScale) -> StabilityCounts {
             gate.wait();
             let mut n = 0u64;
             loop {
-                db.compact_range(None, None).unwrap();
+                db.compact_range(None, None).wait().unwrap();
                 n += 1;
                 if n as usize >= min_compactions && !live.any() {
                     break;
@@ -368,7 +368,7 @@ pub fn run_batch_atomicity(scale: &AtomicityScale) -> (u64, u64) {
     for k in &batch_keys {
         seed_batch.put(k, &stamped_value(0));
     }
-    db.write(seed_batch).unwrap();
+    regolith::through_stalls(|| db.write(seed_batch.clone())).unwrap();
 
     let live = Live::new(1);
     let checks = Arc::new(AtomicU64::new(0));
@@ -387,7 +387,7 @@ pub fn run_batch_atomicity(scale: &AtomicityScale) -> (u64, u64) {
                 for k in &batch_keys {
                     batch.put(k, &stamped_value(generation));
                 }
-                db.write(batch).unwrap();
+                regolith::through_stalls(|| db.write(batch.clone())).unwrap();
             }
             live.done_one();
         })
@@ -401,7 +401,7 @@ pub fn run_batch_atomicity(scale: &AtomicityScale) -> (u64, u64) {
             gate.wait();
             let mut n = 0u64;
             loop {
-                db.compact_range(None, None).unwrap();
+                db.compact_range(None, None).wait().unwrap();
                 n += 1;
                 if n >= 2 && !live.any() {
                     break;
@@ -504,7 +504,7 @@ pub fn run_monotonic_reads(scale: &MonotonicScale) -> MonotonicOutcome {
 
     for w in 0..scale.writers {
         for i in 0..scale.keys_per_writer {
-            db.put(&mono_key(w, i), &stamped_value(0)).unwrap();
+            regolith::through_stalls(|| db.put(&mono_key(w, i), &stamped_value(0))).unwrap();
         }
     }
 
@@ -526,7 +526,8 @@ pub fn run_monotonic_reads(scale: &MonotonicScale) -> MonotonicOutcome {
             // is a strictly increasing version number by construction.
             for v in 1..=versions {
                 for i in 0..keys {
-                    db.put(&mono_key(w, i), &stamped_value(v)).unwrap();
+                    regolith::through_stalls(|| db.put(&mono_key(w, i), &stamped_value(v)))
+                        .unwrap();
                 }
             }
             live.done_one();
@@ -541,7 +542,7 @@ pub fn run_monotonic_reads(scale: &MonotonicScale) -> MonotonicOutcome {
             gate.wait();
             let mut n = 0u64;
             loop {
-                db.compact_range(None, None).unwrap();
+                db.compact_range(None, None).wait().unwrap();
                 n += 1;
                 if n >= 3 && !live.any() {
                     break;

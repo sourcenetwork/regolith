@@ -27,6 +27,18 @@
 //! about one test in 2^32, can only refuse an open that could have
 //! succeeded, never open one that should not.
 //!
+//! # Sealed manifests
+//!
+//! On an encrypted database every batch is sealed (`sealed.rs`), and its
+//! records are noise until the batch is opened under the key it names.
+//! Noise decodes as nothing this build knows, which [`needs_sync`] must count
+//! as a batch that needed a sync, so a judge reading sealed batches as plain
+//! ones would take every whole reservation after a torn one as proof, and
+//! refuse a crash's tail. Each batch is therefore opened first
+//! (`ManifestRecovery.tla`, RED JudgeCiphertext). One that does not open, a
+//! key the provider lacks or a tag that fails, still counts as needing a
+//! sync: a crash leaves only batches the writer sealed, under its key.
+//!
 //! # What it cannot see
 //!
 //! Damage to the last batch that needed a sync, with no batch needing a
@@ -52,6 +64,7 @@ use std::path::Path;
 
 use super::ManifestRecord;
 use crate::engine::checksum;
+use crate::engine::seal::Keyring;
 
 /// Bytes of a batch's framing: its length in front, its checksum behind.
 const FRAMING: usize = 8;
@@ -84,6 +97,14 @@ pub(super) fn batch_at(data: &[u8], at: usize) -> Option<Batch<'_>> {
     })
 }
 
+/// What a sealed manifest's batches are opened with: the database's keyring
+/// and the manifest's salt, which every batch's tag is bound to.
+#[derive(Clone, Copy)]
+pub(super) struct Opener<'a> {
+    pub(super) keyring: &'a Keyring,
+    pub(super) salt: &'a [u8; 16],
+}
+
 /// The end of a manifest an open dropped as a crash's unsynced tail.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct DroppedTail {
@@ -95,9 +116,15 @@ pub(crate) struct DroppedTail {
 
 /// Judge the bytes of `data` from `damage_at`, where replay stopped, to the
 /// end: the tail to drop when a crash can have left them, or an error naming
-/// the file and both offsets when a later batch proves them synced.
-pub(super) fn judge(data: &[u8], damage_at: usize, path: &Path) -> io::Result<DroppedTail> {
-    match proof_past(data, damage_at) {
+/// the file and both offsets when a later batch proves them synced. A sealed
+/// manifest's batches are opened through `sealed` before they are read.
+pub(super) fn judge(
+    data: &[u8],
+    damage_at: usize,
+    path: &Path,
+    sealed: Option<Opener<'_>>,
+) -> io::Result<DroppedTail> {
+    match proof_past(data, damage_at, sealed) {
         Some(proven) => Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!(
@@ -122,11 +149,11 @@ pub(super) fn judge(data: &[u8], damage_at: usize, path: &Path) -> io::Result<Dr
 // vertexia: a tail crafted so that many offsets claim a batch that fits costs
 // a checksum over each, quadratic in the tail's length; a batch header that
 // carries its own offset and check would make each test constant.
-fn proof_past(data: &[u8], damage_at: usize) -> Option<usize> {
+fn proof_past(data: &[u8], damage_at: usize, sealed: Option<Opener<'_>>) -> Option<usize> {
     let mut at = damage_at + 1;
     while at + FRAMING <= data.len() {
         match batch_at(data, at) {
-            Some(batch) if batch.end < data.len() && needs_sync(batch.records) => {
+            Some(batch) if batch.end < data.len() && needs_sync(batch.records, at, sealed) => {
                 return Some(batch.end);
             }
             Some(batch) => at = batch.end,
@@ -136,10 +163,24 @@ fn proof_past(data: &[u8], damage_at: usize) -> Option<usize> {
     None
 }
 
-/// Whether a batch holding `records` was synced before the next was
-/// written. A batch this build cannot decode is counted as one: nothing
-/// shows it needed no sync.
-fn needs_sync(records: &[u8]) -> bool {
+/// Whether the batch at `at` holding `records` was synced before the next
+/// was written. A sealed batch is opened first, and one that does not open
+/// counts as synced, as does one this build cannot decode: nothing shows it
+/// needed no sync.
+fn needs_sync(records: &[u8], at: usize, sealed: Option<Opener<'_>>) -> bool {
+    let opened;
+    let records = match sealed {
+        Some(opener) => {
+            match super::sealed::open_batch(opener.keyring, opener.salt, at as u64, records) {
+                Ok((_, plain)) => {
+                    opened = plain;
+                    opened.as_slice()
+                }
+                Err(_) => return true,
+            }
+        }
+        None => records,
+    };
     let mut pos = 0;
     loop {
         match ManifestRecord::decode(records, &mut pos) {

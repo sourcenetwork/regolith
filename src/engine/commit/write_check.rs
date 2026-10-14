@@ -205,9 +205,15 @@ mod tests {
             ],
         ) {
             let dir = TempDir::new().unwrap();
+            // No worker: a background compaction that folded the key's
+            // operands between the probe and the commit would change the
+            // kind of its newest version, and the two would name different
+            // ones for the same conflict.
             let db = Db::open(
                 dir.path(),
-                Options::default().merge_operator(Some(Arc::new(Keep))),
+                Options::default()
+                    .merge_operator(Some(Arc::new(Keep)))
+                    .max_background_compactions(0),
             )
             .unwrap();
             let mut seqs = vec![db.latest_sequence()];

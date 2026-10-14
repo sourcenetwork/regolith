@@ -18,7 +18,6 @@ use std::time::{Duration, Instant};
 use tempfile::TempDir;
 
 use crate::engine::ingest::after_next_ingest_seq;
-use crate::portability::Ordering;
 use crate::{
     Db, IngestOptions, IsolationLevel, OptimisticTransactionDb, Options, SstFileWriter,
     TransactionError, TxnOptions, WriteBatch,
@@ -57,13 +56,15 @@ impl Window {
     /// it has committed or is queued in the commit ring, whichever the
     /// engine allows.
     fn open(db: &Db, write: impl FnOnce() -> crate::Result<u64> + Send + 'static) -> Self {
-        // The hook runs right after the ingest's allocation and nothing
-        // else writes, so this is the ingest's sequence.
-        let ingest_seq = db.engine.latest_seq.load(Ordering::Acquire);
+        // The hook runs right after the ingest's allocation, inside its
+        // ordered step, and nothing else writes: the ingest took the
+        // sequence after the last one decided before its step.
+        let ingest_seq = db.engine.last_decided_seq() + 1;
+        let taken = db.engine.pipeline_slots_taken();
         let writer = thread::spawn(write);
         let deadline = Instant::now() + Duration::from_secs(30);
         let mut backoff = Duration::from_micros(100);
-        while !writer.is_finished() && db.engine.commit_ring.is_empty() {
+        while !writer.is_finished() && db.engine.pipeline_slots_taken() == taken {
             assert!(
                 Instant::now() < deadline,
                 "the write neither committed nor queued"
@@ -112,6 +113,7 @@ fn a_commit_above_a_pending_ingest_is_not_published_before_it() {
         *slot.borrow_mut() = Some(Window::open(&held, move || put_other(&writer_db)));
     });
     db.ingest_external_files(&[path], IngestOptions::default())
+        .wait()
         .unwrap();
 
     seen.borrow_mut()
@@ -140,6 +142,7 @@ fn a_snapshot_taken_before_an_ingest_installs_reads_one_value_throughout() {
         *slot.borrow_mut() = Some((window, snapshot, before));
     });
     db.ingest_external_files(&[path], IngestOptions::default())
+        .wait()
         .unwrap();
 
     let (window, snapshot, before) = seen
@@ -176,6 +179,7 @@ fn a_transaction_that_read_the_value_an_ingest_replaces_conflicts() {
     });
     db.db()
         .ingest_external_files(&[path], IngestOptions::default())
+        .wait()
         .unwrap();
 
     let (window, txn, read) = seen

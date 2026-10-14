@@ -8,7 +8,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use crate::env::{Capabilities, DirEntry, FileMeta, ReadFile, WriteFile, WriteMode};
+use crate::env::{Capabilities, FileMeta, LogFile, ReadDir, ReadFile, WriteFile, WriteMode};
 
 use super::mirror::MirrorFs;
 use super::pool::SahPool;
@@ -16,21 +16,18 @@ use super::pool::SahPool;
 /// The operations an OPFS strategy provides to the `Env` implementation.
 pub(super) trait OpfsStore: Send + Sync + std::fmt::Debug {
     fn create_dir_all(&self, path: &Path) -> io::Result<()>;
-    fn read_dir(&self, path: &Path) -> io::Result<Vec<DirEntry>>;
+    fn read_dir(&self, path: &Path) -> io::Result<ReadDir<'_>>;
     fn open_read(&self, path: &Path) -> io::Result<Box<dyn ReadFile>>;
     fn open_write(&self, path: &Path, mode: WriteMode) -> io::Result<Box<dyn WriteFile>>;
+    /// The write-ahead log at `path`. Both strategies write at an offset
+    /// underneath, so the log is that write with no cursor and no lock.
+    fn open_log(&self, path: &Path, mode: WriteMode) -> io::Result<Box<dyn LogFile>>;
     fn metadata(&self, path: &Path) -> io::Result<FileMeta>;
     fn remove_file(&self, path: &Path) -> io::Result<()>;
     fn rename(&self, from: &Path, to: &Path) -> io::Result<()>;
     fn exists(&self, path: &Path) -> bool;
     fn sync_dir(&self, path: &Path) -> io::Result<()>;
     fn capabilities(&self) -> Capabilities;
-}
-
-fn entries(raw: Vec<(PathBuf, bool)>) -> Vec<DirEntry> {
-    raw.into_iter()
-        .map(|(path, is_dir)| DirEntry { path, is_dir })
-        .collect()
 }
 
 fn short_read(want: usize, got: usize) -> io::Error {
@@ -53,8 +50,8 @@ impl OpfsStore for PoolStore {
         self.0.create_dir_all(path)
     }
 
-    fn read_dir(&self, path: &Path) -> io::Result<Vec<DirEntry>> {
-        self.0.read_dir(path).map(entries)
+    fn read_dir(&self, path: &Path) -> io::Result<ReadDir<'_>> {
+        self.0.read_dir(path)
     }
 
     fn open_read(&self, path: &Path) -> io::Result<Box<dyn ReadFile>> {
@@ -84,6 +81,18 @@ impl OpfsStore for PoolStore {
                 WriteMode::Append => end,
                 WriteMode::Truncate | WriteMode::Update => 0,
             },
+        }))
+    }
+
+    fn open_log(&self, path: &Path, mode: WriteMode) -> io::Result<Box<dyn LogFile>> {
+        // As `open_write`: only `Truncate` discards.
+        let (slot, generation, _end) = self
+            .0
+            .open_write(path, !matches!(mode, WriteMode::Truncate))?;
+        Ok(Box::new(PoolLog {
+            pool: Arc::clone(&self.0),
+            slot,
+            generation,
         }))
     }
 
@@ -178,6 +187,31 @@ impl WriteFile for PoolWriter {
     }
 }
 
+/// A log over one slot of the pool: a sync access handle writes at an
+/// offset, so every write names its own and none moves a cursor.
+struct PoolLog {
+    pool: Arc<SahPool>,
+    slot: usize,
+    generation: u64,
+}
+
+impl LogFile for PoolLog {
+    fn write_all_at(&self, offset: u64, buf: &[u8]) -> io::Result<()> {
+        if buf.is_empty() {
+            return Ok(());
+        }
+        self.pool.write_at(self.slot, self.generation, offset, buf)
+    }
+
+    fn sync_data(&self) -> io::Result<()> {
+        self.pool.sync(self.slot, self.generation)
+    }
+
+    fn set_len(&self, len: u64) -> io::Result<()> {
+        self.pool.set_len(self.slot, self.generation, len)
+    }
+}
+
 // ---------------------------------------------------------------------
 // In-memory mirror
 // ---------------------------------------------------------------------
@@ -191,8 +225,8 @@ impl OpfsStore for MirrorStore {
         self.0.create_dir_all(path)
     }
 
-    fn read_dir(&self, path: &Path) -> io::Result<Vec<DirEntry>> {
-        self.0.read_dir(path).map(entries)
+    fn read_dir(&self, path: &Path) -> io::Result<ReadDir<'_>> {
+        self.0.read_dir(path)
     }
 
     fn open_read(&self, path: &Path) -> io::Result<Box<dyn ReadFile>> {
@@ -215,6 +249,14 @@ impl OpfsStore for MirrorStore {
                 // `set_len` needs.
                 WriteMode::Truncate | WriteMode::Update => 0,
             },
+        }))
+    }
+
+    fn open_log(&self, path: &Path, mode: WriteMode) -> io::Result<Box<dyn LogFile>> {
+        self.0.create(path, matches!(mode, WriteMode::Truncate))?;
+        Ok(Box::new(MirrorLog {
+            fs: Arc::clone(&self.0),
+            path: path.to_path_buf(),
         }))
     }
 
@@ -304,5 +346,32 @@ impl WriteFile for MirrorWriter {
 
     fn len(&self) -> io::Result<u64> {
         self.fs.file_len(&self.path)
+    }
+}
+
+/// A log over one file of the mirror, written at an offset. A write above
+/// the file's end leaves zeros below it, as a hole on a host file does,
+/// until the write that belongs there arrives.
+struct MirrorLog {
+    fs: Arc<MirrorFs>,
+    path: PathBuf,
+}
+
+impl LogFile for MirrorLog {
+    fn write_all_at(&self, offset: u64, buf: &[u8]) -> io::Result<()> {
+        if buf.is_empty() {
+            return Ok(());
+        }
+        self.fs.write_at(&self.path, offset, buf)
+    }
+
+    /// As [`MirrorWriter::sync_all`]: nothing is durable until
+    /// `OpfsEnv::persist`, which `Capabilities::durable_sync` says.
+    fn sync_data(&self) -> io::Result<()> {
+        Ok(())
+    }
+
+    fn set_len(&self, len: u64) -> io::Result<()> {
+        self.fs.set_len(&self.path, len)
     }
 }

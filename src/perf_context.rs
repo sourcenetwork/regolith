@@ -12,11 +12,11 @@
 //!
 //! # Usage
 //!
-//! ```no_run
+//! ```
 //! use regolith::{Db, Options, PerfContext, PerfLevel};
 //!
 //! # fn main() -> regolith::Result<()> {
-//! let db = Db::open("/tmp/regolith_perf", Options::default())?;
+//! let db = Db::open("rows", Options::memory())?;
 //!
 //! PerfContext::set_level(PerfLevel::EnableTime);
 //! PerfContext::reset();
@@ -24,6 +24,7 @@
 //! let _ = db.get(b"some-key")?;
 //!
 //! let snap = PerfContext::capture();
+//! assert_eq!(snap.get_count, 1);
 //! println!("get spent {} ns in memtable", snap.get_from_memtable_time_nanos);
 //! println!("get spent {} ns in SSTables",  snap.get_from_output_files_time_nanos);
 //! # Ok(())
@@ -187,8 +188,9 @@ pub(crate) fn is_timed() -> bool {
 /// return what `f` counted apart from this thread's own counters, which are
 /// left as they were.
 ///
-/// The leader of a commit group validates each transaction in it on behalf of
-/// the thread that committed it; that thread [`absorb`]s the counts, so the
+/// Whichever thread decides a transaction's slot of the commit ring validates
+/// it on behalf of the thread that committed it; that thread [`absorb`]s the
+/// counts, so the
 /// work lands where the module docs say it does, on the originating thread.
 pub(crate) fn on_behalf<T>(level: PerfLevel, f: impl FnOnce() -> T) -> (T, PerfContextSnapshot) {
     /// Puts this thread's own level and counters back, on unwind too.

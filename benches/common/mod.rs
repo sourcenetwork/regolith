@@ -13,6 +13,9 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+pub mod counting_env;
+pub mod start;
+
 /// This process's arguments, without the `--bench` marker cargo appends.
 ///
 /// `cargo bench --bench <name> -- <args>` passes `<args>` through and then
@@ -172,11 +175,44 @@ impl Drop for TempDb {
     }
 }
 
+/// Copy the database directory `from` to `to`, everything but the contents
+/// of its `LOCK`, which the copy gets empty. The lock of a database still
+/// open cannot be read on Windows, where its holder shares it for nothing
+/// but deletion; an empty `LOCK` is one a read-write open adopts and stamps,
+/// and one a read-only open, which never creates it, can lock shared.
+pub fn copy_db(from: &Path, to: &Path) {
+    fs::create_dir_all(to).unwrap_or_else(|e| panic!("create {}: {e}", to.display()));
+    for entry in fs::read_dir(from).unwrap_or_else(|e| panic!("read {}: {e}", from.display())) {
+        let entry = entry.unwrap_or_else(|e| panic!("read {}: {e}", from.display()));
+        let (src, dst) = (entry.path(), to.join(entry.file_name()));
+        if src.is_dir() {
+            copy_db(&src, &dst);
+        } else if entry.file_name() == "LOCK" {
+            fs::write(&dst, []).unwrap_or_else(|e| panic!("create {}: {e}", dst.display()));
+        } else {
+            fs::copy(&src, &dst).unwrap_or_else(|e| panic!("copy {}: {e}", src.display()));
+        }
+    }
+}
+
 pub fn open(tag: &str, opts: regolith::Options) -> (TempDb, regolith::Db) {
     let tmp = TempDb::new(tag);
     let db = regolith::Db::open(tmp.path(), opts)
         .unwrap_or_else(|e| panic!("open db at {}: {e}", tmp.dir.display()));
     (tmp, db)
+}
+
+/// Whether `db`, which held no table and no sealed memtable when a timed
+/// window began, sealed a memtable in it: one waits for its flush, or a table
+/// was written. A bench whose rows must all time the write path alone checks
+/// this, because a row that rotated timed a flush the others did not.
+pub fn rotated(db: &regolith::Db) -> bool {
+    let property = |name: &str| {
+        db.get_int_property(name)
+            .unwrap_or_else(|| panic!("the database does not report {name}"))
+    };
+    property("regolith.num-entries-imm-mem-tables") > 0
+        || property("regolith.total-sst-files-size") > 0
 }
 
 pub fn default_opts() -> regolith::Options {

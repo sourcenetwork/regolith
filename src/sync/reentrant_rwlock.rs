@@ -186,7 +186,9 @@ impl<T: ?Sized> ReentrantRwLock<T> {
         })
     }
 
-    /// Waits to read, at once if `owner` already reads or writes.
+    /// Waits to read, at once if `owner` already reads or writes. A
+    /// contended wait is lock-free, not wait-free: see
+    /// [Progress](super#progress).
     pub fn read<'a>(&'a self, owner: &'a Owner) -> ReentrantRead<'a, T> {
         ReentrantRead {
             lock: self,
@@ -197,7 +199,8 @@ impl<T: ?Sized> ReentrantRwLock<T> {
 
     /// Waits to write, at once if `owner` already writes. Fails with
     /// [`ReadHeldByOwner`] when `owner` reads without writing: the write
-    /// would wait for that read, which only `owner` can end.
+    /// would wait for that read, which only `owner` can end. A contended
+    /// wait is lock-free, not wait-free: see [Progress](super#progress).
     pub fn write<'a>(&'a self, owner: &'a Owner) -> ReentrantWrite<'a, T> {
         ReentrantWrite {
             lock: self,
@@ -286,7 +289,10 @@ impl<T: ?Sized> fmt::Debug for ReentrantRwLock<T> {
 }
 
 /// One read of a [`ReentrantRwLock`]; drops one level of the owner's
-/// reads.
+/// reads. The drop of the last level releases the read, which is
+/// lock-free, not wait-free: with waiters it returns after one pass over
+/// the queue, plus at most one for each operation of another thread that
+/// lands on the queue meanwhile (see [Progress](super#progress)).
 #[must_use = "dropping the guard releases one read at once"]
 pub struct ReentrantReadGuard<'a, T: ?Sized> {
     lock: &'a ReentrantRwLock<T>,
@@ -327,7 +333,8 @@ impl<T: ?Sized + fmt::Debug> fmt::Debug for ReentrantReadGuard<'_, T> {
 }
 
 /// One write of a [`ReentrantRwLock`]; drops one level of the owner's
-/// writes.
+/// writes. The drop of the last level releases the write, with the
+/// progress [`ReentrantReadGuard`]'s release makes.
 #[must_use = "dropping the guard releases one write at once"]
 pub struct ReentrantWriteGuard<'a, T: ?Sized> {
     lock: &'a ReentrantRwLock<T>,

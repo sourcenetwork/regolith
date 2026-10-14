@@ -147,8 +147,7 @@ fn a_memory_env_database_reopens_when_its_newest_wal_ends_mid_record() {
 fn newest_wal(env: &Arc<MemEnv>, dir: &str) -> std::path::PathBuf {
     let mut logs: Vec<_> = Env::read_dir(&**env, std::path::Path::new(&format!("{dir}/wal")))
         .expect("read_dir wal")
-        .into_iter()
-        .map(|e| e.path)
+        .map(|e| e.expect("walk wal").path)
         .filter(|p| p.extension().is_some_and(|x| x == "log"))
         .collect();
     logs.sort();

@@ -2,10 +2,10 @@
 //!
 //! Every test here runs a database with no background worker, which is
 //! the only mode a single-threaded host such as `wasm32-wasip1` can
-//! open in. The invariant under test throughout is that a writer never
-//! blocks on a signal that nobody will send: it either does the
-//! compaction work on its own thread or returns
-//! [`regolith::Error::Busy`].
+//! open in, with inline compaction on and no I/O queue. The invariant
+//! under test throughout is that a writer never blocks on a signal that
+//! nobody will send: it either does the compaction work on its own thread
+//! or returns [`regolith::Error::Busy`].
 
 // Native-only. wasm-pack builds every test target for wasm32, and these use
 // threads, the filesystem or proptest, none of which exist there. The browser
@@ -34,6 +34,7 @@ fn foreground_options() -> Options {
         .level0_slowdown_writes_trigger(4)
         .level0_stop_writes_trigger(8)
         .max_background_compactions(0)
+        .inline_compaction(true)
 }
 
 fn value(i: usize) -> Vec<u8> {
@@ -63,7 +64,7 @@ impl EventListener for JobCounter {
 fn open_succeeds_with_zero_background_compactions() {
     let dir = tempfile::tempdir().unwrap();
     let db = Db::open(dir.path(), foreground_options()).unwrap();
-    db.put(b"k", b"v").unwrap();
+    regolith::through_stalls(|| db.put(b"k", b"v")).unwrap();
     assert_eq!(db.get(b"k").unwrap().as_deref(), Some(&b"v"[..]));
 }
 
@@ -80,7 +81,7 @@ fn zero_workers_do_not_wedge_at_the_stop_trigger() {
     // push L0 well past `level0_stop_writes_trigger`, with no
     // `compact_range` anywhere to rescue it.
     for i in 0..8_000usize {
-        db.put(format!("key{i:06}").as_bytes(), &value(i)).unwrap();
+        regolith::through_stalls(|| db.put(format!("key{i:06}").as_bytes(), &value(i))).unwrap();
     }
 
     for i in (0..8_000usize).step_by(97) {
@@ -114,7 +115,7 @@ fn inline_compaction_bounds_the_work_one_write_performs() {
     let mut worst = 0usize;
     for i in 0..4_000usize {
         let before = counter.compactions.load(Ordering::Relaxed);
-        db.put(format!("key{i:06}").as_bytes(), &value(i)).unwrap();
+        regolith::through_stalls(|| db.put(format!("key{i:06}").as_bytes(), &value(i))).unwrap();
         worst = worst.max(counter.compactions.load(Ordering::Relaxed) - before);
     }
 
@@ -224,7 +225,7 @@ fn a_full_memtable_becomes_an_l0_file_with_no_worker() {
     assert_eq!(db.get_int_property("regolith.num-files-at-level0"), Some(0));
 
     for i in 0..400usize {
-        db.put(format!("key{i:06}").as_bytes(), &value(i)).unwrap();
+        regolith::through_stalls(|| db.put(format!("key{i:06}").as_bytes(), &value(i))).unwrap();
     }
 
     assert!(
@@ -238,7 +239,7 @@ fn explicit_flush_writes_an_l0_file_and_is_idempotent() {
     let dir = tempfile::tempdir().unwrap();
     let db = Db::open(dir.path(), foreground_options().l0_compaction_trigger(64)).unwrap();
 
-    db.put(b"a", b"1").unwrap();
+    regolith::through_stalls(|| db.put(b"a", b"1")).unwrap();
     db.flush().unwrap();
     let after_first = db.get_int_property("regolith.num-files-at-level0").unwrap();
     assert_eq!(after_first, 1);
@@ -278,7 +279,7 @@ fn compact_step_reports_idle_did_work_and_contended_apart() {
     )
     .unwrap();
     for i in 0..KEYS {
-        db.put(format!("key{i:06}").as_bytes(), &value(i)).unwrap();
+        regolith::through_stalls(|| db.put(format!("key{i:06}").as_bytes(), &value(i))).unwrap();
     }
     db.flush().unwrap();
     assert!(
@@ -329,7 +330,8 @@ fn compact_step_works_with_a_background_worker_running() {
     .unwrap();
 
     for i in 0..2_000usize {
-        db.put(format!("key{i:06}").as_bytes(), &value(i)).unwrap();
+        // Through stalls: the workers may fall behind these writes.
+        regolith::through_stalls(|| db.put(format!("key{i:06}").as_bytes(), &value(i))).unwrap();
         if i % 250 == 0 {
             // Returns false when the workers got there first; either
             // answer is correct, and neither may corrupt the version.
@@ -354,12 +356,12 @@ fn full_lifecycle_with_zero_workers() {
     let db = Db::open(dir.path(), foreground_options()).unwrap();
 
     for i in 0..2_000usize {
-        db.put(format!("key{i:06}").as_bytes(), &value(i)).unwrap();
+        regolith::through_stalls(|| db.put(format!("key{i:06}").as_bytes(), &value(i))).unwrap();
     }
 
     let snapshot = db.snapshot();
 
-    db.delete(b"key000005").unwrap();
+    regolith::through_stalls(|| db.delete(b"key000005")).unwrap();
     assert_eq!(db.get(b"key000005").unwrap(), None);
     assert_eq!(
         snapshot.get(b"key000005").unwrap(),
@@ -370,7 +372,7 @@ fn full_lifecycle_with_zero_workers() {
     let mut batch = WriteBatch::new();
     batch.put(b"batched", b"yes");
     batch.delete(b"key000006");
-    db.write(batch).unwrap();
+    regolith::through_stalls(|| db.write(batch.clone())).unwrap();
     assert_eq!(db.get(b"batched").unwrap().as_deref(), Some(&b"yes"[..]));
     assert_eq!(db.get(b"key000006").unwrap(), None);
 
@@ -391,7 +393,7 @@ fn full_lifecycle_with_zero_workers() {
     drop(snapshot);
 
     db.flush().unwrap();
-    db.compact_range(None, None).unwrap();
+    db.compact_range(None, None).wait().unwrap();
     while db.compact_step().unwrap() == CompactionOutcome::DidWork {}
 
     db.close().unwrap();
@@ -405,4 +407,86 @@ fn full_lifecycle_with_zero_workers() {
     assert_eq!(db.get(b"key000005").unwrap(), None);
     assert_eq!(db.get(b"key000006").unwrap(), None);
     assert_eq!(db.get(b"batched").unwrap().as_deref(), Some(&b"yes"[..]));
+}
+
+fn l0_tables(db: &Db) -> u64 {
+    db.get_int_property("regolith.num-files-at-level0").unwrap()
+}
+
+/// A slowdown delays no write. What a slowdown threshold still decides, for
+/// both of them (the count of level-0 tables and their bytes):
+///
+/// - a write that asked not to be slowed is refused with the reason;
+/// - with no worker and inline compaction on, a write pays one step of the
+///   compaction that is due, and with inline compaction off it does not.
+///
+/// A threshold that is off decides neither.
+#[test]
+fn a_slowdown_threshold_refuses_no_slowdown_writes_and_makes_a_write_pay_a_step() {
+    let dir = tempfile::tempdir().unwrap();
+    // Three level-0 tables, written with thresholds they never reach.
+    let quiet = || {
+        foreground_options()
+            .l0_compaction_trigger(1_000)
+            .level0_slowdown_writes_trigger(0)
+            .level0_stop_writes_trigger(0)
+            .soft_pending_compaction_bytes_limit(0)
+            .hard_pending_compaction_bytes_limit(0)
+    };
+    {
+        let db = Db::open(dir.path(), quiet()).unwrap();
+        for table in 0..3usize {
+            db.put(format!("key{table}").as_bytes(), &value(table))
+                .unwrap();
+            db.flush().unwrap();
+        }
+        assert_eq!(l0_tables(&db), 3);
+    }
+    let no_slowdown = WriteOptions {
+        no_slowdown: true,
+        ..WriteOptions::default()
+    };
+    let by_count = |options: Options| options.level0_slowdown_writes_trigger(3);
+    let by_bytes = |options: Options| options.soft_pending_compaction_bytes_limit(1);
+    let cases: [(&dyn Fn(Options) -> Options, &str); 2] = [
+        (&by_count, "slowdown: L0 files over trigger"),
+        (
+            &by_bytes,
+            "slowdown: pending compaction bytes over soft limit",
+        ),
+    ];
+
+    for (threshold, reason) in cases {
+        // Inline compaction off: nothing is compacted, a plain write goes
+        // on at once, and a write that refuses to be slowed is told why.
+        let db = Db::open(dir.path(), threshold(quiet()).inline_compaction(false)).unwrap();
+        db.put(b"plain", b"v").unwrap();
+        assert_eq!(l0_tables(&db), 3);
+        match db.put_opt(&no_slowdown, b"refused", b"v") {
+            Err(Error::Busy(told)) => assert_eq!(told, reason),
+            other => panic!("expected the slowdown's reason, got {other:?}"),
+        }
+        assert_eq!(db.get(b"refused").unwrap(), None);
+        drop(db);
+    }
+
+    // The threshold off, inline compaction on, a compaction due: a write
+    // owes nothing, so the tables stay.
+    let due = || quiet().l0_compaction_trigger(2).inline_compaction(true);
+    let db = Db::open(dir.path(), due()).unwrap();
+    db.put(b"plain", b"v").unwrap();
+    db.put_opt(&no_slowdown, b"not-refused", b"v").unwrap();
+    assert_eq!(l0_tables(&db), 3);
+    drop(db);
+
+    // The threshold on: the same write pays the step, which merges them.
+    let db = Db::open(dir.path(), by_count(due())).unwrap();
+    db.put(b"plain", b"w").unwrap();
+    assert_eq!(
+        l0_tables(&db),
+        0,
+        "the slowed write ran the pass that was due"
+    );
+    assert_eq!(db.get(b"key0").unwrap(), Some(value(0)));
+    assert_eq!(db.get(b"plain").unwrap(), Some(b"w".to_vec()));
 }
