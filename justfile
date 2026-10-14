@@ -4,7 +4,7 @@ default:
     @just --list
 
 # Everything CI enforces on every push, in the order it fails fastest.
-gate: fmt lint doc test deny
+gate: fmt lint doc test test-testing deny
 
 fmt:
     cargo fmt --all -- --check
@@ -12,11 +12,17 @@ fmt:
 fmt-fix:
     cargo fmt --all
 
+# The second pass of `lint`, `doc` and `msrv` turns on `testing`: the
+# feature adds `regolith::testing`, which no default build contains, so
+# the default pass never sees it.
+
 lint:
     cargo clippy --workspace --all-targets -- -D warnings
+    cargo clippy -p regolith --all-targets --features testing -- -D warnings
 
 doc:
     RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
+    RUSTDOCFLAGS="-D warnings" cargo doc -p regolith --no-deps --features testing
 
 # nextest, not `cargo test`: each test gets its own process, so a
 # wedged test fails on the profile's slow-timeout instead of holding the
@@ -26,11 +32,19 @@ test:
     cargo nextest run --workspace
     cargo test --workspace --doc
 
+# `regolith::testing` under its feature: the contract checks' own tests,
+# then every doc test again, which adds the ones that call the checks.
+
+test-testing:
+    cargo nextest run -p regolith --features testing --lib testing::
+    cargo test -p regolith --features testing --doc
+
 deny:
     cargo deny check
 
 msrv:
     cargo "+$(grep -m1 '^rust-version' Cargo.toml | cut -d'"' -f2)" check --workspace
+    cargo "+$(grep -m1 '^rust-version' Cargo.toml | cut -d'"' -f2)" check -p regolith --features testing
 
 # The summary line CI annotates a build with.
 # Through nextest, like the gate: one process per test, so a wedged
@@ -280,7 +294,7 @@ loom-debug:
     RUSTFLAGS="--cfg loom" timeout 10m cargo test --test loom_memtable
 
 # Loom models for `regolith::sync`: every primitive's wait protocol,
-# with five calibrations that must fail. Release only: the larger models
+# with seven calibrations that must fail. Release only: the larger models
 # explore 0.1 to 0.4 million interleavings each (about four minutes in
 # all), which a debug build multiplies several times over.
 loom-sync:
@@ -526,8 +540,47 @@ tla:
     check MC_DefraLevel_Red_Parts_RepeatableRead       RED INV_PartsRelaxed
     check MC_DefraLevel_Green_ValueReads               GREEN
     check MC_DefraLevel_Red_SeqOnlyValidation          RED INV_IdenticalRewritesCommit
+    # E50, a commit that writes nothing at every level: no pipeline slot, no
+    # sequence, its level's checks against every decided commit and at the
+    # published point, the receipt its snapshot, a latched database commits
+    # it. Lean: Regolith/Validation.lean, writeFree_at_horizon;
+    # Regolith/Relaxations.lean, read_only_anomaly.
+    check MC_ReadCommitted_Green_WriteFree             GREEN
+    check MC_SnapshotIsolation_Green_WriteFree         GREEN
+    check MC_RepeatableRead_Green_WriteFree            GREEN
+    check MC_Serializable_Green_WriteFree              GREEN
     check MC_DefraLevel_Green_WriteFree                GREEN
     check MC_DefraLevel_Red_WriteFreePessimistic       RED INV_WriteFreeConsistent
+    check MC_RepeatableRead_Red_WriteFreeUnchecked     RED INV_WriteFreeAtHorizon
+    check MC_SnapshotIsolation_Red_WriteFreeUnchecked  RED INV_WriteFreeAtHorizon
+    check MC_SnapshotIsolation_Red_WriteFreeChecksPlainReads RED INV_WriteFreeCommits
+    check MC_ReadCommitted_Red_ReadCommittedChecksForUpdate RED INV_WriteFreeCommits
+    check MC_DefraLevel_Red_ValueAboveHorizonRefuses   RED INV_WriteFreeIdenticalCommits
+    check MC_SnapshotIsolation_Red_WriteFreeRefusedWhenLatched RED INV_LatchRefusesOnlyWrites
+    check MC_SnapshotIsolation_Red_WriteFreeTakesSequence RED INV_WriteFreeTakesNoSequence
+    check MC_SnapshotIsolation_Red_ReceiptAtHorizon    RED INV_WriteFreeReceipt
+    # A value read judged where it is placed: changed at the published point,
+    # restored by a commit decided and not yet visible, it is refused.
+    check MC_DefraLevel_Green_WriteFreeRestore         GREEN
+    check MC_DefraLevel_Red_JudgedAtDecidedOnly        RED INV_WriteFreeAtHorizon
+    # Write-free scans: a validated range is checked at every level but under
+    # DefraLevel's relaxation, a plain scan's keys at Serializable.
+    check MC_Serializable_Green_WriteFreeScan          GREEN
+    check MC_RepeatableRead_Green_WriteFreeScan        GREEN
+    check MC_DefraLevel_Green_WriteFreeScan            GREEN
+    check MC_RepeatableRead_Red_WriteFreeIgnoresRanges RED INV_ScanDecisionsCurrent
+    check MC_Serializable_Red_WriteFreeScanUnchecked   RED INV_WriteFreeAtHorizon
+    # The read-only anomaly (Fekete, O'Neil and O'Neil 2004): a report checked
+    # against every decided commit is refused once the withdrawal is decided;
+    # checked against the published state alone, or not at all, it commits a
+    # sheet no serial order gives, as one at SnapshotIsolation does by design.
+    check MC_Serializable_Green_ReadOnlyAnomaly        GREEN
+    check MC_RepeatableRead_Green_ReadOnlyAnomaly      GREEN
+    check MC_Serializable_Green_ReadOnlyAnomalyPessimistic GREEN
+    check MC_DefraLevel_Green_ReadOnlyAnomalyPessimistic GREEN
+    check MC_Serializable_Red_ReadOnlyAnomaly          RED INV_NoReadOnlyAnomaly
+    check MC_Serializable_Red_ReadOnlyAnomalyPublishedOnly RED INV_NoReadOnlyAnomaly
+    check MC_SnapshotIsolation_Red_ReadOnlyAnomaly     RED INV_NoReadOnlyAnomaly
     check MC_DefraLevel_Green_Log                      GREEN
     check MC_DefraLevel_Red_OwnAppendVisible           RED INV_NoPhantomAppend
     check MC_DefraLevel_Red_DecideOnLogRead            RED INV_LogDecisionsCurrent
@@ -539,6 +592,14 @@ tla:
     check MC_DefraLevel_Green_ValidatedScan            GREEN
     check MC_DefraLevel_Red_PlainScanDecides           RED INV_ScanDecisionsCurrent
     check MC_DefraLevel_Red_ReasonNewestWrite          RED INV_ReasonsExact
+    # The exempt reads a caller must not decide on: a scan inside a
+    # commutative prefix and a read by no parts. Each GREEN uses the
+    # exemption as declared; each RED decides on it and loses.
+    check MC_DefraLevel_Green_CommutativeScan          GREEN
+    check MC_DefraLevel_Red_DecideOnCommutativeScan    RED INV_SeatExclusive
+    check MC_DefraLevel_Green_ClaimUndeclared          GREEN
+    check MC_DefraLevel_Green_NoParts                  GREEN
+    check MC_DefraLevel_Red_DecideOnNoParts            RED INV_PartsCurrent
     # E1. Lean: Regolith/LsmOrder.lean, compact_range_reads_newest.
     spec=LsmOrder
     # E31, a flush's table and its memtable's retirement are one publication.
@@ -557,6 +618,24 @@ tla:
     check MC_LsmOrder_Green_Demote                     GREEN
     check MC_LsmOrder_Red_DemoteLevelOnly              RED ReadNewest
     check MC_LsmOrder_Red_NoDemotion                   RED ReadNewest
+    # E38: a universal merge takes L0 files that lie next to one another.
+    # Lean: Regolith/LsmOrder.lean, merge_window_reads_newest,
+    # merge_gapped_breaks_reads.
+    check MC_LsmOrder_Green_L0Merge                    GREEN
+    check MC_LsmOrder_Red_L0MergeGap                   RED ReadNewest
+    # E14 and E37, the range deletes of the tables an open moves out of
+    # overlapping levels and those 0.1.x left below older keys they delete:
+    # copied into the recovered memtable, and logged before the manifest
+    # records the move and the check. Lean: Regolith/RangeDelete.lean,
+    # hoisted_delete_reads_by_sequence.
+    spec=LegacyRangeRead
+    check MC_LegacyRangeRead_Green                     GREEN
+    check MC_LegacyRangeRead_Red_NoHoist               RED ReadNewest
+    check MC_LegacyRangeRead_Red_PreScanOnly           RED ReadNewest
+    check MC_LegacyRangeRead_Red_MoveBeforeLog         RED ReadNewest
+    check MC_LegacyRangeRead_Green_Buried              GREEN
+    check MC_LegacyRangeRead_Red_BuriedRetired         RED ScanNewest
+    check MC_LegacyRangeRead_Red_CheckBeforeLog        RED HeadNewest
     # E6. Lean: Regolith/BatchView.lean, batch_one_view_newest.
     spec=BatchRead
     check MC_BatchRead_Green                           GREEN
@@ -676,10 +755,10 @@ tla:
     # the pool a batch at a time, reading each listing as its walk of meta/
     # reaches it, and removes every unlisted table and no listed one. Lean:
     # Regolith/BackupSeal.lean, entitled_restore_is_faithful,
-    # refusal_writes_nothing, collect_keeps_listed, last_write_holds_all,
-    # listing_names_every_backup, purge_keeps_the_newest, collect_stream_eq,
-    # stream_holds_one_batch, sweep_eq, sweep_removes_every_unlisted,
-    # list_pages_all.
+    # restored_tables_verify, refusal_writes_nothing, collect_keeps_listed,
+    # last_write_holds_all, listing_names_every_backup, purge_keeps_the_newest,
+    # collect_stream_eq, stream_holds_one_batch, sweep_eq,
+    # sweep_removes_every_unlisted, list_pages_all.
     spec=BackupSeal
     check MC_BackupSeal_Green                          GREEN
     check MC_BackupSeal_Green_Attack                   GREEN
@@ -696,8 +775,10 @@ tla:
     check MC_BackupSeal_Red_ManifestFirst              RED FaithfulRestore
     check MC_BackupSeal_Red_OverDatabase               RED FaithfulRestore
     check MC_BackupSeal_Red_CheckAfterCopy             RED RefusalWritesNothing
+    check MC_BackupSeal_Red_FooterUnchecked            RED RestoredOpens
     check MC_BackupSeal_Red_GcSkipsSealed              RED ListedRestores
     check MC_BackupSeal_Red_GcSkipsUnreadable          RED ListedRestores
+    check MC_BackupSeal_Red_SyncOnlyRemoved            RED ListedRestores
     check MC_BackupSeal_Red_MetaFirst                  RED ListedRestores
     check MC_BackupSeal_Red_ListSkipsUnreadable        RED ListingNamesEvery
     check MC_BackupSeal_Red_ListNeedsKey               RED ListingNamesEvery
@@ -712,12 +793,19 @@ tla:
     check MC_StripeCompaction_Red_IgnoreStripes        RED SnapshotReadsKept
     # E27: a pass retires a range tombstone below its range and every
     # snapshot. Green_Retires is the witness that the fix retires at all.
+    # The Rewrite rows check a pass over one run alone, which a pass picked
+    # for its deletions (D14) runs on a bottom-level table and on the only
+    # run of a universal pool.
     # Lean: Regolith/TombstoneRetirement.lean, retire_keeps_reads.
     spec=TombstoneRetirement
     check MC_TombstoneRetirement_Green                 GREEN
     check MC_TombstoneRetirement_Green_Retires         RED NothingRetired
     check MC_TombstoneRetirement_Red_IgnoreSnapshots   RED SnapshotReadsKept
     check MC_TombstoneRetirement_Red_IgnoreDeeper      RED SnapshotReadsKept
+    check MC_TombstoneRetirement_Green_Rewrite         GREEN
+    check MC_TombstoneRetirement_Green_RewriteRetires  RED NothingRetired
+    check MC_TombstoneRetirement_Red_RewriteIgnoreSnapshots RED SnapshotReadsKept
+    check MC_TombstoneRetirement_Red_RewriteIgnoreDeeper RED SnapshotReadsKept
     # 4.6, D54: the snapshot registry on per-thread slots with counted
     # entries, moved handles, copies and shared slots. Lean:
     # Regolith/SnapshotRegistry.lean, scan_respects_live,
@@ -952,6 +1040,27 @@ tla:
     check MC_NonBlocking_Red_PublishAtWrite            RED VisibleAfterSync
     check MC_NonBlocking_Red_DeliverOnLander           RED DeliveredOnOwnPoll
     check MC_NonBlocking_Red_NoRecheck                 RED StallLandsWhenClear
+    # D53, timed waits (the wait a retry backs off on): completed only by
+    # the poll of the queue that was asked, not before the due time, by an
+    # owner that polls again within what its poll reported, and by the drop
+    # of the queue. Lean: Regolith/IoQueue.lean, timed_wait_completed_once,
+    # timed_wait_completed_by_owner, timed_wait_not_before_due,
+    # dropped_queue_holds_no_wait, poll_after_wake_in_completes.
+    check MC_NonBlocking_Green_Timer                   GREEN
+    check MC_NonBlocking_Green_TimerLive               GREEN
+    check MC_NonBlocking_Red_IdlePastDue               RED AllDone
+    check MC_NonBlocking_Red_EarlyFire                 RED TimerNotEarly
+    check MC_NonBlocking_Red_DropForgets               RED DroppedHoldsNothing
+    check MC_NonBlocking_Red_TimerWrongQueue           RED TimerOnOwnQueue
+    # D53, what a read run again finds: a landing that a call still needs is
+    # held past the queue's byte bound until the call runs again, so a call
+    # needing more blocks at once than the bound finishes, and the eviction
+    # that held nothing never let it.
+    spec=LandingHold
+    check MC_LandingHold_Green                         GREEN
+    check MC_LandingHold_Green_Three                   GREEN
+    check MC_LandingHold_Red_Fifo                      RED EveryCallFinishes
+    check MC_LandingHold_Red_NoHolds                   RED RunsKeepProgress
     # Phase 7 integration: with no worker and inline compaction on, no
     # stopped writer waits on a relief nobody runs. Every piece of progress
     # lands the stall's unit (relief handed back), a contended writer reads
@@ -995,15 +1104,20 @@ tla:
     check MC_StallRelief_Red_CommitGivesUp             RED NoLostCommit
     check MC_StallRelief_Green_Commit_InlineOff        GREEN
     check MC_StallRelief_Red_CommitLeftToCaller        RED NoLostCommit
-    # E16: with no worker, a write that owes a step of background work runs
-    # exactly one, and L0 stays at its compaction trigger (at the stop
-    # trigger when every write seals). Lean: Regolith/OwedStep.lean,
-    # write_one_step, l0_bounded, l0_bounded_by_stop.
+    # E16: with no worker, a write that owes a step of background work and
+    # runs it inline runs exactly one, and L0 stays at its compaction trigger
+    # (at the stop trigger when every write seals). A writer with a queue
+    # leaves the step there for its polls: L0 may then pass the trigger, and
+    # stays within the stop trigger plus the sealed memtables a rotation
+    # keeps. Lean: Regolith/OwedStep.lean, write_one_step, l0_bounded,
+    # l0_bounded_by_stop, queued_l0_bounded, queued_passes_trigger.
     spec=OwedStep
     check MC_OwedStep_Green                            GREEN
     check MC_OwedStep_Green_TinyMemtable               GREEN
+    check MC_OwedStep_Green_Queued                     GREEN
     check MC_OwedStep_Red_FlushOwesNothing             RED L0Bounded
     check MC_OwedStep_Red_StepUntilIdle                RED OneStepPerWrite
+    check MC_OwedStep_Red_QueuedTightBound             RED L0Bounded
     # regolith::sync's locks after D49: barging with bounded bypass, for
     # Mutex, Semaphore and ReentrantMutex, one step per atomic instruction
     # of src/sync. Lean: Regolith/Sync.lean, mutual_exclusion,
@@ -1034,6 +1148,12 @@ tla:
     check MC_Sync_Red_ReleaseDirties                   RED DrainBounded
     check MC_Sync_Red_ExitIgnoresRequest               RED NoLostWakeup
     check MC_Sync_Green_PassesGrow                     RED FewPasses
+    # E48: the spin before queueing and the spin on the waiter's own node.
+    # The spin must stop for an owed handoff, and a spin that runs out must
+    # read its node's marks as it arms the waker again: a release that found
+    # it spinning called no waker.
+    check MC_Sync_Red_SpinNoRecheck                    RED NoLostWakeup
+    check MC_Sync_Red_SpinIgnoresOwed                  RED HandoffExclusive
     # regolith::sync::Notify, which keeps FIFO handoff. Lean:
     # Regolith/SyncFifo.lean, fifo_served, no_stranded_waiter.
     spec=SyncNotify
@@ -1043,6 +1163,7 @@ tla:
     check MC_SyncNotify_Red_CancelNoPassOn             RED CancelPassesOn
     check MC_SyncNotify_Red_NoRecheck                  RED NoLostWakeup
     check MC_SyncNotify_Red_NoGenCheck                 RED NoLostWakeup
+    check MC_SyncNotify_Red_FrontGenCheck              RED NoLostWakeup
     # regolith::sync::RwLock and ReentrantRwLock after D49, with D50's
     # upgradable read, one step of src/sync/raw_rwlock.rs at a time on the
     # queue of Sync.tla. Lean: Regolith/Sync.lean for the exclusive side.
@@ -1063,6 +1184,9 @@ tla:
     # reads UPGRADING and takes the write for the node in its slot.
     check MC_SyncRwLock_Green_UpgradeDropped           GREEN
     check MC_SyncRwLock_Red_PassTakesWrite             RED GuardsCounted
+    # E48: a spin on the node that runs out must read the marks as it arms
+    # the waker again, for the RwLock's waits too.
+    check MC_SyncRwLock_Red_SpinNoRecheck              RED NoLostWakeup
     # The compaction gate (4.6, E28): a pass shares it, a job holds it
     # alone, no waiter is passed over more than Bound times either way, the
     # worker takes turns between jobs and passes, and a job parked on its
@@ -1211,6 +1335,16 @@ tla:
     check MC_EnvFiles_Green_Rename                     GREEN
     check MC_EnvFiles_Red_RemoveFirst                  RED OpenFindsFile
     check MC_EnvFiles_Red_NoReload                     RED OpenFindsFile
+    # MemEnv's rename racing other changes to the namespace: the rename marks
+    # its source before it puts the file at the destination, so a removal or
+    # a rename that moves the destination on cannot make it undo itself.
+    # Green_Moved is the witness that the GREEN run reaches that race.
+    spec=EnvRename
+    check MC_EnvRename_Green                           GREEN
+    check MC_EnvRename_Green_FourCalls                 GREEN
+    check MC_EnvRename_Green_Moved                     RED NeverMovedOn
+    check MC_EnvRename_Red_Rollback                    RED Linearizable
+    check MC_EnvRename_Red_RemoveIgnoresMark           RED Linearizable
     # The pessimistic lock table (plan 4.6, 4.10): one holder per key, no
     # lost wake-up, bounded bypass, a wait delivered to its own queue, and a
     # lock released when its commit lands. Lean: Regolith/LockTable.lean,
@@ -1237,6 +1371,12 @@ tla:
     check MC_LockTable_Red_CompleteOnWaker             RED OwnQueue
     check MC_LockTable_Red_ReleaseAtWrite              RED IsolationAtLanding
     check MC_LockTable_Red_ReleaseAtDelivery           RED HeldOnlyWhileNeeded
+    check MC_LockTable_Green_EarlyPoll                 GREEN
+    check MC_LockTable_Red_MineBeforeGrant             RED MutualExclusion
+    spec=LockTableCalls
+    check MC_LockTableCalls_Green                      GREEN
+    check MC_LockTableCalls_Red_NewestShadows          RED OneQueuedWait
+    check MC_LockTableCalls_Red_NoHandBack             RED NobodyStranded
     wait
     rm -rf ./*_TTrace_*.tla ./*_TTrace_*.bin
     cat "$results"/*.out
@@ -1353,6 +1493,9 @@ elle-matrix:
     # get_for_update, the one read that level leaves unvalidated and
     # SnapshotIsolation validates.
     check pessimistic-rc      list-append read-committed     --isolation read-committed --threads 8 --txns 50 --keys 4 --seed 2
+    # The same level over registers: a lock that times out aborts its
+    # transaction, and a value an aborted transaction wrote must never be read.
+    check pessimistic-rc-rw   rw-register read-committed     --isolation read-committed --threads 8 --txns 50 --keys 4 --seed 3
     check pessimistic-hotkey  list-append read-committed     --isolation read-committed --threads 8 --txns 50 --keys 1 --seed 1
     # Serializable validates the whole read set, so the strongest model
     # Elle offers must hold.
@@ -1373,6 +1516,35 @@ elle-matrix:
     # key both commit, which first-committer-wins forbids.
     check defra-level         list-append strict-serializable --isolation defra-level --threads 8 --txns 60 --keys 4 --seed 16
     check defra-level-rw      rw-register strict-serializable --isolation defra-level --threads 8 --txns 60 --keys 4 --seed 17
+    # DefraLevel with a key classifier (`--shape`, README.md). In the
+    # `classified` shape every transaction also stores a content-addressed
+    # block it read as missing, adds a key to a commutative prefix it scanned
+    # and appends to a log. The classes say none of that conflicts, and none
+    # of it may loosen the point operations beside it: the strongest model
+    # must hold, and elle-gen itself fails the row when a commit left a head
+    # without its log entry.
+    check defra-classified    list-append strict-serializable --isolation defra-level --shape classified --threads 8 --txns 60 --keys 4 --seed 18
+    check defra-classified-rw rw-register strict-serializable --isolation defra-level --shape classified --threads 8 --txns 60 --keys 4 --seed 19
+    # Commit-ordered appends: a key is a log, an append is
+    # `Transaction::append` and a read is the log in one snapshot. An append
+    # is never validated at any level and positions follow commit order, so
+    # every level must hold the strongest model, the pessimistic flavour too.
+    check defra-appends       list-append strict-serializable --isolation defra-level --shape appends --threads 8 --txns 60 --keys 4 --seed 20
+    check si-appends          list-append strict-serializable --isolation snapshot-isolation --shape appends --threads 8 --txns 60 --keys 4 --seed 21
+    check pessimistic-appends list-append strict-serializable --isolation read-committed --shape appends --threads 8 --txns 60 --keys 4 --seed 22
+    # Projected reads: a key is one part of a document, an append is an
+    # operand on the part and a read is `get_parts` naming it. Two keys share
+    # a document, so a reader of one part commits beside an append to the
+    # other, and is refused by an append to its own.
+    check defra-parts         list-append strict-serializable --isolation defra-level --shape parts --threads 8 --txns 60 --keys 4 --seed 23
+    # A prefix scan: every read is one validated scan of all the keys,
+    # recorded as a read of each. Scan-then-write is the shape of write skew,
+    # which a validated scan refuses at every level. The rw-register row has
+    # keys enough that most writes create one: a key that appears under a
+    # scan, which only a validated range sees.
+    check defra-scan          list-append strict-serializable --isolation defra-level --shape scan --threads 8 --txns 60 --keys 4 --seed 24
+    check defra-scan-phantoms rw-register strict-serializable --isolation defra-level --shape scan --threads 8 --txns 60 --keys 64 --seed 25
+    check repeatable-read-scan list-append strict-serializable --isolation repeatable-read --shape scan --threads 8 --txns 60 --keys 4 --seed 26
     exit $fail
 
 # ---------- portability ----------
@@ -1414,7 +1586,7 @@ wasm-native records="5000" sustained="20000":
 
 # The OPFS contract against a real browser. `wasm-pack test` cannot
 # drive these: it appends `--tests`, which builds every target in
-# `tests/`, and all but the three `wasm_opfs*` files are native-only.
+# `tests/`, and all but the four `wasm_opfs*` files are native-only.
 # The runner is named per target instead, so only the named test
 # binaries are built.
 #
@@ -1443,7 +1615,7 @@ wasm-browser:
     # the whole driver, so nine passing tests report as one failure with
     # no attribution.
     export WASM_BINDGEN_TEST_TIMEOUT=180
-    for suite in wasm_opfs wasm_opfs_main wasm_opfs_memory; do
+    for suite in wasm_opfs wasm_opfs_main wasm_opfs_memory wasm_opfs_transactions; do
         echo "== $suite =="
         cargo test --target wasm32-unknown-unknown --test "$suite"
     done

@@ -16,7 +16,9 @@ Picture backup 1 holding one table under key 1, taken before a rotation to
 key 2. A restore with a provider that still holds key 1 must work; one
 without a provider, without key 1, with other bytes under key 1, or after
 someone edited the listing or renamed the file, must refuse, and must not
-have copied a single table first.
+have copied a single table first. So must a backup 2 sealed under key 2
+whose older table is under key 1, restored with the right bytes for key 2
+and other bytes under key 1: its metadata opens, but the table does not.
 
 Picture too backups 1, 2 and 3, where a bit flips in backup 3's metadata.
 The listing must still name backup 3, saying it cannot be read, or whoever
@@ -42,8 +44,11 @@ This file backs `proofs/tla/BackupSeal.tla` (configurations
    tag covers and writes a MANIFEST sealed under a key it has
    (`RightKeysRestore`, `FaithfulRestore`).
 3. The refusals: no provider, a missing key, a wrong key, an edited
-   listing, a renamed file, a current or table key the provider lacks, and
-   a target that already holds a MANIFEST.
+   listing, a renamed file, a current or table key the provider lacks, a
+   table key it holds other bytes under, and a target that already holds a
+   MANIFEST. `restored_tables_verify`: a restore that is not refused had the
+   right bytes for every table's key, so the database it restores opens
+   (`RestoredOpens`).
 4. `restored_manifest_is_sealed`: with a provider, every MANIFEST a restore
    writes is sealed (`SealedMetadata`).
 5. `last_write_holds_all`, with `restore_manifest_follows_its_tables` and
@@ -102,8 +107,9 @@ structure Meta where
 structure Provider where
   /-- Whether it hands back a key under id `k` (`KeyProvider::key`). -/
   has : Nat → Bool
-  /-- Whether those keys are the bytes that sealed the files. -/
-  right : Bool
+  /-- Whether the bytes it hands back under id `k` are the ones that sealed
+  the files under `k`. -/
+  right : Nat → Bool
   /-- The key it names current (`KeyProvider::current`). -/
   cur : Nat
 
@@ -137,15 +143,17 @@ def opens (id : Nat) (m : Meta) : Option Provider → Bool
     -- Plain: nothing to check.
     | none => true
     -- Sealed under key k: the key, the bytes, the listing and the id.
-    | some k => p.has k && p.right && m.listing == m.sealedListing && m.bound == id
+    | some k => p.has k && p.right k && m.listing == m.sealedListing && m.bound == id
 
 /-- Whether the provider has its current key, which the MANIFEST is sealed
-under, and the key every table names; with no provider nothing is sealed. -/
+under, and the key every table names with the bytes that sealed it: the
+restore authenticates each table's footer under its key
+(`sstable::authenticate_footer`). With no provider nothing is sealed. -/
 def keysProvided (m : Meta) : Option Provider → Bool
   -- No provider: nothing to provide.
   | none => true
-  -- A provider: its current key and each table's key.
-  | some p => p.has p.cur && m.tableKeys.all p.has
+  -- A provider: its current key, and each table's key with the right bytes.
+  | some p => p.has p.cur && m.tableKeys.all (fun k => p.has k && p.right k)
 
 /-- The engine's restore (`BackupEngine::restore`). `hasManifest` is
 whether the target already holds a MANIFEST. Every check comes first; then
@@ -184,15 +192,15 @@ theorem entitled_restore_is_faithful (id k : Nat) (m : Meta) (p : Provider)
     -- ...the provider has key k...
     (hk : p.has k = true)
     -- ...with the right bytes...
-    (hr : p.right = true)
+    (hr : p.right k = true)
     -- ...nobody edited the listing...
     (hl : m.listing = m.sealedListing)
     -- ...the file is this id's own...
     (hb : m.bound = id)
     -- ...the provider has its current key...
     (hcur : p.has p.cur = true)
-    -- ...and every table's key.
-    (ht : m.tableKeys.all p.has = true) :
+    -- ...and every table's key, with the right bytes.
+    (ht : m.tableKeys.all (fun k => p.has k && p.right k) = true) :
     -- The statement: the restore is not refused, and it writes one copy per table of the sealed
     -- listing, then a MANIFEST sealed under the provider's current key.
     restore false id m (some p) =
@@ -226,7 +234,7 @@ theorem wrong_key_refuses (h : Bool) (id k : Nat) (m : Meta) (p : Provider)
     -- The file is sealed under key k.
     (hkey : m.key = some k)
     -- The provider's bytes are not the ones that sealed it.
-    (hr : p.right = false) :
+    (hr : p.right k = false) :
     -- The statement: the restore refuses.
     (restore h id m (some p)).refused = true := by
   -- The file does not open, so the restore refuses.
@@ -282,13 +290,56 @@ theorem unprovided_table_key_refuses (h : Bool) (id t : Nat) (m : Meta) (p : Pro
     -- The statement: the restore refuses.
     (restore h id m (some p)).refused = true := by
   -- Not every table key is provided: the one at `t` is the witness.
-  have hall : m.tableKeys.all p.has = false := by
+  have hall : m.tableKeys.all (fun k => p.has k && p.right k) = false := by
     -- `all` is false when some member fails; `t` is that member.
     simp only [List.all_eq_false]
     -- Name it, and show it fails.
     exact ⟨t, ht, by simp [hmiss]⟩
   -- The key check fails, so the restore refuses.
   simp [restore, keysProvided, hall]
+
+/-- **A table key under the wrong bytes refuses**, before anything is
+written: the provider has the key, but its footer does not verify under
+those bytes, and the restored database could not open that table. -/
+theorem wrong_table_key_refuses (h : Bool) (id t : Nat) (m : Meta) (p : Provider)
+    -- A listed table names key t...
+    (ht : t ∈ m.tableKeys)
+    -- ...whose bytes are not the ones that sealed it.
+    (hwrong : p.right t = false) :
+    -- The statement: the restore refuses.
+    (restore h id m (some p)).refused = true := by
+  -- Not every table key verifies: the one at `t` is the witness.
+  have hall : m.tableKeys.all (fun k => p.has k && p.right k) = false := by
+    -- `all` is false when some member fails; `t` is that member.
+    simp only [List.all_eq_false]
+    -- Name it, and show it fails.
+    exact ⟨t, ht, by simp [hwrong]⟩
+  -- The key check fails, so the restore refuses.
+  simp [restore, keysProvided, hall]
+
+/-- **A restore that goes ahead had the right bytes for every table**: each
+table's key, with the bytes that sealed it, so the database it writes opens.
+It rules out a restore that writes a MANIFEST for a table the provider
+cannot open. -/
+theorem restored_tables_verify (h : Bool) (id : Nat) (m : Meta) (p : Provider)
+    -- The restore was not refused.
+    (hok : (restore h id m (some p)).refused = false) :
+    -- The statement: every table's key has the bytes that sealed it.
+    ∀ t ∈ m.tableKeys, p.right t = true := by
+  -- Open up the restore and look at its two branches.
+  unfold restore at hok
+  -- Split on whether every check passed.
+  split at hok
+  -- They passed: the key check holds for every table.
+  · rename_i hpass
+    -- Pull the per-table check out of the conjunction of checks.
+    simp only [Bool.and_eq_true, keysProvided, List.all_eq_true] at hpass
+    -- Take any table key.
+    intro t ht
+    -- Its check holds, and its second half is the right bytes.
+    exact ((hpass.2.2 t ht).2)
+  -- They failed: the restore refused, which the premise rules out.
+  · simp at hok
 
 /-- **A target that already holds a MANIFEST refuses**: restoring over a
 database would replace tables its MANIFEST names. -/
@@ -1077,7 +1128,7 @@ def restoreCheckAfterCopy (hasManifest : Bool) (id : Nat) (m : Meta) (p : Option
   else ⟨[], true⟩
 
 /-- A provider with key 1 only, which names key 2 current. -/
-def lacksCurrent : Provider := ⟨fun k => k == 1, true, 2⟩
+def lacksCurrent : Provider := ⟨fun k => k == 1, fun _ => true, 2⟩
 
 /-- Backup 1: one table, pool file 5, sealed under key 1. -/
 def backupOne : Meta := ⟨some 1, [5], [5], [1], 1⟩
@@ -1102,7 +1153,7 @@ def opensUnbound (m : Meta) : Option Provider → Bool
     -- Plain: nothing to check.
     | none => true
     -- Sealed: the key and the bytes, nothing else.
-    | some k => p.has k && p.right
+    | some k => p.has k && p.right k
 
 /-- The restore with the unbound tag. -/
 def restoreUnbound (m : Meta) (p : Option Provider) : Run :=
@@ -1114,7 +1165,7 @@ def restoreUnbound (m : Meta) (p : Option Provider) : Run :=
   else ⟨[], true⟩
 
 /-- A provider with both keys and the right bytes, key 1 current. -/
-def bothKeys : Provider := ⟨fun k => k == 1 || k == 2, true, 1⟩
+def bothKeys : Provider := ⟨fun k => k == 1 || k == 2, fun _ => true, 1⟩
 
 /-- Backup 1 with its listing edited to name pool file 9, another backup's
 copy of the table. -/
@@ -1150,10 +1201,10 @@ def opensUnderCurrent (id : Nat) (m : Meta) : Option Provider → Bool
     -- Plain: nothing to check.
     | none => true
     -- Sealed under k: opened under the current key, which must be k.
-    | some k => p.cur == k && p.has k && p.right && m.listing == m.sealedListing && m.bound == id
+    | some k => p.cur == k && p.has k && p.right k && m.listing == m.sealedListing && m.bound == id
 
 /-- A provider after a rotation: both keys, key 2 current. -/
-def rotated : Provider := ⟨fun k => k == 1 || k == 2, true, 2⟩
+def rotated : Provider := ⟨fun k => k == 1 || k == 2, fun _ => true, 2⟩
 
 /-- **RED `OpenUnderCurrent`.** Backup 1, sealed under key 1, restored after
 a rotation to key 2 with both keys: the engine restores it, the defect
@@ -1165,6 +1216,49 @@ theorem open_under_current_refuses_after_a_rotation :
     opensUnderCurrent 1 backupOne (some rotated) = false :=
   -- Both are evaluations Lean can run.
   ⟨by decide, by decide⟩
+
+/-- The defect `FooterUnchecked`: each table's key is checked for presence
+only, not against the table, as the restore did before. -/
+def keysPresent (m : Meta) : Option Provider → Bool
+  -- No provider: nothing to provide.
+  | none => true
+  -- A provider: its current key and each table's key, whatever their bytes.
+  | some p => p.has p.cur && m.tableKeys.all p.has
+
+/-- The restore with the defect `FooterUnchecked`. -/
+def restoreFooterUnchecked (hasManifest : Bool) (id : Nat) (m : Meta) (p : Option Provider) :
+    -- It returns what the restore did.
+    Run :=
+  -- The engine's checks, the table keys checked for presence only.
+  if !hasManifest && opens id m p && keysPresent m p then
+    -- The copies, then the MANIFEST, and no refusal.
+    ⟨m.listing.map Write.copy ++ [Write.manifest (p.map Provider.cur)], false⟩
+  -- Otherwise: nothing written, refused.
+  else ⟨[], true⟩
+
+/-- A provider after a rotation, key 2 current with the right bytes, and
+other bytes under key 1. -/
+def olderWrong : Provider := ⟨fun k => k == 1 || k == 2, fun k => k == 2, 2⟩
+
+/-- Backup 2, taken after the rotation: its metadata sealed under key 2, its
+one table, pool file 5, still under key 1. -/
+def acrossRotation : Meta := ⟨some 2, [5], [5], [1], 2⟩
+
+/-- **RED `FooterUnchecked`.** Backup 2's metadata opens under the right
+key 2 and key 1 is present, so the defect restores it and writes a MANIFEST
+naming a table whose key bytes are wrong: the target then fails to open, and
+refuses a second restore because it holds a MANIFEST. The engine
+authenticates the table's footer and refuses with nothing written. -/
+theorem footer_unchecked_restores_a_table_that_cannot_open :
+    -- The engine refuses, having written nothing...
+    restore false 2 acrossRotation (some olderWrong) = ⟨[], true⟩ ∧
+    -- ...the defect copies the table and writes the MANIFEST...
+    restoreFooterUnchecked false 2 acrossRotation (some olderWrong) =
+      ⟨[Write.copy 5, Write.manifest (some 2)], false⟩ ∧
+    -- ...though the table's key holds the wrong bytes.
+    olderWrong.right 1 = false :=
+  -- Each is an evaluation Lean can run.
+  ⟨by decide, by decide, by decide⟩
 
 /-- The defect `PlainRestore`: the MANIFEST is plain even with a provider. -/
 def restorePlain (hasManifest : Bool) (id : Nat) (m : Meta) (p : Option Provider) : Run :=

@@ -535,10 +535,6 @@ impl LogFile for StdLogFile {
         self.file.set_len(len)
     }
 
-    fn len(&self) -> io::Result<u64> {
-        Ok(self.file.metadata()?.len())
-    }
-
     // `sync_file_range` with `SYNC_FILE_RANGE_WRITE` alone starts the
     // writeback of the range's dirty pages and waits for none of it. It does
     // not move the file's writeback error past this handle, so `fdatasync`
@@ -588,8 +584,11 @@ impl JoinHandle for StdJoinHandle {
         // A worker asked to join itself is the one tearing the database
         // down: it held the last reference, inside a job whose caller
         // dropped its handle without waiting. It cannot wait for its own
-        // exit, which follows as soon as it returns to its loop and finds
-        // the shutdown it just signalled; the handle is let go instead.
+        // exit, which follows as soon as the job returns to its loop and
+        // the loop finds the shutdown it just signalled; the handle is let
+        // go instead. The directory stays locked until then: the worker
+        // holds a share of the lock and drops it as it exits
+        // (`CompactionScheduler::start`).
         if self.0.thread().id() == std::thread::current().id() {
             return;
         }
@@ -946,7 +945,6 @@ mod log_tests {
         // The same bytes again: the contract every helper relies on.
         log.write_all_at(4, b"4567").unwrap();
         log.sync_data().unwrap();
-        assert_eq!(log.len().unwrap(), 12);
         assert_eq!(env.read(&path).unwrap(), b"0123456789ab");
     }
 
@@ -957,7 +955,6 @@ mod log_tests {
         let path = dir.path().join("log");
         env.write(&path, b"stamp+tail").unwrap();
         let log = env.open_log(&path, WriteMode::Update).unwrap();
-        assert_eq!(log.len().unwrap(), 10);
         log.set_len(5).unwrap();
         log.write_all_at(5, b"=next").unwrap();
         assert_eq!(env.read(&path).unwrap(), b"stamp=next");

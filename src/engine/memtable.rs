@@ -23,6 +23,10 @@ use super::skiplist::{ArenaSkipList, InsertHint, NodeRef};
 use crate::DbSlice;
 use crate::sync::internal::Arc;
 use tombstones::TombstoneLog;
+/// Test seam: what this thread's appends of range tombstones have cost
+/// since the last call, as (indexes built, slots looked at for a duplicate).
+#[cfg(all(test, not(loom)))]
+pub(crate) use tombstones::work_since_last_call as range_tombstone_work;
 
 mod key_walk;
 mod tombstones;
@@ -244,6 +248,15 @@ impl MemTable {
             .push(RangeTombstone::new(start.to_vec(), end.to_vec(), seq));
     }
 
+    /// Record every tombstone of `batch`: what [`Self::delete_range`] does
+    /// for each, at a cost linear in the batch, where one call a tombstone
+    /// is quadratic for tombstones that share a sequence
+    /// (`TombstoneLog::extend`). Recovery uses it, for the range tombstones a
+    /// log holds and for the ones an open copies out of the tables it moved.
+    pub(crate) fn delete_ranges(&self, batch: Vec<RangeTombstone>) {
+        self.range_tombstones.extend(batch);
+    }
+
     /// Whether this memtable holds any range tombstone. One acquire load.
     pub(crate) fn has_range_tombstones(&self) -> bool {
         self.range_tombstones.len() != 0
@@ -258,20 +271,22 @@ impl MemTable {
     }
 
     /// A range tombstone overlapping `[lo, hi)` with a sequence above
-    /// `floor`, as the first key of the range it deletes and its sequence.
-    /// The first such tombstone in the order `clone_range_tombstones` lists
-    /// them.
+    /// `floor` and at or below `ceil`, as the first key of the range it
+    /// deletes and its sequence. The first such tombstone in the order
+    /// `clone_range_tombstones` lists them. `u64::MAX` as `ceil` bounds
+    /// nothing.
     pub(crate) fn newer_range_tombstone(
         &self,
         lo: &[u8],
         hi: &[u8],
         floor: u64,
+        ceil: u64,
     ) -> Option<(Vec<u8>, u64)> {
         if !self.has_range_tombstones() {
             return None;
         }
         self.range_tombstones
-            .first_newer_overlap(lo, hi, floor)
+            .first_newer_overlap(lo, hi, floor, ceil)
             .map(|t| (t.start.as_slice().max(lo).to_vec(), t.seq))
     }
 

@@ -451,16 +451,6 @@ impl RateLimiter for HeldRelief {
             panic!("the relief fails: a test's rate limiter");
         }
     }
-
-    fn set_bytes_per_second(&self, _bytes_per_second: u64) {}
-
-    fn get_bytes_per_second(&self) -> u64 {
-        0
-    }
-
-    fn get_total_bytes_through(&self, _pri: Priority) -> u64 {
-        0
-    }
 }
 
 /// A relief holder, the channel that says the worker entered it, and the

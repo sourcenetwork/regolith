@@ -19,7 +19,8 @@ impl CommitReceipt {
     }
 
     /// The sequence at which the commit's writes became visible. A commit
-    /// that wrote nothing reports the sequence of its snapshot.
+    /// that wrote nothing reports the sequence of its snapshot, also when a
+    /// pessimistic `get_for_update` served one of its reads later than that.
     pub fn seq(&self) -> u64 {
         self.seq
     }

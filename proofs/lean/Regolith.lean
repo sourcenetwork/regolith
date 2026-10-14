@@ -4,6 +4,10 @@
 -- E1: the read order returns the newest visible version, and compacting a
 -- closed L0 input set keeps that. Backs `proofs/tla/LsmOrder.tla`.
 import Regolith.LsmOrder
+-- E14: a range delete copied into the first layer a read walks deletes
+-- every older key below it, however the layers are ordered. Backs
+-- `proofs/tla/LegacyRangeRead.tla`.
+import Regolith.RangeDelete
 -- E6: a batch read resolved against one view answers as of one point in
 -- time. Backs `proofs/tla/BatchRead.tla`.
 import Regolith.BatchView
@@ -188,9 +192,11 @@ import Regolith.StallCommit
 -- thread the call returns the count of pins held without waiting. Backs
 -- `proofs/tla/SnapshotWait.tla`.
 import Regolith.SnapshotWait
--- E16: with no worker, a write runs exactly the one step of background work
--- it found owed, and L0 never passes its compaction trigger (its stop
--- trigger when every write seals). Backs `proofs/tla/OwedStep.tla`.
+-- E16: with no worker, a write that runs its owed step inline runs exactly
+-- the one step of background work it found owed, and L0 never passes its
+-- compaction trigger (its stop trigger when every write seals); with the
+-- step left on the writer's queue, L0 never passes the stop trigger plus
+-- the sealed memtables a rotation keeps. Backs `proofs/tla/OwedStep.tla`.
 import Regolith.OwedStep
 -- 4.6, 4.10: the pessimistic lock table. One holder per key, a retired
 -- table entry has no user, a waiter the lock may serve is told through its

@@ -43,7 +43,7 @@ fn an_empty_log_answers_nothing_and_holds_nothing() {
     assert_eq!(log.len(), 0);
     assert_eq!(log.bytes(), 0);
     assert_eq!(log.covering_seq(b"k", u64::MAX), 0);
-    assert!(log.first_newer_overlap(b"a", b"z", 0).is_none());
+    assert!(log.first_newer_overlap(b"a", b"z", 0, u64::MAX).is_none());
     assert!(log.to_sorted_vec().is_empty());
 }
 
@@ -259,6 +259,128 @@ fn a_position_whose_append_has_not_finished_is_skipped_and_not_indexed() {
     );
 }
 
+/// `count` range tombstones at one sequence, no two touching, in an order
+/// that is neither their key order nor its reverse: `d00000a..d00000m`,
+/// `d00001a..d00001m`, and so on. What an ingested table that deleted
+/// `count` separate ranges carries, all at the table's one sequence.
+fn disjoint_at_one_sequence(count: u64, seq: u64) -> Vec<RangeTombstone> {
+    // Seven shares no factor with the counts used here, so this visits
+    // every one of them once.
+    assert!(!count.is_multiple_of(7));
+    (0..count)
+        .map(|i| (i * 7 + 3) % count)
+        .map(|i| {
+            tomb(
+                format!("d{i:05}a").as_bytes(),
+                format!("d{i:05}m").as_bytes(),
+                seq,
+            )
+        })
+        .collect()
+}
+
+/// The cost of a batch, counted: one index and no walk through the log for
+/// a duplicate, where the same tombstones appended one at a time build an
+/// index every [`REBUILD`] of them and walk the whole log for each. The
+/// answers are the same.
+#[test]
+fn a_batch_of_thousands_builds_one_index_and_walks_the_log_for_no_duplicate() {
+    // Under miri a hundred: the interpreter takes minutes for thousands, and
+    // the counts below are exact at any size.
+    const COUNT: u64 = if cfg!(miri) { 96 } else { 4_096 };
+    let batch = disjoint_at_one_sequence(COUNT, 20);
+    assert_eq!(batch.len() as u64, COUNT);
+    assert!(
+        batch.windows(2).any(|pair| pair[0].start > pair[1].start),
+        "the batch arrives unsorted"
+    );
+
+    let one_by_one = TombstoneLog::new();
+    work_since_last_call();
+    for tombstone in batch.iter().cloned() {
+        one_by_one.push(tombstone);
+    }
+    let (indexes, looks) = work_since_last_call();
+    assert_eq!(indexes as u64, COUNT / REBUILD as u64);
+    assert_eq!(
+        looks as u64,
+        COUNT * (COUNT - 1) / 2,
+        "every append at one sequence walks the whole log"
+    );
+
+    let at_once = TombstoneLog::new();
+    // With a copy of one of them in it twice: a batch may repeat itself.
+    let mut repeated = batch.clone();
+    repeated.push(batch[3].clone());
+    at_once.extend(repeated);
+    assert_eq!(work_since_last_call(), (1, 0));
+    assert_eq!(at_once.len() as u64, COUNT);
+    assert_eq!(at_once.bytes(), one_by_one.bytes());
+    assert_eq!(
+        at_once.index.load().map(|index| index.covered as u64),
+        Some(COUNT),
+        "the one index covers the whole batch"
+    );
+
+    let listing = |log: &TombstoneLog| -> Vec<(Vec<u8>, Vec<u8>, u64)> {
+        log.to_sorted_vec()
+            .into_iter()
+            .map(|t| (t.start, t.end, t.seq))
+            .collect()
+    };
+    assert_eq!(listing(&at_once), listing(&one_by_one));
+    for i in (0..COUNT).step_by(if cfg!(miri) { 7 } else { 1 }) {
+        let inside = format!("d{i:05}c").into_bytes();
+        let between = format!("d{i:05}p").into_bytes();
+        for log in [&at_once, &one_by_one] {
+            assert_eq!(log.covering_seq(&inside, u64::MAX), 20);
+            assert_eq!(log.covering_seq(&inside, 19), 0);
+            assert_eq!(log.covering_seq(&between, u64::MAX), 0);
+        }
+    }
+}
+
+/// T1 for a batch: what the log already holds is not appended again, by
+/// one look at the log, and a batch given twice adds nothing the second
+/// time.
+#[test]
+fn a_batch_appends_only_what_the_log_does_not_hold() {
+    const COUNT: u64 = if cfg!(miri) { 48 } else { 1_024 };
+    let log = TombstoneLog::new();
+    log.push(tomb(b"a", b"c", 3));
+    log.push(tomb(b"d00002a", b"d00002m", 20));
+    let batch = disjoint_at_one_sequence(COUNT, 20);
+    work_since_last_call();
+
+    log.extend(batch.clone());
+    // One of the batch was there already.
+    assert_eq!(log.len() as u64, 2 + COUNT - 1);
+    assert_eq!(work_since_last_call(), (1, 0));
+    let (len, bytes) = (log.len(), log.bytes());
+
+    log.extend(batch);
+    assert_eq!((log.len(), log.bytes()), (len, bytes));
+    assert_eq!(
+        work_since_last_call(),
+        (0, 0),
+        "nothing new: no index to build"
+    );
+    assert_eq!(log.to_sorted_vec().len(), len);
+    assert_eq!(log.covering_seq(b"b", u64::MAX), 3);
+    assert_eq!(log.covering_seq(b"d00002c", u64::MAX), 20);
+
+    // The same range at another sequence is another tombstone, and an
+    // empty batch is nothing at all.
+    log.extend(vec![tomb(b"a", b"c", 4)]);
+    assert_eq!(log.len(), len + 1);
+    log.extend(Vec::new());
+    assert_eq!(log.len(), len + 1);
+    // A commit applied after a batch still finds its own tombstone.
+    log.push(tomb(b"q", b"r", 30));
+    log.push(tomb(b"q", b"r", 30));
+    assert_eq!(log.len(), len + 2);
+}
+
 /// T4: an append that claims its position after a rebuild found every
 /// position below its bound ready is left out of the view the rebuild
 /// publishes, so once it finishes every query finds it. The view covering
@@ -303,7 +425,7 @@ fn a_position_claimed_while_a_rebuild_scans_is_not_indexed() {
     );
     assert_eq!(log.covering_seq(b"c", u64::MAX), newest);
     assert_eq!(
-        log.first_newer_overlap(b"x", b"z", REBUILD as u64)
+        log.first_newer_overlap(b"x", b"z", REBUILD as u64, u64::MAX)
             .map(|t| t.seq),
         Some(newest)
     );
@@ -323,6 +445,49 @@ fn key() -> impl Strategy<Value = Vec<u8>> {
 }
 
 proptest! {
+    /// A batch, whatever the log held before it and whatever is appended
+    /// after it, answers every query as the same tombstones appended one at
+    /// a time do.
+    #[test]
+    fn a_batch_answers_what_its_tombstones_appended_one_at_a_time_answer(
+        before in proptest::collection::vec((key(), key(), 1u64..40), 0..24),
+        batch in proptest::collection::vec((key(), key(), 1u64..40), 0..60),
+        after in proptest::collection::vec((key(), key(), 40u64..60), 0..24),
+        probes in proptest::collection::vec((key(), key(), 0u64..70), 1..24),
+    ) {
+        let whole = |list: &[(Vec<u8>, Vec<u8>, u64)]| -> Vec<RangeTombstone> {
+            list.iter()
+                .filter(|(start, end, _)| start < end)
+                .map(|(start, end, seq)| tomb(start, end, *seq))
+                .collect()
+        };
+        let (batched, pushed) = (TombstoneLog::new(), TombstoneLog::new());
+        for tombstone in whole(&before) {
+            batched.push(tombstone.clone());
+            pushed.push(tombstone);
+        }
+        batched.extend(whole(&batch));
+        for tombstone in whole(&batch) {
+            pushed.push(tombstone);
+        }
+        for tombstone in whole(&after) {
+            batched.push(tombstone.clone());
+            pushed.push(tombstone);
+        }
+        let listing = |log: &TombstoneLog| -> Vec<(Vec<u8>, Vec<u8>, u64)> {
+            log.to_sorted_vec().into_iter().map(|t| (t.start, t.end, t.seq)).collect()
+        };
+        prop_assert_eq!(listing(&batched), listing(&pushed));
+        for (a, b, n) in &probes {
+            prop_assert_eq!(batched.covering_seq(a, *n), pushed.covering_seq(a, *n));
+            let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
+            prop_assert_eq!(
+                batched.first_newer_overlap(lo, hi, *n, u64::MAX).map(|t| (&t.start, &t.end, t.seq)),
+                pushed.first_newer_overlap(lo, hi, *n, u64::MAX).map(|t| (&t.start, &t.end, t.seq))
+            );
+        }
+    }
+
     /// Every query the memtable makes of its tombstones, against a linear
     /// model over the same appends, across rebuilds of the index.
     #[test]
@@ -352,7 +517,7 @@ proptest! {
             prop_assert_eq!(log.covering_seq(a, *n), model_covering(&all, a, *n));
             let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
             let expected = sorted.iter().find(|t| t.seq > *n && t.overlaps(lo, hi));
-            let got = log.first_newer_overlap(lo, hi, *n);
+            let got = log.first_newer_overlap(lo, hi, *n, u64::MAX);
             prop_assert_eq!(
                 got.map(|t| (&t.start, &t.end, t.seq)),
                 expected.map(|t| (&t.start, &t.end, t.seq))

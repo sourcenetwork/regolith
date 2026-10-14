@@ -70,7 +70,12 @@
 \*     re-checks as it lets go;
 \*   - notify_waiters bumps bgen and CASes every waiting node to "broadcast"
 \*     (one step here); a waiter registered under an older generation that
-\*     pushes afterwards notifies itself at the push.
+\*     pushes afterwards notifies itself at the push. In the code that check
+\*     is the drain pass that takes the node in (Notify::pass): it grants
+\*     every arrival of an older generation, wherever the arrival lands in
+\*     the queue. Generation order is not queue order: a waiter can pass
+\*     its check, stop, and push after a newer waiter, so a pass that only
+\*     granted from the front would stop at that newer waiter.
 \*
 \* WHAT THE MODEL LEAVES OUT, and why that loses nothing.
 \*   - A task has one request at a time and may not register again while its
@@ -93,6 +98,11 @@
 \*   MC_SyncNotify_Red_NoRecheck      park right after the push: NoLostWakeup.
 \*   MC_SyncNotify_Red_NoGenCheck     a waiter that pushed after a broadcast
 \*                                    misses it: NoLostWakeup.
+\*   MC_SyncNotify_Red_FrontGenCheck  the older waiter's generation is checked
+\*                                    only when every waiting node ahead of it
+\*                                    is older too: one that pushed behind a
+\*                                    newer waiter misses the broadcast,
+\*                                    NoLostWakeup.
 
 \* Borrow the standard TLA+ books: counting numbers, lists, and sizes of finite sets.
 EXTENDS Naturals, Sequences, FiniteSets
@@ -117,8 +127,9 @@ NoTask == 0
 ASSUME Tasks \subseteq Nat \ {0} /\ Notifiers \subseteq Tasks /\ Watched \subseteq Tasks
 \* The broadcast budget is a number.
 ASSUME MaxBcast \in Nat
-\* The mutant is "none" or one of the four planted bugs.
-ASSUME Mutant \in {"none", "WakeBeforeHandoff", "CancelNoPassOn", "NoRecheck", "NoGenCheck"}
+\* The mutant is "none" or one of the five planted bugs.
+ASSUME Mutant \in {"none", "WakeBeforeHandoff", "CancelNoPassOn", "NoRecheck", "NoGenCheck",
+                   "FrontGenCheck"}
 
 \* The state: everything that changes from one step to the next. Each line says what the variable
 \* stands for in the real program.
@@ -189,6 +200,10 @@ Min(a, b) == IF a <= b THEN a ELSE b
 \* Task t has a node in the queue (live or stale).
 InFifo(t) == \E i \in 1..Len(fifo) : fifo[i] = t
 
+\* Some node in the queue still waits and belongs to the current broadcast
+\* generation: a waiter that registered after the last notify_waiters.
+CurrentWaiting == \E i \in 1..Len(fifo) : node[fifo[i]] = "waiting" /\ gen[fifo[i]] = bgen
+
 \* Task t's future still waits on its node: parked, or running the drain
 \* that re-checks right after its push.
 Waits(t) == pc[t] = "parked" \/ (pc[t] \in DrainPCs /\ ret[t] = "parked")
@@ -242,8 +257,12 @@ Acquire(t) ==
 
 \* The registered waiter pushes its node, Waker inside, then drains (the
 \* re-check). A broadcast that ran since registration could not see this
-\* node, so the waiter notifies itself. Mutant NoRecheck: it parks at once.
-\* Mutant NoGenCheck: it skips the generation check.
+\* node, so the waiter notifies itself: the pass that takes the node in
+\* grants it, whatever waits ahead of it. Mutant NoRecheck: it parks at
+\* once. Mutant NoGenCheck: it skips the generation check. Mutant
+\* FrontGenCheck: the pass grants older waiters only from the front of the
+\* queue and stops at the first waiter of the current generation, so the
+\* check is skipped when such a waiter is queued ahead.
 Push(t) ==
   \* The task registered and has not pushed yet.
   /\ pc[t] = "push"
@@ -251,8 +270,12 @@ Push(t) ==
   /\ fifo' = Append(fifo, t)
   \* It gets in line.
   /\ line' = Append(line, t)
-  \* Did a broadcast happen since it registered (the bug NoGenCheck does not ask)?
-  /\ IF gen[t] < bgen /\ Mutant # "NoGenCheck"
+  \* Did a broadcast happen since it registered? The pass that takes the node in asks,
+  /\ IF /\ gen[t] < bgen
+        \* unless the bug NoGenCheck skips the question,
+        /\ Mutant # "NoGenCheck"
+        \* or the bug FrontGenCheck stops at a newer waiter queued ahead and never reaches this node.
+        /\ ~(Mutant = "FrontGenCheck" /\ CurrentWaiting)
        \* Yes: that broadcast could not see this node, so the waiter marks itself notified,
        THEN /\ node' = [node EXCEPT ![t] = "broadcast"]
             \* counts as woken,

@@ -132,6 +132,21 @@ pub mod parted;
 /// a listener that records the tails an open discards.
 pub mod wal_format;
 
+/// The database 0.1.9 left with an overlapping bottom level, and what it
+/// holds.
+pub mod overlap_fixture;
+
+/// The database 0.1.9 left with a range delete below older keys it covers,
+/// and what it holds.
+pub mod buried_fixture;
+
+/// The first open of a database an earlier release wrote, across a power
+/// cut at each of its I/O calls.
+pub mod open_sweep;
+
+/// Every warning a test thread logs, through one subscriber for the binary.
+pub mod log_capture;
+
 /// An `Env` that counts SSTable opens and reads, and can hold reads at the
 /// device: what the non-blocking read tests pin.
 pub mod device_env;

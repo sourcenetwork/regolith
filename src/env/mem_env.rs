@@ -16,7 +16,10 @@
 //! Two lock-free maps (kovan): path to file, and the set of directories.
 //! A file is a `MemFile` behind an `Arc`, so a reader and a writer hold
 //! the same file without touching either map, and every read is a copy
-//! out of the file with no lock at all. The clocks are atomics. No call
+//! out of the file with no lock at all. A rename marks the name it moves
+//! a file away from before it puts the file at the new name (see
+//! [`MemEnv`]'s `rename`), so a removal or a second rename of the old name
+//! cannot undo a move that is half done. The clocks are atomics. No call
 //! here takes a lock; the directory registry (`open_dirs`) is the only
 //! exclusion, and it is taken only by `lock_file`. A write-ahead log is the
 //! same file written at offsets, with no lock either (`mem_log.rs`).
@@ -44,8 +47,33 @@ const BUCKETS: usize = 64;
 const ABSENT: u64 = u64::MAX;
 
 struct MemFs {
-    files: HashMap<PathBuf, Arc<MemFile>>,
+    files: HashMap<PathBuf, Named>,
     dirs: HashMap<PathBuf, ()>,
+}
+
+/// What a path names: a file, and whether a rename is moving it away from
+/// this name.
+#[derive(Clone)]
+struct Named {
+    file: Arc<MemFile>,
+    /// Set by a rename that took this name as its source, until it takes
+    /// the name away. A removal or another rename treats the name as gone
+    /// already; an open still finds the file here.
+    leaving: bool,
+}
+
+impl Named {
+    fn new(file: Arc<MemFile>) -> Self {
+        Self {
+            file,
+            leaving: false,
+        }
+    }
+
+    /// Whether this names `file`, with `leaving` as given.
+    fn is(&self, file: &Arc<MemFile>, leaving: bool) -> bool {
+        Arc::ptr_eq(&self.file, file) && self.leaving == leaving
+    }
 }
 
 impl Default for MemFs {
@@ -145,7 +173,7 @@ impl MemEnv {
 
     /// Total bytes currently held across every file.
     pub fn total_bytes(&self) -> u64 {
-        self.fs.files.values().map(|f| f.len()).sum()
+        self.fs.files.values().map(|named| named.file.len()).sum()
     }
 
     /// Number of files currently present.
@@ -154,7 +182,11 @@ impl MemEnv {
     }
 
     fn lookup(&self, path: &Path) -> io::Result<Arc<MemFile>> {
-        self.fs.files.get(path).ok_or_else(|| not_found(path))
+        self.fs
+            .files
+            .get(path)
+            .map(|named| named.file)
+            .ok_or_else(|| not_found(path))
     }
 
     /// The file at `path` to write to: made when absent, and emptied for
@@ -167,11 +199,13 @@ impl MemEnv {
             return Err(not_found(parent));
         }
         let data = match self.fs.files.get(path) {
-            Some(data) => data,
-            None => self
-                .fs
-                .files
-                .get_or_insert(path.to_path_buf(), Arc::new(MemFile::new())),
+            Some(named) => named.file,
+            None => {
+                self.fs
+                    .files
+                    .get_or_insert(path.to_path_buf(), Named::new(Arc::new(MemFile::new())))
+                    .file
+            }
         };
         if mode == WriteMode::Truncate {
             data.set_len(0, &Free)?;
@@ -182,9 +216,10 @@ impl MemEnv {
 
 #[cfg(test)]
 thread_local! {
-    /// A step a test sets to run once, on the renaming thread, between a
-    /// rename's two map writes: the instant a concurrent open or removal is
-    /// most likely to see the rename half done.
+    /// A step a test sets to run once, on the renaming thread, between the
+    /// map write that puts a renamed file at its new name and the one that
+    /// takes its old name away: the instant a concurrent open, removal or
+    /// rename is most likely to see the rename half done.
     static BETWEEN_RENAME_WRITES: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
         const { std::cell::RefCell::new(None) };
 }
@@ -254,9 +289,9 @@ impl Env for MemEnv {
     }
 
     fn metadata(&self, path: &Path) -> io::Result<FileMeta> {
-        if let Some(file) = self.fs.files.get(path) {
+        if let Some(named) = self.fs.files.get(path) {
             return Ok(FileMeta {
-                len: file.len(),
+                len: named.file.len(),
                 is_dir: false,
             });
         }
@@ -269,56 +304,70 @@ impl Env for MemEnv {
         Err(not_found(path))
     }
 
+    /// A name a rename is moving a file away from is gone already: the
+    /// rename was decided when it marked the name.
     fn remove_file(&self, path: &Path) -> io::Result<()> {
         self.fs
             .files
-            .remove(path)
+            .remove_if(path, |held| !held.leaving)
             .map(|_| ())
             .ok_or_else(|| not_found(path))
     }
 
+    /// Three map writes, each one atomic. First `from` is marked leaving,
+    /// in one compare-and-swap that holds only while `from` still names the
+    /// file and no other rename marked it: from that write on, the rename
+    /// has happened as far as every other change to the namespace can tell.
+    /// A removal of `from` or a second rename of it finds the name gone, so
+    /// nothing can take the file from `from` before this rename does, and
+    /// the rename never has to be undone. Then the file is put at `to`,
+    /// replacing whatever was there, and only then taken from `from`: at
+    /// every instant one of the two names holds the file, so an open that
+    /// tries the old name and then the new one always finds it (the
+    /// open-file table's reopen of a table renamed aside does exactly
+    /// that). For a moment both names hold it, as with a hard link, and an
+    /// open of `from` in that moment still finds the file.
+    ///
+    /// A rename that lost the mark looks at `from` again: it is gone (the
+    /// rename then fails, as POSIX's would) or names a newer file, which
+    /// this rename then moves. Once marked, the rename succeeds; when `to`
+    /// was renamed or removed meanwhile, or `from` was named again by a
+    /// later rename onto it, those came after this one.
     fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
         if from == to {
             return self.lookup(from).map(|_| ());
         }
-        loop {
-            let file = self.lookup(from)?;
-            // Published at `to` first, in one map write that replaces
-            // whatever was there, and only then taken from `from`: at every
-            // instant one of the two names holds the file, so an open that
-            // tries the old name and then the new one always finds it (the
-            // open-file table's reopen of a table renamed aside does exactly
-            // that). For a moment both names hold it, as with a hard link.
-            let replaced = self.fs.files.insert(to.to_path_buf(), Arc::clone(&file));
-            #[cfg(test)]
-            between_rename_writes();
-            // Taken from `from` only if `from` still names this file, so two
-            // renames or a rename and a removal of one file cannot both
-            // move it.
+        let file = loop {
+            let named = self
+                .fs
+                .files
+                .get(from)
+                .filter(|named| !named.leaving)
+                .ok_or_else(|| not_found(from))?;
+            let marked = Named {
+                file: Arc::clone(&named.file),
+                leaving: true,
+            };
             if self
                 .fs
                 .files
-                .remove_if(from, |held| Arc::ptr_eq(held, &file))
-                .is_some()
+                .replace_if(from.to_path_buf(), marked, |held| {
+                    held.is(&named.file, false)
+                })
+                .is_ok()
             {
-                return Ok(());
+                break named.file;
             }
-            // Another rename or a removal took `from` first. Put `to` back
-            // as it was, unless something replaced it since, and look at
-            // `from` again: it is gone (this rename then fails as POSIX's
-            // would) or names a newer file, which this rename then moves.
-            match replaced {
-                Some(previous) => {
-                    let _ = self
-                        .fs
-                        .files
-                        .replace_if(to.to_path_buf(), previous, |held| Arc::ptr_eq(held, &file));
-                }
-                None => {
-                    self.fs.files.remove_if(to, |held| Arc::ptr_eq(held, &file));
-                }
-            }
-        }
+        };
+        self.fs
+            .files
+            .insert(to.to_path_buf(), Named::new(Arc::clone(&file)));
+        #[cfg(test)]
+        between_rename_writes();
+        // Only the mark this rename set: a later rename onto `from` has
+        // replaced it with a file of its own, which stays.
+        self.fs.files.remove_if(from, |held| held.is(&file, true));
+        Ok(())
     }
 
     fn hard_link(&self, _src: &Path, _dst: &Path) -> io::Result<()> {
@@ -622,34 +671,134 @@ mod tests {
         assert!(!env.exists(from));
     }
 
-    /// A removal of the source lands between a rename's two writes, after
-    /// the rename already put the source's file at the destination. The
-    /// rename then fails, as one whose source was removed first does, and
-    /// the destination holds the bytes it held before.
+    /// A removal of the source, and a second rename of it, land between a
+    /// rename's write that puts the file at the destination and the one
+    /// that takes the source away. The rename marked the source before
+    /// either write, so it has happened as far as they can tell: both find
+    /// the source gone, the rename lands whole, and an open of the source in
+    /// that moment still finds the file.
     #[test]
-    fn a_removal_landing_halfway_through_a_rename_fails_it_and_restores_the_destination() {
+    fn a_removal_or_rename_of_a_source_being_moved_finds_it_gone() {
         let env = env();
         let (from, to) = (Path::new("/db/tmp"), Path::new("/db/live"));
         env.write(from, b"new").unwrap();
         env.write(to, b"old").unwrap();
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(None));
         {
-            let env = env.clone();
-            between_rename_writes(move || env.remove_file(from).unwrap());
+            let (env, seen) = (env.clone(), std::sync::Arc::clone(&seen));
+            between_rename_writes(move || {
+                let opened = env.open_read(from).is_ok();
+                let removed = env.remove_file(from).map_err(|e| e.kind());
+                let moved = env
+                    .rename(from, Path::new("/db/elsewhere"))
+                    .map_err(|e| e.kind());
+                *seen.lock().unwrap() = Some((opened, removed, moved));
+            });
         }
-        let err = env.rename(from, to).unwrap_err();
-        assert_eq!(err.kind(), io::ErrorKind::NotFound);
+        env.rename(from, to).unwrap();
+        let (opened, removed, moved) = seen.lock().unwrap().take().expect("setup: the step ran");
+        assert!(
+            opened,
+            "an open of the source found nothing halfway through"
+        );
+        assert_eq!(removed, Err(io::ErrorKind::NotFound));
+        assert_eq!(moved, Err(io::ErrorKind::NotFound));
         assert!(!env.exists(from));
-        assert_eq!(env.read(to).unwrap(), b"old");
+        assert!(!env.exists(Path::new("/db/elsewhere")));
+        assert_eq!(env.read(to).unwrap(), b"new");
+    }
 
-        // And when the destination did not exist, it does not after.
-        let fresh = Path::new("/db/fresh");
-        env.write(from, b"new").unwrap();
-        {
-            let env = env.clone();
-            between_rename_writes(move || env.remove_file(from).unwrap());
+    /// One namespace call, for the sequential model below.
+    #[derive(Clone, Copy)]
+    enum Call {
+        Rename(&'static str, &'static str),
+        Remove(&'static str),
+    }
+
+    /// What each path holds and what each call answers when `calls` run one
+    /// at a time, in `order`, from `start`.
+    fn one_at_a_time(
+        start: &[(&'static str, &'static [u8])],
+        calls: &[Call],
+        order: &[usize],
+    ) -> (Vec<(&'static str, Vec<u8>)>, Vec<bool>) {
+        let mut held: std::collections::BTreeMap<&str, Vec<u8>> =
+            start.iter().map(|(p, b)| (*p, b.to_vec())).collect();
+        let mut answers = vec![false; calls.len()];
+        for &i in order {
+            answers[i] = match calls[i] {
+                Call::Rename(from, to) => held.remove(from).map(|b| held.insert(to, b)).is_some(),
+                Call::Remove(path) => held.remove(path).is_some(),
+            };
         }
-        assert!(env.rename(from, fresh).is_err());
-        assert!(!env.exists(fresh) && !env.exists(from));
+        (held.into_iter().collect(), answers)
+    }
+
+    /// Whether some order of `calls`, run one at a time from `start`, gives
+    /// what each answered and what the namespace holds now.
+    fn some_order_gives(
+        env: &MemEnv,
+        start: &[(&'static str, &'static [u8])],
+        calls: &[Call],
+        answers: &[bool],
+    ) -> bool {
+        let now: Vec<(&'static str, Vec<u8>)> = ["/db/new", "/db/old", "/db/third"]
+            .into_iter()
+            .filter_map(|p| env.read(Path::new(p)).ok().map(|b| (p, b)))
+            .collect();
+        let orders: [[usize; 3]; 6] = [
+            [0, 1, 2],
+            [0, 2, 1],
+            [1, 0, 2],
+            [1, 2, 0],
+            [2, 0, 1],
+            [2, 1, 0],
+        ];
+        orders
+            .iter()
+            .any(|order| one_at_a_time(start, calls, order) == (now.clone(), answers.to_vec()))
+    }
+
+    /// Between a rename's write that puts the file at its destination and
+    /// the one that takes its source away, a second rename moves that
+    /// destination onward and a removal takes the source. Whatever each call
+    /// answers, the namespace ends as some order of the three calls run one
+    /// at a time leaves it: the bytes the destination held are never lost to
+    /// a rename that failed.
+    #[test]
+    fn a_rename_whose_destination_moves_on_and_whose_source_goes_matches_some_order() {
+        let env = env();
+        let start: [(&'static str, &'static [u8]); 2] = [("/db/new", b"new"), ("/db/old", b"old")];
+        for (path, bytes) in start {
+            env.write(Path::new(path), bytes).unwrap();
+        }
+        let calls = [
+            Call::Rename("/db/new", "/db/old"),
+            Call::Rename("/db/old", "/db/third"),
+            Call::Remove("/db/new"),
+        ];
+        let inner = std::sync::Arc::new(std::sync::Mutex::new(None));
+        {
+            let (env, inner) = (env.clone(), std::sync::Arc::clone(&inner));
+            between_rename_writes(move || {
+                let moved = env
+                    .rename(Path::new("/db/old"), Path::new("/db/third"))
+                    .is_ok();
+                let removed = env.remove_file(Path::new("/db/new")).is_ok();
+                *inner.lock().unwrap() = Some((moved, removed));
+            });
+        }
+        let renamed = env.rename(Path::new("/db/new"), Path::new("/db/old"));
+        let (moved, removed) = inner.lock().unwrap().take().expect("setup: the step ran");
+        let answers = [renamed.is_ok(), moved, removed];
+        assert!(
+            some_order_gives(&env, &start, &calls, &answers),
+            "answers {answers:?} and the namespace after them match no order of the calls: \
+             new={:?} old={:?} third={:?}",
+            env.read(Path::new("/db/new")).ok(),
+            env.read(Path::new("/db/old")).ok(),
+            env.read(Path::new("/db/third")).ok()
+        );
     }
 
     #[test]

@@ -611,6 +611,245 @@ fn sampling_the_horizon_first_is_caught_by_the_read_path_model() {
     });
 }
 
+/// Preemptions the write-free models explore. At this bound the search is
+/// saturated: raising it to 12 explores no new interleaving (525 for
+/// `horizon_then_view` and 114 for `apply_then_frontier`, the same at 8 and
+/// at 12, measured). loom's search with no bound at all reports fewer, 336 and
+/// 114, because without a bound it prunes more orders as equivalent, not
+/// because it reaches more states. Each model has two threads of a few steps.
+const WRITE_FREE_PREEMPTIONS: usize = 8;
+
+/// [`run_model`] with [`WRITE_FREE_PREEMPTIONS`] as an explicit bound.
+fn run_bounded_model(name: &str, floor: usize, body: impl Fn() + Send + Sync + 'static) -> usize {
+    let executions = StdArc::new(StdAtomicUsize::new(0));
+    let counter = StdArc::clone(&executions);
+    let mut builder = loom::model::Builder::new();
+    builder.preemption_bound = Some(WRITE_FREE_PREEMPTIONS);
+    builder.check(move || {
+        counter.fetch_add(1, StdOrdering::Relaxed);
+        body();
+    });
+    let explored = executions.load(StdOrdering::Relaxed);
+    println!("loom model `{name}`: {explored} interleavings explored");
+    assert!(
+        explored >= floor,
+        "`{name}` explored only {explored} interleavings (floor {floor}): the \
+         state space collapsed and this model proves nothing",
+    );
+    explored
+}
+
+/// [`expect_violation`] with [`WRITE_FREE_PREEMPTIONS`] as an explicit bound.
+fn expect_bounded_violation(name: &str, body: impl Fn() + Send + Sync + 'static) {
+    println!("negative control `{name}`: loom must report a violation below");
+    let outcome = std::panic::catch_unwind(AssertUnwindSafe(|| {
+        let mut builder = loom::model::Builder::new();
+        builder.preemption_bound = Some(WRITE_FREE_PREEMPTIONS);
+        builder.check(body);
+    }));
+    assert!(
+        outcome.is_err(),
+        "negative control `{name}` passed: the model cannot tell the mutated \
+         protocol from the real one",
+    );
+    println!("negative control `{name}`: violation reported, as required");
+}
+
+/// Whether `view` can reach the fresh memtable: `reachable_ids` is a bit set
+/// with bit `n` standing for memtable `n`, so the bit for [`FRESH`] says
+/// whether the view still holds it (active, frozen, or flushed into the
+/// version).
+fn reaches_fresh(view: &View) -> bool {
+    view.reachable_ids() & (1u16 << FRESH) != 0
+}
+
+/// The load order the write-free commit depends on (E50): its points (the
+/// published horizon and the decided frontier) first, the view second
+/// (`RegolithEngine::commit_write_free`, src/engine/commit/write_free.rs:118
+/// and 129). It is the reverse of the read path's, and for a different
+/// reason: a plain read is placed where it loaded its view, while a commit
+/// that writes nothing is placed at its points, so every commit at or below
+/// them must be reachable through the view it checks in.
+///
+/// The committer seals the active memtable and only then publishes its
+/// sequence, the order the pipeline keeps: its write goes into the fresh
+/// memtable before it is published. The model has no write of its own: that
+/// the view reaches the fresh memtable stands for the view holding the write
+/// in it. A checker whose horizon covers the commit must load a view that
+/// reaches the fresh memtable.
+#[test]
+fn the_write_free_check_samples_the_horizon_before_it_loads_the_view() {
+    run_bounded_model("horizon_then_view", 262, || {
+        let cell = Arc::new(Cell::new(View::initial()));
+        let horizon = Arc::new(AtomicU64::new(1));
+
+        let committer = {
+            let cell = Arc::clone(&cell);
+            let horizon = Arc::clone(&horizon);
+            thread::spawn(move || {
+                cell.rcu(|view| rotate(view, FRESH));
+                horizon.store(2, Ordering::Release);
+            })
+        };
+
+        let checker = {
+            let cell = Arc::clone(&cell);
+            let horizon = Arc::clone(&horizon);
+            thread::spawn(move || {
+                let sampled = horizon.load(Ordering::Acquire);
+                let view = cell.load();
+                if sampled >= 2 {
+                    assert!(
+                        reaches_fresh(&view),
+                        "the check's horizon covers the commit but its view \
+                         misses the memtable the commit wrote to: {view:?}",
+                    );
+                }
+            })
+        };
+
+        committer.join().unwrap();
+        checker.join().unwrap();
+    });
+}
+
+/// The negative control of the model above: the broken order, view first
+/// and horizon second. The checker can load the old view, then see the
+/// horizon cover the commit, and miss the write; loom must find it.
+#[test]
+fn loading_the_view_first_is_caught_by_the_write_free_model() {
+    expect_bounded_violation("horizon_then_view/view_first", || {
+        let cell = Arc::new(Cell::new(View::initial()));
+        let horizon = Arc::new(AtomicU64::new(1));
+
+        let committer = {
+            let cell = Arc::clone(&cell);
+            let horizon = Arc::clone(&horizon);
+            thread::spawn(move || {
+                cell.rcu(|view| rotate(view, FRESH));
+                horizon.store(2, Ordering::Release);
+            })
+        };
+
+        let checker = {
+            let cell = Arc::clone(&cell);
+            let horizon = Arc::clone(&horizon);
+            thread::spawn(move || {
+                let view = cell.load();
+                let sampled = horizon.load(Ordering::Acquire);
+                if sampled >= 2 {
+                    assert!(reaches_fresh(&view));
+                }
+            })
+        };
+
+        committer.join().unwrap();
+        checker.join().unwrap();
+    });
+}
+
+/// One slot of the commit pipeline as the write-free check meets it: a
+/// decision installed, its operation applied to the memtable, then the tip
+/// (the decided frontier) moved past it (`settle`,
+/// src/engine/commit/pipeline.rs:671).
+struct Slot {
+    /// The slot holds a decision.
+    decided: AtomicBool,
+    /// Its operation is in the memtable.
+    in_memtable: AtomicBool,
+    /// The decided frontier: 1 before the slot, 2 once it is settled.
+    tip: AtomicU64,
+}
+
+impl Slot {
+    fn new() -> Self {
+        Self {
+            decided: AtomicBool::new(false),
+            in_memtable: AtomicBool::new(false),
+            tip: AtomicU64::new(1),
+        }
+    }
+
+    /// Apply the slot and move the tip past it: what the deciding thread
+    /// does, and what any helper does for it. Two threads may both do it,
+    /// which is harmless (the apply is idempotent and only one moves the
+    /// tip).
+    fn settle(&self) {
+        self.in_memtable.store(true, Ordering::Relaxed);
+        let _ = self
+            .tip
+            .compare_exchange(1, 2, Ordering::AcqRel, Ordering::Acquire);
+    }
+
+    /// The pipeline's thread: install the decision, then settle the slot.
+    fn decide_and_settle(&self) {
+        self.decided.store(true, Ordering::Release);
+        self.settle();
+    }
+
+    /// The write-free check: when the slot holds a decision, settle it
+    /// (`apply_decided`, write_free.rs:203-216), then read the decided
+    /// frontier, then look at the memtable. Returns whether a decision was
+    /// there when the check began, the frontier it read, and whether the
+    /// memtable held the write. `help` off is the calibration's broken check.
+    fn check(&self, help: bool) -> (bool, u64, bool) {
+        let decided = self.decided.load(Ordering::Acquire);
+        if help && decided {
+            self.settle();
+        }
+        let frontier = self.tip.load(Ordering::Acquire);
+        let seen = self.in_memtable.load(Ordering::Relaxed);
+        (decided, frontier, seen)
+    }
+}
+
+/// E50 F2: a write-free check that begins after a commit is decided counts
+/// it, applied or not. The check settles a decided slot itself before it
+/// reads the decided frontier, so the frontier it reads is past that slot,
+/// and a frontier past a slot means its write is in the memtable.
+#[test]
+fn the_write_free_check_counts_a_commit_decided_before_it() {
+    run_bounded_model("apply_then_frontier", 57, || {
+        let slot = Arc::new(Slot::new());
+        let pipeline = {
+            let slot = Arc::clone(&slot);
+            thread::spawn(move || slot.decide_and_settle())
+        };
+        let (decided, frontier, seen) = slot.check(true);
+        if decided {
+            assert_eq!(frontier, 2, "the check missed a commit decided before it");
+        }
+        if frontier >= 2 {
+            assert!(
+                seen,
+                "the frontier counts a write the memtable does not hold"
+            );
+        }
+        pipeline.join().unwrap();
+    });
+}
+
+/// The negative control of the model above: a check that reads the decided
+/// frontier without settling a decided slot first. It can begin after the
+/// decision and before the apply, read the old frontier and miss the commit,
+/// which a commit through the pipeline would be checked against; loom must
+/// find it.
+#[test]
+fn reading_the_frontier_without_helping_is_caught() {
+    expect_bounded_violation("apply_then_frontier/no_help", || {
+        let slot = Arc::new(Slot::new());
+        let pipeline = {
+            let slot = Arc::clone(&slot);
+            thread::spawn(move || slot.decide_and_settle())
+        };
+        let (decided, frontier, _) = slot.check(false);
+        if decided {
+            assert_eq!(frontier, 2);
+        }
+        pipeline.join().unwrap();
+    });
+}
+
 #[test]
 fn the_packing_round_trips_every_field() {
     let view = View {

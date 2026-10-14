@@ -159,6 +159,24 @@ pub(crate) fn prefix_key(cf_id: u32, key: &[u8]) -> Vec<u8> {
     out
 }
 
+/// The key the caller wrote, from the engine's key for it: what
+/// [`prefix_key`] put the family id in front of. Every hook the caller
+/// implements is handed this, never the engine's key.
+///
+/// A key too short to carry an id is handed back whole. The database never
+/// stores one; the engine's own unit tests do.
+pub(crate) fn callers_key(prefixed: &[u8]) -> &[u8] {
+    prefixed.get(CF_PREFIX_LEN..).unwrap_or(prefixed)
+}
+
+/// The id of the column family the engine's key `prefixed` belongs to, when
+/// it carries one.
+pub(crate) fn family_of(prefixed: &[u8]) -> Option<u32> {
+    prefixed
+        .first_chunk::<CF_PREFIX_LEN>()
+        .map(|id| u32::from_be_bytes(*id))
+}
+
 /// Shortest byte string strictly greater than every key prefixed
 /// with `cf_id`. Used by CF drop to issue a
 /// `delete_range(prefix, upper_bound)` and by `iter_cf` to bound

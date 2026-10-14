@@ -8,6 +8,7 @@ pub(crate) mod block_cache;
 #[cfg(all(test, not(loom)))]
 mod blocked_call_tests;
 pub(crate) mod bloom;
+mod buried_range_deletes;
 pub(crate) mod callback;
 pub(crate) mod checksum;
 #[cfg(test)]
@@ -20,6 +21,7 @@ pub(crate) mod compaction_gate;
 pub(crate) mod disk_check;
 mod drain;
 pub(crate) mod filter_block;
+pub(crate) mod filter_call;
 mod flush;
 mod foreground;
 pub(crate) mod index_block;
@@ -46,6 +48,7 @@ pub(crate) mod lookup_key;
 pub mod loom_model;
 pub(crate) mod manifest;
 pub(crate) mod memtable;
+pub(crate) mod merge_call;
 pub(crate) mod open_transactions;
 pub(crate) mod orphan_sweep;
 #[cfg(all(test, not(loom)))]
@@ -53,6 +56,7 @@ mod park_support;
 pub(crate) mod pending_outputs;
 #[cfg(all(test, not(loom)))]
 mod poll_park_tests;
+pub(crate) mod prefix_call;
 pub(crate) mod range_tombstone;
 pub(crate) mod read_horizon;
 mod read_rule;
@@ -111,8 +115,8 @@ use read_horizon::ReadHorizon;
 pub(crate) use read_rule::ReadRule;
 use read_view::{ReadView, ReadViewCell};
 use recovery::{
-    replay_logs, report_discarded_tail, report_dropped_manifest_tail,
-    rewrite_recovered_memtable_to_wal,
+    hoist_range_deletes, replay_logs, report_copied_range_deletes, report_demoted_tables,
+    report_discarded_tail, report_dropped_manifest_tail, rewrite_recovered_memtable_to_wal,
 };
 use skiplist::InsertHint;
 pub(crate) use snapshot_registry::SnapshotPin;
@@ -180,23 +184,6 @@ fn grouped_batch_ops(
         ops.push(WriteBatchOp::Merge { key, operand });
     }
     ops
-}
-
-/// Fold `operands`, oldest first, onto `base` with `op`. A read of the
-/// database and a transaction's read of its own merges both go through here,
-/// so both fail the same way when the operator declines.
-pub(crate) fn apply_merge(
-    op: &dyn crate::options::MergeOperator,
-    key: &[u8],
-    base: Option<&[u8]>,
-    operands: &[&[u8]],
-) -> std::io::Result<Vec<u8>> {
-    op.full_merge(key, base, operands).ok_or_else(|| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!("merge operator {} failed for key", op.name()),
-        )
-    })
 }
 
 /// A key a commit validates because the transaction read it: the key and
@@ -448,6 +435,10 @@ impl EngineOptions {
     pub(crate) fn to_compaction_options(&self) -> CompactionOptions {
         CompactionOptions {
             l0_compaction_trigger: self.l0_compaction_trigger,
+            level0_slowdown_writes_trigger: self.level0_slowdown_writes_trigger,
+            level0_stop_writes_trigger: self.level0_stop_writes_trigger,
+            soft_pending_compaction_bytes_limit: self.soft_pending_compaction_bytes_limit,
+            hard_pending_compaction_bytes_limit: self.hard_pending_compaction_bytes_limit,
             level_base_bytes: self.level_base_bytes,
             level_size_multiplier: self.level_size_multiplier,
             target_file_size: self.target_file_size,
@@ -561,7 +552,9 @@ pub(crate) struct RegolithEngine {
     /// One close at a time; a second caller waits for the first and then
     /// reads what it left in `close_state`. A [`crate::sync::Mutex`], so no
     /// thread sleeps in the kernel on it: close is a call that chose to
-    /// block, and waits on its own thread.
+    /// block, and waits on its own thread. Built without spin (E48): a close
+    /// holds it for the whole close, flushes and syncs included, so a second
+    /// close queues at once.
     close_lock: crate::sync::Mutex<()>,
     /// Transactions that `close` must abort. See `open_transactions`.
     open_transactions: open_transactions::OpenTransactions,
@@ -645,6 +638,11 @@ pub(crate) struct RegolithEngine {
     log_writeback: Option<WritebackLane>,
     /// Where the disk check looks.
     disk_dir: PathBuf,
+    /// Tables this open moved out of overlapping levels (`recovery.rs`).
+    tables_demoted_at_open: u64,
+    /// Range tombstones this open copied in front of older keys they may
+    /// delete (`buried_range_deletes.rs`).
+    range_deletes_copied_at_open: u64,
     /// A step relieving a stop waits on some thread's queue: no second one
     /// is left until it ran (`background_step.rs`).
     stall_step_queued: AtomicBool,
@@ -662,7 +660,12 @@ pub(crate) struct RegolithEngine {
     /// The host platform. Cloned out of [`EngineOptions`] so the read
     /// and write paths reach it without going through `options`.
     env: Arc<dyn Env>,
-    _db_lock: Box<dyn FileLock>,
+    /// The lock on the database directory, shared with every compaction
+    /// worker, so the directory is released only once the engine and every
+    /// worker are gone. An engine torn down on its own worker (a job held the
+    /// last reference) cannot join that worker, which keeps its share until
+    /// it has returned: no other open writes the directory while it might.
+    _db_lock: Arc<dyn FileLock>,
 }
 
 impl RegolithEngine {
@@ -670,7 +673,7 @@ impl RegolithEngine {
     pub(crate) fn open(db_dir: &Path, mut options: EngineOptions) -> std::io::Result<Arc<Self>> {
         options.read_only = false;
         let env = Arc::clone(&options.env);
-        let db_lock = env.lock_file(db_dir, true)?;
+        let db_lock: Arc<dyn FileLock> = Arc::from(env.lock_file(db_dir, true)?);
         let sst_dir = db_dir.join("sst");
         let wal_dir = db_dir.join("wal");
 
@@ -683,7 +686,7 @@ impl RegolithEngine {
         if let Some(keyring) = &options.keyring {
             keyring.current()?;
         }
-        let version_set = VersionSet::open_with_policy(
+        let mut version_set = VersionSet::open_with_policy(
             &env,
             db_dir,
             &sst_dir,
@@ -693,6 +696,9 @@ impl RegolithEngine {
         if let Some(tail) = version_set.dropped_tail() {
             report_dropped_manifest_tail(&options, version_set.manifest_path(), tail);
         }
+        let manifest_path = version_set.manifest_path().to_path_buf();
+        let demotion = version_set.take_demotion();
+        let check = !version_set.range_deletes_checked();
         let version = version_set.current();
         let latest_seq = version.last_seq;
 
@@ -722,6 +728,10 @@ impl RegolithEngine {
             wal::truncate_durably(&*env, &path, tail.offset)?;
             report_discarded_tail(&options, &path, tail, latest_seq);
         }
+        // Into the memtable the new log is written from just below, so
+        // they are durable there before the edit that records the move.
+        let (moved, copied, latest_seq) =
+            hoist_range_deletes(demotion, check, &version, &memtable, latest_seq);
 
         let wal_id = next_wal_id(version.next_file_id, &wal_files);
         let wal_path = wal_dir.join(wal_filename(wal_id));
@@ -744,12 +754,26 @@ impl RegolithEngine {
         // retired with the logs flushes left behind. Recorded unsynced: if
         // the record is lost, the replayed logs are replayed again beside
         // the new one, which repeats their writes and nothing older.
+        //
+        // An open that moved overlapping levels records the move in this
+        // same batch, which is then synced: the new log already holds the
+        // moved tables' range tombstones, so no crash leaves the move
+        // without them (LegacyRangeRead.tla, RED `MoveBeforeLog`). The
+        // first open of a database written without the record of the range
+        // delete check records it here too, synced for the same reason (RED
+        // `CheckBeforeLog`); a new database records it unsynced, having
+        // nothing to copy.
         versions.run(|versions| {
             versions.apply(&[
                 VersionEdit::SetNextFileId(wal_id + 1),
                 VersionEdit::SetMinWalId(wal_id),
             ])
         })?;
+        let tables_demoted_at_open = moved.map_or(0, |moved| moved.tables);
+        if let Some(moved) = moved {
+            report_demoted_tables(&options, &manifest_path, moved, false);
+        }
+        report_copied_range_deletes(&options, &manifest_path, copied, false);
         let removed =
             log_retirement::remove_below(&*env, &wal_dir, wal_id, options.statistics.as_deref());
         let retired_logs = RetiredLogs::new(wal_dir.clone(), !removed);
@@ -780,6 +804,7 @@ impl RegolithEngine {
         // instead of aborting; the directory lock and the fresh WAL
         // drop with this return.
         let compaction = CompactionScheduler::start(
+            Arc::clone(&db_lock),
             compaction_gate.clone(),
             Arc::clone(&snapshot_registry),
             Arc::clone(&versions),
@@ -845,7 +870,7 @@ impl RegolithEngine {
             cache,
             visible_seq: ReadHorizon::new(latest_seq),
             close_state: AtomicU8::new(CLOSE_STATE_OPEN),
-            close_lock: crate::sync::Mutex::new(()),
+            close_lock: crate::sync::Mutex::new_without_spin(()),
             open_transactions: open_transactions::OpenTransactions::new(),
             wal_id: AtomicU64::new(wal_id),
             sst_dir,
@@ -860,6 +885,8 @@ impl RegolithEngine {
             owed_queued: AtomicBool::new(false),
             log_writeback,
             disk_dir: db_dir.to_path_buf(),
+            tables_demoted_at_open,
+            range_deletes_copied_at_open: copied,
             stall_step_queued: AtomicBool::new(false),
             stall_steps_idle: std::sync::atomic::AtomicUsize::new(0),
             options,
@@ -914,7 +941,7 @@ impl RegolithEngine {
         mut options: EngineOptions,
     ) -> std::io::Result<Arc<Self>> {
         let env = Arc::clone(&options.env);
-        let db_lock = env.lock_file(db_dir, false)?;
+        let db_lock: Arc<dyn FileLock> = Arc::from(env.lock_file(db_dir, false)?);
         let sst_dir = db_dir.join("sst");
         let wal_dir = db_dir.join("wal");
 
@@ -944,7 +971,7 @@ impl RegolithEngine {
             options.write_buffer_size,
             options.max_write_buffer_number,
         );
-        let version_set = VersionSet::open_read_only(
+        let mut version_set = VersionSet::open_read_only(
             &env,
             db_dir,
             &sst_dir,
@@ -954,6 +981,11 @@ impl RegolithEngine {
         if let Some(tail) = version_set.dropped_tail() {
             report_dropped_manifest_tail(&options, version_set.manifest_path(), tail);
         }
+        // A read-only open moves overlapping levels in its own view only:
+        // the manifest keeps them, and every open moves them again until a
+        // read-write one records the move.
+        let demotion = version_set.take_demotion();
+        let check = !version_set.range_deletes_checked();
         let version = version_set.current();
         let latest_seq = version.last_seq;
 
@@ -972,6 +1004,13 @@ impl RegolithEngine {
         if let Some((path, tail)) = discarded {
             report_discarded_tail(&options, &path, tail, latest_seq);
         }
+        let (moved, copied, latest_seq) =
+            hoist_range_deletes(demotion, check, &version, &memtable, latest_seq);
+        let tables_demoted_at_open = moved.map_or(0, |moved| moved.tables);
+        if let Some(moved) = moved {
+            report_demoted_tables(&options, version_set.manifest_path(), moved, true);
+        }
+        report_copied_range_deletes(&options, version_set.manifest_path(), copied, true);
 
         let cache = Arc::new(
             BlockCache::with_config(
@@ -1017,7 +1056,7 @@ impl RegolithEngine {
             cache,
             visible_seq: ReadHorizon::new(latest_seq),
             close_state: AtomicU8::new(CLOSE_STATE_OPEN),
-            close_lock: crate::sync::Mutex::new(()),
+            close_lock: crate::sync::Mutex::new_without_spin(()),
             open_transactions: open_transactions::OpenTransactions::new(),
             wal_id: AtomicU64::new(wal_id),
             sst_dir,
@@ -1034,6 +1073,8 @@ impl RegolithEngine {
             owed_queued: AtomicBool::new(false),
             log_writeback: None,
             disk_dir: db_dir.to_path_buf(),
+            tables_demoted_at_open,
+            range_deletes_copied_at_open: copied,
             stall_step_queued: AtomicBool::new(false),
             stall_steps_idle: std::sync::atomic::AtomicUsize::new(0),
             options,
@@ -1212,7 +1253,6 @@ impl RegolithEngine {
     /// The last sequence the commit pipeline decided: every commit decided
     /// so far took sequences at or below it. A database opened read-only
     /// decides none, so there it is the published horizon.
-    #[cfg(test)]
     pub(crate) fn last_decided_seq(&self) -> u64 {
         match self.pipeline_state() {
             Some(tip) => tip.after.next_seq.saturating_sub(1),
@@ -1308,6 +1348,12 @@ impl RegolithEngine {
         self.options.statistics.clone()
     }
 
+    /// The statistics `Arc` exactly as the caller configured it, for
+    /// [`crate::Db::statistics`] to hand back.
+    pub(crate) fn statistics_shared(&self) -> Option<&Arc<crate::statistics::Statistics>> {
+        self.options.statistics.as_ref()
+    }
+
     /// The table of units and jobs in flight, and the registry of open
     /// queues, for this database.
     pub(crate) fn io(&self) -> &io::IoRuntime {
@@ -1323,6 +1369,7 @@ impl RegolithEngine {
         crate::IoQueue::open(
             Arc::clone(&self.cache),
             self.options.block_size.saturating_mul(IO_QUEUE_BLOCKS),
+            Arc::clone(&self.env),
         )
     }
 
@@ -1379,6 +1426,11 @@ impl RegolithEngine {
     /// were still outstanding when `timeout` elapsed.
     pub(crate) fn wait_for_snapshots(&self, timeout: std::time::Duration) -> u64 {
         self.snapshot_registry.wait_until_drained(timeout)
+    }
+
+    /// The same wait for a task: over once no snapshot is pinned.
+    pub(crate) fn snapshots_drained(&self) -> impl Future<Output = ()> + '_ {
+        self.snapshot_registry.until_drained()
     }
 
     /// Construct a streaming iterator over the latest published read
@@ -1837,7 +1889,7 @@ impl RegolithEngine {
             });
         }
 
-        apply_merge(merge_op.as_ref(), key, base_slice, &operands_owned)
+        merge_call::apply_merge(merge_op.as_ref(), key, base_slice, &operands_owned)
             .map(|merged| Some(DbSlice::from_vec(merged)))
     }
 
@@ -2128,14 +2180,32 @@ impl RegolithEngine {
                 &self.options.to_compaction_options(),
                 &self.snapshot_registry,
                 &self.compaction_claims,
+                // A caller's own pass: nothing a census step stops for.
+                &|| false,
             );
             self.unkeep(kept);
-            outcome?
+            outcome.inspect_err(|err| self.compaction_failed(err))?
         };
         // As a worker does after each pass: writers a stop stopped are told
         // once the pass relieved it.
         self.refresh_stall_level();
         Ok(Some(outcome))
+    }
+
+    /// A compaction this thread ran failed with `err`: a step a write left
+    /// owing, one relieving a stall, [`crate::Db::compact_step`] or a
+    /// `compact_range`. Counted among the background errors and told to the
+    /// listeners as a worker's failing pass is
+    /// ([`compaction::tell_failure`]).
+    ///
+    /// Not recorded as the failure a stopped writer is told
+    /// (`BackgroundHealth::record_failure`): with no worker, a writer told
+    /// it would stop running the steps that are the only relief.
+    fn compaction_failed(&self, err: &std::io::Error) {
+        self.background_health.count_failure();
+        // A listener's panic, contained in a background step, was logged
+        // where it was caught: the caller gets the compaction's failure.
+        let _told = compaction::tell_failure(&self.options.listeners, err);
     }
 
     /// Write every memtable currently held in memory out to level-0
@@ -2620,17 +2690,17 @@ impl RegolithEngine {
         self.latest_version_upto(key, u64::MAX, view)
     }
 
-    /// [`Self::latest_version_in_view`] among the writes at or below `snap`,
-    /// for a check that takes no slot of the commit ring and so must not see
-    /// a commit that is decided and not yet published.
+    /// [`Self::latest_version_in_view`] among the writes at or below `ceil`:
+    /// what the key held for a reader at `ceil`, for a check that takes no
+    /// slot of the commit ring (`commit/write_free.rs`).
     fn latest_version_upto(
         &self,
         key: &[u8],
-        snap: u64,
+        ceil: u64,
         view: &ReadView,
     ) -> std::io::Result<Option<(u64, WriteKind)>> {
-        let lk = LookupKey::from_prefixed(key, snap);
-        let walked = view.walk_newest_first(key, snap, |source, max_rt_seq| {
+        let lk = LookupKey::from_prefixed(key, ceil);
+        let walked = view.walk_newest_first(key, ceil, |source, max_rt_seq| {
             let version = match source {
                 Source::Memtable(mt) => mt.latest_version(&lk),
                 Source::Table(reader) => {
@@ -2704,13 +2774,24 @@ impl RegolithEngine {
     /// a queue's poll holds the step for the length of this call.
     ///
     /// Walks levels 0..MAX_LEVELS-1, picking range-overlapping files and
-    /// merging them into the next level.
+    /// merging them into the next level. A failure is told as any failing
+    /// compaction is ([`Self::compaction_failed`]).
     pub(crate) fn compact_range_levels(
         &self,
         start: Option<&[u8]>,
         end: Option<&[u8]>,
     ) -> std::io::Result<()> {
         self.ensure_writable()?;
+        self.compact_range_passes(start, end)
+            .inspect_err(|err| self.compaction_failed(err))
+    }
+
+    /// The passes of [`Self::compact_range_levels`].
+    fn compact_range_passes(
+        &self,
+        start: Option<&[u8]>,
+        end: Option<&[u8]>,
+    ) -> std::io::Result<()> {
         // Run the level-by-level push-down.
         let compaction_opts = self.options.to_compaction_options();
         // Under FIFO compaction there is no level push-down; a
@@ -2719,7 +2800,12 @@ impl RegolithEngine {
         // get dropped deterministically.
         match self.options.compaction_style {
             crate::options::CompactionStyle::Fifo => {
-                let _ = compaction::run_fifo_pass(&self.versions, &self.sst_dir, &compaction_opts)?;
+                let _ = compaction::run_fifo_pass(
+                    &self.versions,
+                    &self.sst_dir,
+                    &self.cache,
+                    &compaction_opts,
+                )?;
             }
             // Under Universal compaction a manual compact_range folds
             // every L0 file into one run, matching the "force full
@@ -2916,6 +3002,19 @@ impl RegolithEngine {
             .get(level)
             .map(|files| files.len() as u64)
             .unwrap_or(0)
+    }
+
+    /// Tables this open moved out of overlapping levels: zero once a
+    /// read-write open has recorded the move.
+    pub(crate) fn tables_demoted_at_open(&self) -> u64 {
+        self.tables_demoted_at_open
+    }
+
+    /// Range tombstones this open copied in front of older keys an earlier
+    /// release may have left them behind: zero once a read-write open has
+    /// recorded the check.
+    pub(crate) fn range_deletes_copied_at_open(&self) -> u64 {
+        self.range_deletes_copied_at_open
     }
 
     /// Total size in bytes across every level of the current

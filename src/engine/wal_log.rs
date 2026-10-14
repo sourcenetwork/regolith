@@ -521,6 +521,11 @@ impl Log {
     /// docs). The wait is for positional writes already in flight; a caller
     /// that may not wait calls [`Log::turn_away`] first and comes here once
     /// it answered `true`, when there is nothing left to wait for.
+    ///
+    /// The wait is bounded by those writes: once the epoch moved none is let
+    /// in, and each one in flight leaves once (`wal_gate.rs`, WG2). The
+    /// thread parks for them and the last to leave wakes it (WG3), the
+    /// handshake a rollback on a queue's poll parks on; it does not spin.
     pub(crate) fn rollback_to(
         &self,
         offset: u64,
@@ -533,8 +538,18 @@ impl Log {
         self.gate.turn(epoch);
         if !self.gate.is_clear() {
             super::io::scope::waits("positional writes in flight on a log being rolled back");
-            while !self.gate.is_clear() {
-                std::thread::yield_now();
+            let left = crate::sync::internal::wait_here(std::future::poll_fn(|cx| {
+                if self.gate.clear_or_park(cx.waker()) {
+                    std::task::Poll::Ready(())
+                } else {
+                    std::task::Poll::Pending
+                }
+            }));
+            // Only where one thread is all there is: a write in flight is
+            // then this thread's own, further up its stack, and nothing is
+            // cut under it.
+            if let Err(waits_for_itself) = left {
+                return (None, Err(waits_for_itself));
             }
         }
         // A sync that turned the gate for a prefix this cut removes would

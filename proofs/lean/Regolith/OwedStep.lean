@@ -18,10 +18,23 @@ Usually a background thread (the "worker") flushes and compacts. A database
 opened with no worker (for example on a wasm target that has no threads)
 has nobody to do that. So the writes do it: a write that seals a memtable
 leaves one step of background work "owed", and the next write to finish
-its commit runs exactly one step, then returns
+its commit starts exactly one step, then returns
 (`RegolithEngine::run_owed_step`, `src/engine/background_step.rs`). One step
 is one flush of the oldest sealed memtable, or, when nothing is sealed, one
 compaction pass. A step that did work owes the next one.
+
+Where the step runs decides which bound holds. A writer with no queue open
+runs it inline, before its write returns, so every owed step is done before
+the next write: that is what `write` below composes, and what the first
+three results need. A writer with an `IoQueue` open leaves the step there as
+a job and returns; the job runs when the writer polls, and while it waits
+the later writes' debts ride on it. A writer that keeps writing without
+polling seals memtable after memtable, and the rotation, which keeps at most
+`max_write_buffer_number` memtables, flushes the older sealed one itself to
+make room, adding a file to L0 each time with nobody compacting. There the
+compaction trigger is no bound (`queued_passes_trigger`), and the bound is
+the stop trigger plus the sealed memtables a rotation keeps
+(`queued_l0_bounded`).
 
 Example, with a memtable of two writes and a trigger of two L0 files:
 write 2 seals and flushes (L0 = 1); write 3 runs a pass that finds nothing
@@ -37,6 +50,8 @@ one call.
 
 ## What is proved, in plain words
 
+For inline execution, each owed step done before the next write:
+
 1. `write_one_step`: a write runs one step when one is owed as it leaves
    the commit pipeline, and none otherwise. Never more than one.
 2. `write_inv`, `run_inv`, `l0_bounded`: when a memtable holds at least
@@ -45,8 +60,20 @@ one call.
 3. `stopped_write_inv`, `l0_bounded_by_stop`: for any memtable size, even
    one write per memtable, L0 never passes the stop trigger `P`: a write
    that finds L0 there first runs the step that compacts it.
-4. `flush_owes_nothing_overfills` and `step_until_idle_runs_three`: the two
-   RED cases, as counterexamples.
+
+On the writer's queue, the steps run whenever the writer polls, or never:
+
+4. `queued_inv`, `queued_l0_bounded`: after any writes and any steps, in
+   any order, L0 holds at most `P + R` files and at most `R` sealed
+   memtables wait, where `R` is what a rotation keeps sealed
+   (`max_write_buffer_number - 1`).
+
+And the RED cases, as counterexamples:
+
+5. `flush_owes_nothing_overfills` and `step_until_idle_runs_three`: the two
+   defects.
+6. `queued_passes_trigger`: on the queue, L0 passes the compaction trigger,
+   so the bound of 2 holds only for inline execution.
 
 ## What the proof leaves out
 
@@ -112,17 +139,20 @@ def runOwed (T : Nat) (deeper : Bool) (s : St) : St × Nat :=
   -- A step is owed: clear the debt, run one step, count one. Otherwise run nothing.
   if s.owed then (bgStep T deeper { s with owed := false }, 1) else (s, 0)
 
-/-- One whole write: the commit, then the owed step if any. -/
+/-- One whole write run inline: the commit, then the owed step if any, done
+before the write returns and so before the next write. A writer with a queue
+does not compose this way; its writes are `stepQ` below. -/
 def write (S T : Nat) (deeper : Bool) (s : St) : St × Nat :=
   -- First the commit, then what it left owing.
   runOwed T deeper (commit S s)
 
 /-! ## One step per write -/
 
-/-- **`write_one_step`.** A write runs one step when one is owed as its
-commit returns, and none otherwise: never more than one. TLA+:
+/-- **`write_one_step`.** A write run inline runs one step when one is owed
+as its commit returns, and none otherwise: never more than one. TLA+:
 `OneStepPerWrite`, `ExactlyTheOwedStep`. Example ruled out: a write that
-seals, flushes, compacts and compacts again before it returns. -/
+seals, flushes, compacts and compacts again before it returns. A writer with
+a queue runs none itself: it leaves the step for its polls. -/
 theorem write_one_step (S T : Nat) (deeper : Bool) (s : St) :
     -- The statement: the steps run are 1 if a step is owed after the commit, else 0.
     (write S T deeper s).2 = (if (commit S s).owed then 1 else 0) := by
@@ -278,10 +308,12 @@ theorem run_inv {S T : Nat}
   | cons d ds ih => exact ih (write_inv hS hT d hs)
 
 /-- **`l0_bounded`.** With no worker, a memtable of at least two writes and
-any trigger, after any number of writes L0 holds at most `T` files and no
-sealed memtable is left waiting. TLA+: `L0Bounded`, `FrozenBounded`. Example
-ruled out: a trigger of 2 and an L0 of 3, 4, 5 files, growing with every
-flush until the database stops writes. -/
+any trigger, after any number of writes run inline L0 holds at most `T`
+files and no sealed memtable is left waiting. TLA+: `L0Bounded`,
+`FrozenBounded`. Example ruled out: a trigger of 2 and an L0 of 3, 4, 5
+files, growing with every flush until the database stops writes. The writes
+must run their owed steps inline: on a queue polled late this fails
+(`queued_passes_trigger`). -/
 theorem l0_bounded {S T : Nat}
     -- A memtable holds at least two writes.
     (hS : 2 ≤ S)
@@ -424,7 +456,7 @@ def runStopped (S T P : Nat) : List Bool → St → St
   | d :: ds, s => runStopped S T P ds (writeStopped S T P d s)
 
 /-- **`l0_bounded_by_stop`.** With no worker and any memtable size, even one
-write per memtable, after any number of writes L0 holds at most `P` files,
+write per memtable, after any number of writes run inline L0 holds at most `P` files,
 the stop trigger, and no sealed memtable is left waiting. Example ruled
 out: an L0 that grows for ever because every write seals and every step
 flushes. -/
@@ -455,6 +487,171 @@ theorem l0_bounded_by_stop {S T P : Nat}
   have h := hrun ds init h0
   -- Read off two of its facts.
   exact ⟨h.l0_le, h.none_frozen⟩
+
+/-! ## On the writer's queue: the stop trigger plus what a rotation keeps -/
+
+/-- A write's commit on a database whose rotation keeps at most `R` sealed
+memtables (`max_write_buffer_number - 1`). The write that fills the memtable
+first flushes the oldest sealed ones until `R - 1` are left
+(`Turn::rotation_due`, `flush_down_to`), then seals: `s.frozen + 1 - R`
+flushes, none when fewer than `R` wait. Every flush and the seal owe a step.
+With nothing sealed before it, as inline, this is `commit`. -/
+def commitQ (S R : Nat) (s : St) : St :=
+  -- The write that fills the memtable: the flushes, then the seal, and a step owed.
+  if s.filled + 1 = S then
+    -- A fresh memtable; `R` sealed ones once the oldest are flushed and this one sealed; each
+    -- flushed one a file more in L0; a step owed.
+    { s with filled := 0, frozen := s.frozen - (s.frozen + 1 - R) + 1,
+             l0 := s.l0 + (s.frozen + 1 - R), owed := true }
+  -- Any other write: one more write in the memtable.
+  else { s with filled := s.filled + 1 }
+
+/-- What can happen next on a database whose one writer has a queue. -/
+inductive Ev where
+  /-- The writer writes. It leaves its owed step on its queue and runs none. -/
+  | write
+  /-- The writer polls and the queue runs one owed step; `deeper` says what a
+  pass that leaves L0 alone found below it. -/
+  | poll (deeper : Bool)
+  /-- A step relieving a stop runs: a stopped writer's poll of its stall job. -/
+  | relieve
+
+/-- One event on stop trigger `P`, compaction trigger `T`, `S` writes per
+memtable and `R` sealed memtables kept by a rotation. A write that finds L0
+at the stop trigger is stopped and does not go in. -/
+def stepQ (S T P R : Nat) : Ev → St → St
+  -- A write goes in below the stop trigger, and is held off at it.
+  | .write, s => if s.l0 < P then commitQ S R s else s
+  -- A poll runs what is owed: one step, or nothing.
+  | .poll d, s => (runOwed T d s).1
+  -- A step relieving the stop.
+  | .relieve, s => relieveStep T s
+
+/-- Any events, in any order: polls as often or as rarely as the writer
+likes, never included. -/
+def runQ (S T P R : Nat) : List Ev → St → St
+  -- No event: the state as it is.
+  | [], s => s
+  -- One event, then the rest.
+  | e :: es, s => runQ S T P R es (stepQ S T P R e s)
+
+/-- What holds on the queue after any events. -/
+structure InvQ (P R : Nat) (s : St) : Prop where
+  /-- At most `R` sealed memtables wait. -/
+  frozen_le : s.frozen ≤ R
+  /-- The L0 files and the sealed memtables, each a file to be, are at most
+  `P + R`. -/
+  total_le : s.l0 + s.frozen ≤ P + R
+
+/-- A background step keeps the invariant: a flush moves a sealed memtable
+into L0, a pass empties L0 or leaves it, and neither adds to the total. -/
+theorem bgStep_keeps {P R T : Nat} (d : Bool) {s : St}
+    -- The invariant holds before the step.
+    (hs : InvQ P R s) :
+    -- The statement: it holds after it.
+    InvQ P R (bgStep T d s) := by
+  -- Take the invariant apart.
+  obtain ⟨hfz, htot⟩ := hs
+  -- Look at the three cases of the step.
+  unfold bgStep
+  -- A sealed memtable waits, or not.
+  split
+  -- A flush: one sealed memtable fewer, one file more.
+  · exact ⟨show s.frozen - 1 ≤ R by omega, show s.l0 + 1 + (s.frozen - 1) ≤ P + R by omega⟩
+  -- Nothing sealed: is L0 at its trigger?
+  · split
+    -- A pass merges L0 away: the total only falls.
+    · exact ⟨hfz, show 0 + s.frozen ≤ P + R by omega⟩
+    -- A pass that leaves L0 alone: nothing counted changes.
+    · exact ⟨hfz, htot⟩
+
+/-- **Every event keeps the invariant**, whenever the writer polls. -/
+theorem queued_inv {S T P R : Nat}
+    -- A rotation keeps at least one sealed memtable.
+    (hR : 1 ≤ R)
+    -- Any event.
+    (e : Ev) {s : St}
+    -- The invariant holds before it.
+    (hs : InvQ P R s) :
+    -- The statement: it holds after it.
+    InvQ P R (stepQ S T P R e s) := by
+  -- Which event?
+  cases e with
+  -- A write.
+  | write =>
+    -- Take the invariant apart.
+    obtain ⟨hfz, htot⟩ := hs
+    -- Unfold the write.
+    simp only [stepQ]
+    -- Was it held off by the stop trigger?
+    split
+    -- It goes in, with L0 below the stop trigger. Does it fill the memtable?
+    · unfold commitQ
+      -- It seals, or not.
+      split
+      -- It seals: at most `R` sealed after the flushes, and the total grows by the one seal.
+      · exact ⟨show s.frozen - (s.frozen + 1 - R) + 1 ≤ R by omega,
+          show s.l0 + (s.frozen + 1 - R) + (s.frozen - (s.frozen + 1 - R) + 1) ≤ P + R by omega⟩
+      -- It does not seal: nothing counted changes.
+      · exact ⟨hfz, htot⟩
+    -- Held off: nothing changes.
+    · exact ⟨hfz, htot⟩
+  -- A poll runs one owed step, or nothing.
+  | poll d =>
+    -- Unfold the poll.
+    simp only [stepQ, runOwed]
+    -- A step is owed, or not.
+    split
+    -- Owed: the step with its debt taken, which keeps the invariant as any step does.
+    · exact bgStep_keeps d ⟨hs.frozen_le, hs.total_le⟩
+    -- Not owed: nothing changes.
+    · exact hs
+  -- A step relieving the stop.
+  | relieve =>
+    -- Take the invariant apart.
+    obtain ⟨hfz, htot⟩ := hs
+    -- Unfold the relief and look at its three cases.
+    simp only [stepQ, relieveStep]
+    -- A sealed memtable waits, or not.
+    split
+    -- A flush: one sealed memtable fewer, one file more.
+    · exact ⟨show s.frozen - 1 ≤ R by omega, show s.l0 + 1 + (s.frozen - 1) ≤ P + R by omega⟩
+    -- Nothing sealed: is L0 at its trigger?
+    · split
+      -- A pass merges L0 away: the total only falls.
+      · exact ⟨hfz, show 0 + s.frozen ≤ P + R by omega⟩
+      -- Nothing to do.
+      · exact ⟨hfz, htot⟩
+
+/-- **`queued_l0_bounded`.** With no worker and the owed steps on the
+writer's queue, after any writes and any polls, in any order and polls never
+included, L0 holds at most `P + R` files and at most `R` sealed memtables
+wait. TLA+: `L0WithinStopAndRoom`, `FrozenWithinRoom`. Example ruled out: an
+L0 that grows past the stop trigger because each rotation flushed a sealed
+memtable into it while nobody polled. -/
+theorem queued_l0_bounded {S T P R : Nat}
+    -- A rotation keeps at least one sealed memtable.
+    (hR : 1 ≤ R)
+    -- The events.
+    (es : List Ev) :
+    -- The statement: L0 is at most `P + R`, and at most `R` sealed memtables wait.
+    (runQ S T P R es init).l0 ≤ P + R ∧ (runQ S T P R es init).frozen ≤ R := by
+  -- The invariant holds after any events from any state that satisfies it.
+  have hrun : ∀ (es : List Ev) (s : St), InvQ P R s → InvQ P R (runQ S T P R es s) := by
+    -- Take the events.
+    intro es
+    -- Go through them one at a time, from any starting state.
+    induction es with
+    -- No event: nothing changed.
+    | nil => exact fun s hs => hs
+    -- One event keeps the invariant, and the rest follow from the state it leaves.
+    | cons e es ih => exact fun s hs => ih _ (queued_inv hR e hs)
+  -- The start satisfies it: nothing sealed and an empty L0.
+  have h0 : InvQ P R init := ⟨Nat.zero_le _, Nat.zero_le _⟩
+  -- So it holds after the events.
+  have h := hrun es init h0
+  -- L0 is at most the total, and the total is at most `P + R`.
+  exact ⟨by have := h.total_le; omega, h.frozen_le⟩
 
 /-! ## The RED cases, as counterexamples -/
 
@@ -517,6 +714,19 @@ theorem step_until_idle_runs_three :
     -- three steps.
     (runOwedLoop 2 8 (commit 2 ⟨1, 0, 1, false⟩)).2 = 3 := by
   -- Settled by computing the loop.
+  decide
+
+/-- **`queued_passes_trigger`.** On the queue, with a memtable of two
+writes, a trigger of two files, a stop trigger of four and one sealed
+memtable kept by a rotation: six writes seal three memtables, the rotations
+flush the first two into L0 (L0 = 2, the trigger), and the poll that comes
+at last runs one step, which flushes the third before any pass: L0 = 3, past
+the trigger. So `l0_bounded` needs each owed step done before the next
+write. TLA+: `MC_OwedStep_Red_QueuedTightBound` breaks `L0Bounded`. -/
+theorem queued_passes_trigger :
+    -- The statement: L0 holds three files, one more than the trigger.
+    (runQ 2 2 4 1 [.write, .write, .write, .write, .write, .write, .poll false] init).l0 = 3 := by
+  -- Settled by computing the six writes and the poll.
   decide
 
 -- End of the namespace opened at the top.

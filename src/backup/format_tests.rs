@@ -26,6 +26,7 @@ fn manifest(sealed_under: Option<KeyId>, seal_key: Option<KeyId>) -> BackupManif
         next_file_id: 13,
         last_seq: 5,
         sealed_under,
+        range_deletes_checked: true,
     }
 }
 
@@ -67,6 +68,11 @@ fn a_version_2_backup_manifest_still_reads() {
     let older = decode(&body, BackupId(1), None).unwrap();
     assert_eq!(older.files[0].global_seq, None);
     assert_eq!(older.files[0].largest_key, LARGEST);
+    // 0.1.x wrote version 2: a database restored from it is checked for
+    // range deletes behind older keys at its first open; this build's own
+    // backups were checked when their database opened.
+    assert!(!older.range_deletes_checked);
+    assert!(current.range_deletes_checked);
 }
 
 #[test]

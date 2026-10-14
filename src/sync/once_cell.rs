@@ -63,7 +63,9 @@ impl<T> OnceCell<T> {
         pub fn new() -> Self {
             Self {
                 value: AtomicPtr::new(ptr::null_mut()),
-                init: RawSemaphore::new(1),
+                // The turn is held across the caller's initializer, which may
+                // await anything: a waiter queues at once.
+                init: RawSemaphore::without_spin(1),
                 _value: PhantomData,
             }
         }
@@ -213,11 +215,34 @@ impl<T> From<T> for OnceCell<T> {
 
 #[cfg(all(test, not(loom)))]
 mod tests {
+    use super::super::queue::Policy;
     use super::*;
     use crate::sync::Event;
     use crate::sync::test_support::Polled;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering as StdOrdering};
+
+    /// A caller waiting for the initializer turn queues at once and never
+    /// spins: the turn is held across the caller's initializer, which may
+    /// await anything. The turn's spin budget stays at zero through a
+    /// contended wait, its wake and its retry.
+    #[test]
+    fn a_waiter_for_the_initializer_turn_never_spins() {
+        let cell = OnceCell::<u8>::new();
+        assert_eq!(cell.init.queue().spin.rounds(), 0);
+        let gate = Event::new();
+        let mut first = Polled::new(cell.get_or_init(async {
+            gate.wait().await;
+            1
+        }));
+        first.pending();
+        let mut second = Polled::new(cell.get_or_init(async { 2 }));
+        second.pending();
+        gate.set();
+        assert_eq!(*first.ready(), 1);
+        assert_eq!(*second.ready(), 1);
+        assert_eq!(cell.init.queue().spin.rounds(), 0, "the turn never spins");
+    }
 
     #[test]
     fn set_publishes_once() {

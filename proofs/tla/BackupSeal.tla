@@ -23,6 +23,11 @@
 \*     file to backup 1's name, and the restore puts back the wrong tables;
 \*   - the restore refuses (no key, a wrong key, a missing key) only after
 \*     it has already copied tables into the target;
+\*   - backup 2, sealed under key 2, still lists a table under key 1, and
+\*     the provider has the right bytes for key 2 and other bytes under
+\*     key 1: the restore sees key 1 is there, writes the MANIFEST and
+\*     returns Ok, and the target then fails to open, and refuses a second
+\*     restore because it holds a MANIFEST;
 \*   - deleting a backup removes a shared table a sealed backup still needs,
 \*     because the engine holds no key and skipped what it could not read;
 \*   - a power cut leaves metadata that lists a table the pool never got,
@@ -35,7 +40,12 @@
 \*     every sealed backup;
 \*   - a delete counts only the listings it can read, and removes the
 \*     tables unreadable backup 2 lists, which a newer build, or the disk
-\*     once it reads again, would need.
+\*     once it reads again, would need;
+\*   - a delete removes backup 1's metadata, its sync of meta/ fails, and
+\*     the call is run again: the file is already gone, so the second call
+\*     skips the sync and removes backup 1's tables, and a power cut then
+\*     brings the unsynced removal back undone: backup 1 is listed again,
+\*     and its tables are gone.
 \*
 \* WHAT THE CODE DOES (each line below is one of these, by name).
 \*   create_backup resolves the sealer for the current key first, copies
@@ -51,15 +61,22 @@
 \*     and checks, before it writes anything: a provider is given, it has the
 \*     key the file names, the tag holds (right key bytes, listing unchanged,
 \*     the file is the one this id wrote), and it has its current key and
-\*     every key a table names. Then it copies every listed table into the
-\*     target, and writes the MANIFEST last, sealed under the current key.
+\*     every key a table names, with the bytes that sealed the table: it
+\*     authenticates each table's footer under its key
+\*     (sstable::authenticate_footer). Then it copies every listed table
+\*     into the target, and writes the MANIFEST last, sealed under the
+\*     current key.
 \*   list_backups names every metadata file in meta/ by its backup id, with
 \*     its summary when its metadata reads and the reason when it does not.
 \*     It reads only the clear listing, so it needs no key.
 \*   delete_backup removes one backup's metadata, purge_old_backups the
 \*     metadata of every backup but the newest `keep` by id, readable or
-\*     not. Both make that durable, then sweep the pool (collect_shared,
-\*     src/backup/collect.rs): the walk of shared/ hands the pool files out
+\*     not. Then both sweep the pool (collect_shared,
+\*     src/backup/collect.rs), which starts with a sync of meta/ and removes
+\*     nothing unless it succeeds: a removal this call made, or one an
+\*     earlier call made whose own sync failed, is then durable before any
+\*     pool file goes. Until that sync a power cut may undo a removal. The
+\*     walk of shared/ hands the pool files out
 \*     a batch of Sweep at a time; for each batch the sweep walks meta/ one
 \*     entry at a time (Env::read_dir hands entries out a batch of Batch at
 \*     a time, the way readdir fills its buffer), reads each listing as the
@@ -90,6 +107,8 @@
 \*   FaithfulRestore       a finished restore holds exactly the tables the
 \*                         backup recorded when it was taken.
 \*   RefusalWritesNothing  a refused restore wrote nothing.
+\*   RestoredOpens         a finished restore names only tables the
+\*                         provider it was given opens.
 \*   ListedRestores        every table an untampered backup lists is in the
 \*                         pool, after any delete and any power cut, even
 \*                         while its metadata does not read.
@@ -111,6 +130,9 @@
 \*   "ManifestFirst"     the MANIFEST before the tables.     FaithfulRestore
 \*   "OverDatabase"      a restore over a finished target.   FaithfulRestore
 \*   "CheckAfterCopy"    key checks after the copies.   RefusalWritesNothing
+\*   "FooterUnchecked"   a table's key is checked for presence only, not
+\*                       against the table, as restore did before.
+\*                                                          RestoredOpens
 \*   "GcSkipsSealed"     a delete counts only plain listings.  ListedRestores
 \*   "GcSkipsUnreadable" a delete counts only listings that read.
 \*                                                          ListedRestores
@@ -123,6 +145,8 @@
 \*   "SweepSkips"        the walk of shared/ loses the pool file that starts
 \*                       each batch of candidates after the first.
 \*                                                SweepRemovesEveryUnlisted
+\*   "SyncOnlyRemoved"   meta/ is synced only when this call removed a file,
+\*                       as the code did before.          ListedRestores
 \*
 \* WHAT THE MODEL LEAVES OUT, and why that loses nothing.
 \*   - Bytes. A table is its content id <<t, k>>: table slot t sealed under
@@ -133,6 +157,11 @@
 \*   - Each copy's own crash steps. Every file is written to a staging name,
 \*     synced and renamed, so a power cut leaves it whole or absent: one step
 \*     here. A power cut is the Crash step, which drops what was in flight.
+\*     A removal is the one write that is not durable at once: it waits for
+\*     the sync of its directory, and the Crash step undoes every removal of
+\*     metadata not synced yet (`pend`), the worst a power cut can do. The
+\*     removals of pool files are synced before the sweep returns, and no
+\*     rule here is broken by bringing one back (Collect).
 \*   - Unencrypted databases: their backups stay plain, as they always were,
 \*     and none of these rules is about them.
 \*   - Why a file does not read. A flipped bit (the checksum fails), a
@@ -168,6 +197,8 @@
 \*   MC_BackupSeal_Green_SweepTwoTables    the same sweep with two tables
 \*                                         and no attacker
 \*   MC_BackupSeal_Red_<defect>            the promise named above fails
+\*   Every GREEN run's deletes and purges may find their sync of meta/
+\*   failing, and be run again.
 \*
 \* The Lean proof Regolith/BackupSeal.lean proves the rules for every number
 \* of backups and tables, every batching and every order: collect_keeps_listed,
@@ -218,7 +249,8 @@ ASSUME Slots \in {1, 2}
 ASSUME Mutant \in {"none", "PlainMeta", "PlainRestore", "OpenUnderCurrent",
                    "ListingUnbound", "IdUnbound", "ManifestFirst", "OverDatabase",
                    "CheckAfterCopy", "GcSkipsSealed", "GcSkipsUnreadable", "MetaFirst",
-                   "ListSkipsUnreadable", "ListNeedsKey", "StreamSkips", "SweepSkips"}
+                   "ListSkipsUnreadable", "ListNeedsKey", "StreamSkips", "SweepSkips",
+                   "SyncOnlyRemoved", "FooterUnchecked"}
 
 \* The two key ids the database rotates between (KeyId).
 Keys == {1, 2}
@@ -241,26 +273,30 @@ Plain == 0
 \* A restore given no key provider (restore's `None`). Every stand-in value
 \* in this module is a record shaped like the values beside it, because TLC
 \* refuses to compare a string with a record.
-NoProv == [given |-> FALSE, has |-> {}, right |-> FALSE, cur |-> 1]
+NoProv == [given |-> FALSE, has |-> {}, right |-> {}, cur |-> 1]
 
 \* The providers a restore may be given. `has` is the set of key ids it
-\* hands out, `right` whether their bytes are the ones that sealed, `cur`
-\* the key it names current (KeyProvider::current).
+\* hands out, `right` the ids among them whose bytes are the ones that
+\* sealed, `cur` the key it names current (KeyProvider::current).
 Providers ==
   \* No provider at all.
   {NoProv} \cup
   \* Both keys, the right bytes, key 1 current.
-  { [given |-> TRUE, has |-> {1, 2}, right |-> TRUE, cur |-> 1],
+  { [given |-> TRUE, has |-> {1, 2}, right |-> {1, 2}, cur |-> 1],
     \* Both keys, the right bytes, key 2 current: after a rotation.
-    [given |-> TRUE, has |-> {1, 2}, right |-> TRUE, cur |-> 2],
+    [given |-> TRUE, has |-> {1, 2}, right |-> {1, 2}, cur |-> 2],
     \* Only key 2: key 1 was retired.
-    [given |-> TRUE, has |-> {2}, right |-> TRUE, cur |-> 2],
+    [given |-> TRUE, has |-> {2}, right |-> {2}, cur |-> 2],
     \* Only key 1.
-    [given |-> TRUE, has |-> {1}, right |-> TRUE, cur |-> 1],
+    [given |-> TRUE, has |-> {1}, right |-> {1}, cur |-> 1],
     \* Key 1 only, but it names key 2 current: a current key it lacks.
-    [given |-> TRUE, has |-> {1}, right |-> TRUE, cur |-> 2],
+    [given |-> TRUE, has |-> {1}, right |-> {1}, cur |-> 2],
     \* Both ids, but other bytes under them: the wrong keys.
-    [given |-> TRUE, has |-> {1, 2}, right |-> FALSE, cur |-> 1] }
+    [given |-> TRUE, has |-> {1, 2}, right |-> {}, cur |-> 1],
+    \* Both ids after a rotation, the right bytes for key 2 and other bytes
+    \* under key 1: what opens a backup's metadata sealed under key 2, and
+    \* none of its tables still under key 1.
+    [given |-> TRUE, has |-> {1, 2}, right |-> {2}, cur |-> 2] }
 
 \* The values a slot map's tables take, without the empty marker.
 Held(f) == {f[t] : t \in Tables} \ {NoObj}
@@ -274,7 +310,10 @@ Absent == [on |-> FALSE, key |-> Plain, listing |-> Empty, sealed |-> Empty,
            body |-> Empty, bound |-> 1, reads |-> TRUE]
 
 \* A target with no MANIFEST (`on` says whether it has one).
-NoManifest == [on |-> FALSE, body |-> Empty, sealed |-> FALSE, want |-> Empty]
+NoManifest == [on |-> FALSE, body |-> Empty, sealed |-> FALSE, want |-> Empty, opens |-> FALSE]
+
+\* No removal of metadata waits for its sync.
+NoPend == [b \in Ids |-> Absent]
 
 \* The backup in flight when there is none.
 IdleBk == [phase |-> "idle", id |-> 1, objs |-> Empty, key |-> 1]
@@ -336,8 +375,10 @@ VARIABLES
   \* under slot t's file id.
   tgt,
   \* The restore target's MANIFEST: whether there is one (on), what it
-  \* names (body), whether it is sealed, and the tables the backup recorded
-  \* (want, a ghost).
+  \* names (body), whether it is sealed, the tables the backup recorded
+  \* (want, a ghost), and whether the provider the restore was given opens
+  \* every table it names (opens, a ghost: what the restored database's
+  \* open will find).
   tman,
   \* The restore in flight (BackupEngine::restore): its phase ("idle",
   \* "check", "copy", "refused"), the backup id, the provider, the metadata
@@ -354,7 +395,8 @@ VARIABLES
   adv,
   \* The collection in flight (collect_shared, src/backup/collect.rs), a
   \* record:
-  \*   phase   "idle"; "batch" when it takes the next batch of candidates;
+  \*   phase   "idle"; "sync" while it syncs meta/ before anything else;
+  \*           "batch" when it takes the next batch of candidates;
   \*           "walk" while that batch's walk of meta/ reads the listings;
   \*           "remove" once the walk is done; "done" once the walk of
   \*           shared/ is used up; "stopped" once a listing did not read;
@@ -368,10 +410,15 @@ VARIABLES
   \*   order   the backups' metadata files in the order this batch's walk
   \*           of meta/ hands them out (Env::read_dir; by id here);
   \*   pos     how many entries that walk has handed out so far.
-  gc
+  gc,
+  \* pend[b]: backup b's metadata file as it was before a delete or a purge
+  \* removed it, while that removal is not durable yet: meta/ has not been
+  \* synced since (Env::remove_file, then Env::sync_dir). A power cut brings
+  \* it back. Absent when nothing of b's waits for a sync.
+  pend
 
 \* Every variable, so a step that changes none of them is a stutter.
-vars == <<live, current, shared, meta, recorded, bk, tgt, tman, rs, made, restores, adv, gc>>
+vars == <<live, current, shared, meta, recorded, bk, tgt, tman, rs, made, restores, adv, gc, pend>>
 
 ----------------------------------------------------------------------------
 \* The start: an empty database under key 1, an empty pool, no backup.
@@ -404,6 +451,8 @@ Init ==
   /\ adv = 0
   \* No collection running.
   /\ gc = IdleGc
+  \* No removal waits for a sync.
+  /\ pend = NoPend
 
 ----------------------------------------------------------------------------
 \* The database's own steps.
@@ -418,7 +467,7 @@ WriteTable(t) ==
   \* The new table names the key current right now.
   /\ live' = [live EXCEPT ![t] = current]
   \* Nothing else moves.
-  /\ UNCHANGED <<current, shared, meta, recorded, bk, tgt, tman, rs, made, restores, adv, gc>>
+  /\ UNCHANGED <<current, shared, meta, recorded, bk, tgt, tman, rs, made, restores, adv, gc, pend>>
 
 \* A compaction rewrites table slot t under the current key (reseal_tables).
 Reseal(t) ==
@@ -429,7 +478,7 @@ Reseal(t) ==
   \* Now it names the current key: new bytes, a new content id.
   /\ live' = [live EXCEPT ![t] = current]
   \* Nothing else moves.
-  /\ UNCHANGED <<current, shared, meta, recorded, bk, tgt, tman, rs, made, restores, adv, gc>>
+  /\ UNCHANGED <<current, shared, meta, recorded, bk, tgt, tman, rs, made, restores, adv, gc, pend>>
 
 \* The operator rotates the provider's current key.
 Rotate ==
@@ -438,7 +487,7 @@ Rotate ==
   \* 1 becomes 2 and 2 becomes 1.
   /\ current' = 3 - current
   \* Nothing written changes.
-  /\ UNCHANGED <<live, shared, meta, recorded, bk, tgt, tman, rs, made, restores, adv, gc>>
+  /\ UNCHANGED <<live, shared, meta, recorded, bk, tgt, tman, rs, made, restores, adv, gc, pend>>
 
 ----------------------------------------------------------------------------
 \* Taking a backup (BackupEngine::create_backup).
@@ -472,7 +521,7 @@ StartBackup ==
   \* One more backup started.
   /\ made' = made + 1
   \* Nothing else moves.
-  /\ UNCHANGED <<live, current, shared, meta, recorded, tgt, tman, rs, restores, adv, gc>>
+  /\ UNCHANGED <<live, current, shared, meta, recorded, tgt, tman, rs, restores, adv, gc, pend>>
 
 \* One listed table lands in the pool, whole (ensure_shared_file).
 CopyToPool(t) ==
@@ -485,7 +534,7 @@ CopyToPool(t) ==
   \* Now the pool has it.
   /\ shared' = shared \cup {bk.objs[t]}
   \* Nothing else moves.
-  /\ UNCHANGED <<live, current, meta, recorded, bk, tgt, tman, rs, made, restores, adv, gc>>
+  /\ UNCHANGED <<live, current, meta, recorded, bk, tgt, tman, rs, made, restores, adv, gc, pend>>
 
 \* The metadata is written, whole, and the backup returns.
 WriteMeta ==
@@ -505,6 +554,9 @@ WriteMeta ==
                  bound |-> bk.id, reads |-> TRUE]]
   \* What this id now holds, for the checks.
   /\ recorded' = [recorded EXCEPT ![bk.id] = bk.objs]
+  \* The write ends with a sync of meta/ (atomic_write), which makes every
+  \* removal of metadata made before it durable too.
+  /\ pend' = NoPend
   \* The backup is done.
   /\ bk' = IdleBk
   \* Nothing else moves.
@@ -517,12 +569,15 @@ WriteMeta ==
 \* The ids whose metadata file is in meta/ right now.
 Present == {b \in Ids : meta[b].on}
 
-\* The metadata of every backup in `gone` goes, made durable, and the sweep
-\* of the pool starts. delete_backup and purge_old_backups both end here.
-\* Picture backups 1 and 2, where 2 cannot be read: deleting 1 removes its
-\* file, then the sweep finds 2 unreadable and removes no pool file, since
-\* it cannot know which ones 2 needs. Nothing from the deleted backups'
-\* own metadata is needed, so a backup that cannot be read is deleted too.
+\* The metadata of every backup in `gone` goes, not durable yet, and the
+\* collection starts with its sync of meta/. delete_backup and
+\* purge_old_backups both end here. Picture backups 1 and 2, where 2 cannot
+\* be read: deleting 1 removes its file, then the sweep finds 2 unreadable
+\* and removes no pool file, since it cannot know which ones 2 needs.
+\* Nothing from the deleted backups' own metadata is needed, so a backup that
+\* cannot be read is deleted too. A file that is already gone (a call run
+\* again after its sync failed) is not removed again, and its removal may
+\* still be waiting for a sync.
 Remove(gone) ==
   \* No backup in flight on this engine (both calls take &mut self)...
   /\ bk.phase = "idle"
@@ -532,11 +587,45 @@ Remove(gone) ==
   /\ gc.phase = "idle"
   \* Every file in `gone` is removed (one that is not there stays absent).
   /\ meta' = [b \in Ids |-> IF b \in gone THEN Absent ELSE meta[b]]
-  \* The sweep starts: the walk of shared/ will hand out every pool file,
-  \* none yet.
-  /\ gc' = [IdleGc EXCEPT !.phase = "batch", !.sorder = InOrder(shared)]
+  \* Each removal made now waits for a sync, keeping the file as it was; one
+  \* already waiting keeps waiting.
+  /\ pend' = [b \in Ids |-> IF b \in gone /\ meta[b].on THEN meta[b] ELSE pend[b]]
+  \* The collection starts with the sync of meta/; the walk of shared/ will
+  \* then hand out every pool file, none yet. SyncOnlyRemoved skips the sync
+  \* when this call removed no file, as the code did before, though a
+  \* removal an earlier call made may still wait for it.
+  /\ LET removed == \E b \in gone : meta[b].on
+         \* Whether this call syncs meta/ before it sweeps.
+         syncs == Mutant # "SyncOnlyRemoved" \/ removed
+     \* Into the sync, or straight into the sweep.
+     IN gc' = [IdleGc EXCEPT !.phase = IF syncs THEN "sync" ELSE "batch",
+                             !.sorder = InOrder(shared)]
   \* Nothing else moves.
   /\ UNCHANGED <<live, current, shared, recorded, bk, tgt, tman, rs, made, restores, adv>>
+
+\* The sync of meta/ succeeds (Env::sync_dir): every removal of metadata
+\* made so far, by this call or an earlier one, is durable now, and the
+\* sweep may start.
+SyncMeta ==
+  \* The collection is at its sync.
+  /\ gc.phase = "sync"
+  \* No removal waits any more.
+  /\ pend' = NoPend
+  \* The sweep takes its first batch next.
+  /\ gc' = [gc EXCEPT !.phase = "batch"]
+  \* Nothing else moves.
+  /\ UNCHANGED <<live, current, shared, meta, recorded, bk, tgt, tman, rs, made, restores, adv>>
+
+\* The sync of meta/ fails: the call returns the error and removes no pool
+\* file. The removals it made stay, not durable: the next delete or purge
+\* finds those files gone, and its own sync is what makes them durable.
+SyncFails ==
+  \* The collection is at its sync.
+  /\ gc.phase = "sync"
+  \* The call is over, having swept nothing.
+  /\ gc' = IdleGc
+  \* Nothing else moves: the removals still wait.
+  /\ UNCHANGED <<live, current, shared, meta, recorded, bk, tgt, tman, rs, made, restores, adv, pend>>
 
 \* The sweep takes its next batch: the next Sweep pool files the walk of
 \* shared/ hands out. The file that fills a batch is in it, so the next batch
@@ -563,7 +652,7 @@ NextBatch ==
         ELSE gc' = [gc EXCEPT !.phase = "walk", !.spos = stop, !.from = batch,
                               !.cand = batch, !.order = Ascending(Present), !.pos = 0]
   \* Nothing else moves.
-  /\ UNCHANGED <<live, current, shared, meta, recorded, bk, tgt, tman, rs, made, restores, adv>>
+  /\ UNCHANGED <<live, current, shared, meta, recorded, bk, tgt, tman, rs, made, restores, adv, pend>>
 
 \* The walk of meta/ hands out its next entry and the sweep reads that
 \* backup's listing, striking every candidate the listing names: a file a
@@ -605,7 +694,7 @@ WalkNext ==
                      \* The walk moves on, and those files stop being candidates for removal.
                      IN gc' = [gc EXCEPT !.pos = i, !.cand = @ \ names]
   \* Nothing else moves.
-  /\ UNCHANGED <<live, current, shared, meta, recorded, bk, tgt, tman, rs, made, restores, adv>>
+  /\ UNCHANGED <<live, current, shared, meta, recorded, bk, tgt, tman, rs, made, restores, adv, pend>>
 
 \* The walk of meta/ has handed out its last entry (or lost it): the sweep
 \* stops reading and turns to removing.
@@ -617,7 +706,7 @@ WalkDone ==
   \* Removal comes next.
   /\ gc' = [gc EXCEPT !.phase = "remove"]
   \* Nothing else moves.
-  /\ UNCHANGED <<live, current, shared, meta, recorded, bk, tgt, tman, rs, made, restores, adv>>
+  /\ UNCHANGED <<live, current, shared, meta, recorded, bk, tgt, tman, rs, made, restores, adv, pend>>
 
 \* Every candidate still standing is removed from the pool, and the sweep
 \* goes on to the next batch, or is done once the walk of shared/ is used
@@ -632,7 +721,7 @@ Collect ==
   \* The next batch, or the end.
   /\ gc' = [gc EXCEPT !.phase = IF gc.spos >= Len(gc.sorder) THEN "done" ELSE "batch"]
   \* Nothing else moves.
-  /\ UNCHANGED <<live, current, meta, recorded, bk, tgt, tman, rs, made, restores, adv>>
+  /\ UNCHANGED <<live, current, meta, recorded, bk, tgt, tman, rs, made, restores, adv, pend>>
 
 \* The sweep returns: done, or stopped by a listing that does not read.
 Finish ==
@@ -641,7 +730,7 @@ Finish ==
   \* The engine is free again.
   /\ gc' = IdleGc
   \* Nothing else moves.
-  /\ UNCHANGED <<live, current, shared, meta, recorded, bk, tgt, tman, rs, made, restores, adv>>
+  /\ UNCHANGED <<live, current, shared, meta, recorded, bk, tgt, tman, rs, made, restores, adv, pend>>
 
 \* delete_backup(b): backup b goes, whether or not its file reads, and even
 \* when there is no such backup, in which case only the collection runs.
@@ -655,6 +744,12 @@ Purge(keep) == Remove({b \in Present : Cardinality({c \in Present : c > b}) >= k
 ----------------------------------------------------------------------------
 \* Restoring a backup (BackupEngine::restore).
 
+\* Whether p opens every table of `body`: it has each table's key, with the
+\* bytes that sealed the table.
+TablesOpen(body, p) ==
+  \* For each slot that holds a table, its key is one p has right.
+  \A t \in Tables : body[t] # NoObj => body[t][2] \in p.has \cap p.right
+
 \* Whether provider p has everything restoring backup b from file m needs:
 \* the key the file names, the right bytes, its current key, every key a
 \* table names, and a file that is the one id b wrote, unchanged and
@@ -662,16 +757,16 @@ Purge(keep) == Remove({b \in Present : Cardinality({c \in Present : c > b}) >= k
 Entitled(m, b, p) ==
   \* The file reads: no key opens metadata that does not decode.
   /\ m.reads
-  \* A provider, with the right bytes.
+  \* A provider.
   /\ p.given
-  \* The bytes it gives are the right ones.
-  /\ p.right
-  \* The key the file names.
+  \* The key the file names...
   /\ m.key \in p.has
+  \* ...with the bytes that sealed it.
+  /\ m.key \in p.right
   \* Its own current key, which the MANIFEST is sealed under.
   /\ p.cur \in p.has
-  \* Every key a listed table names.
-  /\ \A t \in Tables : m.body[t] # NoObj => m.body[t][2] \in p.has
+  \* Every key a listed table names, with the bytes that sealed it.
+  /\ TablesOpen(m.body, p)
   \* The listing is the one the tag covers, and the file is b's own.
   /\ m.listing = m.sealed
   \* The file was written as backup b's own.
@@ -695,22 +790,30 @@ MetaOpens(m, b, p) ==
           THEN p.cur = m.key /\ p.cur \in p.has
           \* The design: it opens when the provider has the key the file names.
           ELSE m.key \in p.has
-       \* The tag holds only under the right bytes...
-       /\ p.right
+       \* The tag holds only under the bytes that sealed it...
+       /\ m.key \in p.right
        \* ...over the listing as it was sealed (ListingUnbound skips this)...
        /\ Mutant = "ListingUnbound" \/ m.listing = m.sealed
        \* ...and the id it was sealed as (IdUnbound skips this).
        /\ Mutant = "IdUnbound" \/ m.bound = b
 
 \* Whether p has its current key and every key a table names, the checks
-\* restore makes before its first write.
+\* restore makes before its first write. Each table's key is checked
+\* against the table itself, its footer's tag verified under the bytes p
+\* gives (sstable::authenticate_footer); FooterUnchecked checks only that p
+\* has the key, as restore did before.
 KeysProvided(m, p) ==
   \* No provider: nothing is sealed, nothing to provide.
   \/ ~p.given
   \* Otherwise the current key and each table's key.
   \/ /\ p.cur \in p.has
-     \* and the provider has the key of every table the backup lists.
-     /\ \A t \in Tables : m.body[t] # NoObj => m.body[t][2] \in p.has
+     \* The key of every table the backup lists: with the bytes that sealed
+     \* it, or, under FooterUnchecked, merely present.
+     /\ IF Mutant = "FooterUnchecked"
+        \* The bug: present is enough.
+        THEN \A t \in Tables : m.body[t] # NoObj => m.body[t][2] \in p.has
+        \* The design: each table's footer verifies.
+        ELSE TablesOpen(m.body, p)
 
 \* A restore of backup b with provider p starts: it reads b's metadata.
 StartRestore(b, p) ==
@@ -734,7 +837,7 @@ StartRestore(b, p) ==
   \* One more restore started.
   /\ restores' = restores + 1
   \* Nothing else moves.
-  /\ UNCHANGED <<live, current, shared, meta, recorded, bk, tgt, tman, made, adv, gc>>
+  /\ UNCHANGED <<live, current, shared, meta, recorded, bk, tgt, tman, made, adv, gc, pend>>
 
 \* Every check, before any write.
 Check ==
@@ -748,7 +851,7 @@ Check ==
      \* Go on to copy, or refuse.
      IN rs' = [rs EXCEPT !.phase = IF pass THEN "copy" ELSE "refused"]
   \* Nothing written.
-  /\ UNCHANGED <<live, current, shared, meta, recorded, bk, tgt, tman, made, restores, adv, gc>>
+  /\ UNCHANGED <<live, current, shared, meta, recorded, bk, tgt, tman, made, restores, adv, gc, pend>>
 
 \* One table is copied from the pool into the target, whole: the pool file
 \* the listing names, put at slot t's file id (copy_file_atomic).
@@ -766,7 +869,7 @@ CopyToTarget(t) ==
   \* This restore has written.
   /\ rs' = [rs EXCEPT !.wrote = TRUE]
   \* Nothing else moves.
-  /\ UNCHANGED <<live, current, shared, meta, recorded, bk, tman, made, restores, adv, gc>>
+  /\ UNCHANGED <<live, current, shared, meta, recorded, bk, tman, made, restores, adv, gc, pend>>
 
 \* The MANIFEST is written, whole, and the restore returns.
 WriteManifest ==
@@ -786,11 +889,11 @@ WriteManifest ==
      \* provider was given (plain under PlainRestore).
      ELSE /\ tman' = [on |-> TRUE, body |-> rs.m.body,
                       sealed |-> rs.p.given /\ Mutant # "PlainRestore",
-                      want |-> rs.want]
+                      want |-> rs.want, opens |-> TablesOpen(rs.m.body, rs.p)]
           \* The restore is over.
           /\ rs' = IdleRs
   \* The target's tables do not move.
-  /\ UNCHANGED <<live, current, shared, meta, recorded, bk, tgt, made, restores, adv, gc>>
+  /\ UNCHANGED <<live, current, shared, meta, recorded, bk, tgt, made, restores, adv, gc, pend>>
 
 \* A refused restore returns its error.
 EndRefusal ==
@@ -799,7 +902,7 @@ EndRefusal ==
   \* The engine is free again.
   /\ rs' = IdleRs
   \* Nothing else moves.
-  /\ UNCHANGED <<live, current, shared, meta, recorded, bk, tgt, tman, made, restores, adv, gc>>
+  /\ UNCHANGED <<live, current, shared, meta, recorded, bk, tgt, tman, made, restores, adv, gc, pend>>
 
 \* The operator removes the target, to restore into an empty one again.
 ResetTarget ==
@@ -814,26 +917,34 @@ ResetTarget ==
   \* ...and no MANIFEST.
   /\ tman' = NoManifest
   \* Nothing else moves.
-  /\ UNCHANGED <<live, current, shared, meta, recorded, bk, rs, made, restores, adv, gc>>
+  /\ UNCHANGED <<live, current, shared, meta, recorded, bk, rs, made, restores, adv, gc, pend>>
 
 ----------------------------------------------------------------------------
 \* Power cuts, the attacker, and files that stop reading.
 
 \* The power goes. Every file is whole or absent (staging name, sync,
-\* rename), so the disk keeps what it has; whatever was in flight stops.
+\* rename), so the disk keeps what it has, except a removal of metadata not
+\* synced yet, which comes back undone; whatever was in flight stops.
 Crash ==
-  \* Something was in flight.
-  /\ bk.phase # "idle" \/ rs.phase # "idle" \/ gc.phase # "idle"
+  \* Something was in flight, or a removal waits for its sync.
+  /\ \/ bk.phase # "idle" \/ rs.phase # "idle" \/ gc.phase # "idle"
+     \* (A removal of metadata waits for its sync.)
+     \/ \E b \in Ids : pend[b].on
   \* The backup stops: its pool files stay, unlisted until a later backup
   \* lists them or a delete removes them.
   /\ bk' = IdleBk
   \* The restore stops: its copies stay, with no MANIFEST after them.
   /\ rs' = IdleRs
-  \* The collection stops: the deleted metadata stays deleted, and what it
-  \* has not removed stays in the pool, listed by nobody, for the next one.
+  \* The collection stops: what it has not removed stays in the pool,
+  \* listed by nobody, for the next one.
   /\ gc' = IdleGc
-  \* The disk keeps everything.
-  /\ UNCHANGED <<live, current, shared, meta, recorded, tgt, tman, made, restores, adv>>
+  \* Every removal of metadata not synced yet is undone: the file is back,
+  \* as it was. A synced removal stays.
+  /\ meta' = [b \in Ids |-> IF pend[b].on THEN pend[b] ELSE meta[b]]
+  \* Nothing waits for a sync any more.
+  /\ pend' = NoPend
+  \* The disk keeps everything else.
+  /\ UNCHANGED <<live, current, shared, recorded, tgt, tman, made, restores, adv>>
 
 \* The attacker edits backup b's clear listing so slot t names pool file o,
 \* fixing the checksum: another backup's copy of the table, or none.
@@ -854,7 +965,7 @@ TamperListing(b, t, o) ==
   \* The attacker is done.
   /\ adv' = 1
   \* Nothing else moves.
-  /\ UNCHANGED <<live, current, shared, recorded, bk, tgt, tman, rs, made, restores, gc>>
+  /\ UNCHANGED <<live, current, shared, recorded, bk, tgt, tman, rs, made, restores, gc, pend>>
 
 \* The attacker swaps the two metadata files' names, each whole and valid.
 Swap ==
@@ -871,7 +982,7 @@ Swap ==
   \* The attacker is done.
   /\ adv' = 1
   \* Nothing else moves.
-  /\ UNCHANGED <<live, current, shared, recorded, bk, tgt, tman, rs, made, restores, gc>>
+  /\ UNCHANGED <<live, current, shared, recorded, bk, tgt, tman, rs, made, restores, gc, pend>>
 
 \* Backup b's metadata file stops reading: a bit flips on the disk, a newer
 \* build rewrites it in a format this one does not read, or the disk fails
@@ -890,7 +1001,7 @@ Damage(b) ==
   \* It happened.
   /\ adv' = 1
   \* Nothing else moves.
-  /\ UNCHANGED <<live, current, shared, recorded, bk, tgt, tman, rs, made, restores, gc>>
+  /\ UNCHANGED <<live, current, shared, recorded, bk, tgt, tman, rs, made, restores, gc, pend>>
 
 \* Every step anything can take.
 Next ==
@@ -907,6 +1018,8 @@ Next ==
   \/ \E b \in Ids : Delete(b)
   \* All but the newest `keep` backups are deleted, the same way.
   \/ \E keep \in 0..MaxBackups : Purge(keep)
+  \* The collection's sync of meta/ succeeds, or fails and ends the call.
+  \/ SyncMeta \/ SyncFails
   \* The sweep takes a batch, its walk reads the listings one entry at a
   \* time, the walk ends, the unlisted candidates go, and it returns.
   \/ NextBatch \/ WalkNext \/ WalkDone \/ Collect \/ Finish
@@ -946,6 +1059,12 @@ NoCollection == gc.phase = "idle"
 \* files, no metadata that stops reading.
 NoAttack == adv = 0
 
+\* No sync of meta/ fails: a removal of metadata waits for its sync only
+\* while the collection is at that sync. A run about another rule leaves
+\* the failure and the call run again after it out; every GREEN run keeps
+\* them.
+NoSyncFailure == gc.phase = "sync" \/ \A b \in Ids : ~pend[b].on
+
 ----------------------------------------------------------------------------
 \* Invariants.
 
@@ -971,7 +1090,7 @@ TypeOK ==
   \* The target's tables.
   /\ tgt \in [Tables -> Slot]
   \* The target's MANIFEST.
-  /\ tman \in [on : BOOLEAN, body : [Tables -> Slot], sealed : BOOLEAN,
+  /\ tman \in [on : BOOLEAN, body : [Tables -> Slot], sealed : BOOLEAN, opens : BOOLEAN,
                want : [Tables -> Slot]]
   \* The restore in flight.
   /\ rs \in [phase : {"idle", "check", "copy", "refused"}, id : Ids, p : Providers,
@@ -983,7 +1102,7 @@ TypeOK ==
   \* A file changed behind the engine's back at most once.
   /\ adv \in 0..1
   \* The collection in flight: its walks and its candidates.
-  /\ gc.phase \in {"idle", "batch", "walk", "remove", "done", "stopped"}
+  /\ gc.phase \in {"idle", "sync", "batch", "walk", "remove", "done", "stopped"}
   \* The sweep's order is a sequence of pool files.
   /\ gc.sorder \in Seq(Objs)
   \* Its position is within the pool, or one past it.
@@ -996,6 +1115,8 @@ TypeOK ==
   /\ gc.order \in Seq(Ids)
   \* Its position is within the backups, or one past them.
   /\ gc.pos \in 0..MaxBackups + 1
+  \* What waits for a sync is a metadata file or nothing, for each id.
+  /\ pend \in [Ids -> MetaType]
 
 \* No backup's metadata is plain, and no restored MANIFEST is. It rules out
 \* the PlainMeta story (backup 1's file names every table's key range in
@@ -1029,6 +1150,14 @@ FaithfulRestore ==
     \* ...and each one it names is in the target.
     /\ \A t \in Tables : tman.body[t] # NoObj => tgt[t] = tman.body[t]
 
+\* A finished restore names only tables the provider it was given opens,
+\* so the restored database opens with it. It rules out the FooterUnchecked
+\* story: backup 2's metadata opens under the right bytes for key 2, its
+\* table under key 1 is only checked to be there, and the restore writes a
+\* MANIFEST naming a table that does not open under the other bytes the
+\* provider holds for key 1.
+RestoredOpens == tman.on => tman.opens
+
 \* A refused restore wrote nothing. It rules out the CheckAfterCopy story:
 \* a provider without its current key is refused only after every table was
 \* copied into the target.
@@ -1039,8 +1168,10 @@ RefusalWritesNothing == rs.phase = "refused" => ~rs.wrote
 \* back, or a newer build read it. It rules out the GcSkipsSealed story
 \* (deleting backup 1 removes a table sealed backup 2 still lists), the
 \* GcSkipsUnreadable story (deleting backup 1 removes a table unreadable
-\* backup 2 still lists) and the MetaFirst story (a power cut after the
-\* metadata and before its tables).
+\* backup 2 still lists), the MetaFirst story (a power cut after the
+\* metadata and before its tables) and the SyncOnlyRemoved story (a delete
+\* run again after its sync failed removes backup 1's tables, and a power
+\* cut brings backup 1's metadata back).
 ListedRestores ==
   \* For every backup id b:
   \A b \in Ids :

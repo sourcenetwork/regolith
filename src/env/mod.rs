@@ -124,6 +124,11 @@ pub(crate) const PLATFORM_THREADS: bool =
 /// Paths are whatever the host understands. regolith only ever joins
 /// names onto the database directory it was given, so a backend with
 /// a flat namespace is free to treat the whole path as an opaque key.
+///
+/// One default is worth replacing in an environment of your own:
+/// [`Env::open_log`]. It is correct on any environment, and gets there by
+/// putting every write of the write-ahead log behind one lock; the method
+/// says what that costs.
 pub trait Env: Send + Sync + std::fmt::Debug {
     /// Create `path` and every missing parent. Succeeds when the
     /// directory already exists.
@@ -167,6 +172,20 @@ pub trait Env: Send + Sync + std::fmt::Debug {
     /// lock, holding a write that arrives ahead of a gap until the gap is
     /// filled. That is always correct, and it is the one place a committing
     /// thread waits for another to write.
+    ///
+    /// What the default costs: one lock covers the file.
+    /// The log writes of concurrent commits run one at a time, and a sync of
+    /// the log holds the lock for as long as the device takes, so no commit
+    /// writes its record while a sync is in flight. A write that arrives
+    /// ahead of a gap is copied and kept in memory until the gap is filled,
+    /// which is bounded by the commits in flight. A thread that finds the
+    /// lock taken parks until it is let go, inside
+    /// [`IoQueue::poll`](crate::IoQueue::poll) or
+    /// [`commit_nowait`](crate::Transaction::commit_nowait) as anywhere
+    /// else, so those calls lose their promise never to wait on another
+    /// thread. An environment that takes commits from more than one thread,
+    /// or whose callers must never block, should override this method; one
+    /// that a single thread drives loses nothing by keeping the default.
     ///
     /// No environment of this crate uses the default. Every one a database
     /// runs on has a log no write of which waits for another: [`StdEnv`]
@@ -271,23 +290,7 @@ pub trait Env: Send + Sync + std::fmt::Debug {
     /// reports [`std::io::ErrorKind::OutOfMemory`] instead of
     /// aborting the process.
     fn read(&self, path: &Path) -> io::Result<Vec<u8>> {
-        let file = self.open_read(path)?;
-        let len = usize::try_from(file.len()?).map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("{} is too large to address", path.display()),
-            )
-        })?;
-        let mut buf = Vec::new();
-        buf.try_reserve_exact(len).map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::OutOfMemory,
-                format!("cannot allocate {len} bytes to read {}", path.display()),
-            )
-        })?;
-        buf.resize(len, 0);
-        file.read_exact_at(0, &mut buf)?;
-        Ok(buf)
+        read_whole(&*self.open_read(path)?, path)
     }
 
     /// Replace the whole contents of `path`, creating it if needed.
@@ -309,6 +312,27 @@ pub trait Env: Send + Sync + std::fmt::Debug {
     fn drop_page_cache(&self, path: &Path) {
         let _ = path;
     }
+}
+
+/// Every byte of `file`, which was opened at `path`: the body of
+/// [`Env::read`], for an environment that reads through a handle of its own.
+pub(crate) fn read_whole(file: &dyn ReadFile, path: &Path) -> io::Result<Vec<u8>> {
+    let len = usize::try_from(file.len()?).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{} is too large to address", path.display()),
+        )
+    })?;
+    let mut buf = Vec::new();
+    buf.try_reserve_exact(len).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::OutOfMemory,
+            format!("cannot allocate {len} bytes to read {}", path.display()),
+        )
+    })?;
+    buf.resize(len, 0);
+    file.read_exact_at(0, &mut buf)?;
+    Ok(buf)
 }
 
 /// A file opened for reading.
@@ -478,14 +502,6 @@ pub trait LogFile: Send + Sync {
 
     /// Cut the file to exactly `len` bytes.
     fn set_len(&self, len: u64) -> io::Result<()>;
-
-    /// Length of the file in bytes, counting only what has reached the host.
-    fn len(&self) -> io::Result<u64>;
-
-    /// Whether the file holds no bytes.
-    fn is_empty(&self) -> io::Result<bool> {
-        Ok(self.len()? == 0)
-    }
 
     /// Start writing the `len` bytes at `offset`, all written already, back
     /// to the device: a hint that leaves less for the next

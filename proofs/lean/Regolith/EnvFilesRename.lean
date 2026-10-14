@@ -21,6 +21,11 @@ instead (`Shared::relocate`), in four steps, each one atomic:
 3. the Env's rename takes the file away from "A" (a second map write);
 4. record only "B".
 
+(`MemEnv::rename` first marks "A" as leaving, a map write that takes the
+file from no name, so it changes nothing a reopen sees and is left out
+here. What the mark is for, a removal or a second rename racing the move, is
+checked by `proofs/tla/EnvRename.tla`.)
+
 A reopen loads the recorded names, tries "previous" (if any), then
 "current". If neither holds the file, it loads the names again: if the move
 recorded new ones since, it tries those; if not, the file is really gone.

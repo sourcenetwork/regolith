@@ -24,18 +24,54 @@
 //! waits for this one's owner to poll its queue (`LockTable.tla`,
 //! `IsolationAtLanding`).
 //!
+//! The transaction's snapshot stays pinned until the commit lands too, and
+//! is let go by the same thread. A commit left behind a write stall has not
+//! taken its slot, so the check of what landed above its early horizon is
+//! still to come, and it reads every version above the snapshot. Unpinned,
+//! a compaction meanwhile may retire a deletion newer than the snapshot
+//! (there is no live snapshot below it), and the check would let through a
+//! commit that conflicts with it.
+//!
 //! Exactly one outcome per transaction, whichever way it ends: the commit
 //! claim is won here as `commit` wins it, and the callbacks of the outcome
 //! run once, at return for a ticket ready then, else at delivery, through the
 //! same function `commit` uses (`callbacks::Ending`).
 
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 use super::{Transaction, TransactionError, TxResult, receipt_of};
 use crate::engine::io::job::Delivery;
 use crate::engine::io::shared::QueueShared;
-use crate::engine::{NowaitCommit, PendingCommit, RegolithEngine, conclude_settled};
+use crate::engine::{NowaitCommit, PendingCommit, RegolithEngine, SnapshotPin, conclude_settled};
 use crate::{CommitReceipt, CommitTicket, Error};
+
+/// The snapshot pin of a commit that lands later, let go by whoever lands
+/// it (see the module docs).
+struct LandingSnapshot {
+    engine: Weak<RegolithEngine>,
+    /// Taken once: a `try_lock` that finds it held means the other caller is
+    /// letting it go.
+    pin: crate::sync::Mutex<SnapshotPin>,
+}
+
+impl LandingSnapshot {
+    fn release(&self) {
+        let Some(mut pin) = self.pin.try_lock() else {
+            return;
+        };
+        let pin = pin.take();
+        // A database that is gone took its snapshot registry with it.
+        if let Some(engine) = self.engine.upgrade() {
+            engine.release_snapshot(pin);
+        }
+    }
+}
+
+impl Delivery for LandingSnapshot {
+    fn deliver(&self) {
+        self.release();
+    }
+}
 
 /// How far `commit_nowait` got before it returned.
 enum Committed {
@@ -117,6 +153,36 @@ impl Transaction {
     /// Dropping the ticket never cancels the commit. Dropping the queue
     /// delivers its tickets on the dropping thread (see
     /// [`IoQueue`](crate::IoQueue)).
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use regolith::{OptimisticTransactionDb, Options, TransactionError, TxnOptions};
+    ///
+    /// let db = OptimisticTransactionDb::open("rows", Options::memory())?;
+    /// // This thread's queue: the outcomes of its commits are delivered here.
+    /// let mut queue = db.db().io_queue();
+    /// let on_queue = TxnOptions::new().io_queue(queue.id());
+    ///
+    /// let txn = db.begin(&on_queue);
+    /// txn.put(b"row", b"1")?;
+    /// let ticket = txn.commit_nowait();
+    /// // The commit is decided and written, and the call did not wait for a
+    /// // sync. `block_on` polls the queue until the ticket completes. (An
+    /// // in-memory database has no sync to wait for, so here it already has.)
+    /// let receipt = queue.block_on(ticket)?;
+    /// assert!(receipt.seq() > 0);
+    /// assert_eq!(db.db().get(b"row")?.as_deref(), Some(&b"1"[..]));
+    ///
+    /// // A lost race comes through the ticket too, never out of the call.
+    /// let (one, two) = (db.begin(&on_queue), db.begin(&on_queue));
+    /// one.put(b"row", b"one")?;
+    /// two.put(b"row", b"two")?;
+    /// let (one, two) = (one.commit_nowait(), two.commit_nowait());
+    /// assert!(queue.block_on(one).is_ok());
+    /// assert!(matches!(queue.block_on(two), Err(TransactionError::Conflict(_))));
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
     pub fn commit_nowait(mut self) -> CommitTicket {
         let engine = Arc::clone(&self.engine);
         let completion = CommitTicket::completion(Arc::downgrade(&engine));
@@ -149,6 +215,10 @@ impl Transaction {
                 scan_runs_dropped,
             } => {
                 let locks = self.take_landing_locks();
+                let snapshot = Arc::new(LandingSnapshot {
+                    engine: Arc::downgrade(&engine),
+                    pin: crate::sync::Mutex::new(self.snapshot_pin.take()),
+                });
                 self.release_resources();
                 let ending = self.ending();
                 let stats = engine.statistics_arc();
@@ -176,6 +246,9 @@ impl Transaction {
                     && !pending.listen(Arc::clone(&locks) as Arc<dyn Delivery>)
                 {
                     locks.release();
+                }
+                if !pending.listen(Arc::clone(&snapshot) as Arc<dyn Delivery>) {
+                    snapshot.release();
                 }
                 let waiter: Arc<dyn Delivery> = Arc::clone(&completion) as Arc<dyn Delivery>;
                 // Told on the queue once the commit is published. A queue
@@ -216,12 +289,15 @@ impl Transaction {
         };
         let stats = engine.statistics();
         let receipt = |outcome| receipt_of(stats, outcome, self.snapshot_seq, scan_runs_dropped);
-        if write_free {
-            return Committed::Done(receipt(engine.commit_write_free(&commit.checks)));
-        }
         // A `CacheOnly` handle never reads the device, in its commit's own
-        // validation either.
-        commit.read_queue = self.read_mode().queue();
+        // validation either, written or not.
+        let read_queue = self.read_mode().queue();
+        if write_free {
+            return Committed::Done(receipt(
+                engine.commit_write_free(&commit.checks, read_queue),
+            ));
+        }
+        commit.read_queue = read_queue;
         let Some(queue) = queue else {
             // No queue to complete on: the commit syncs inline.
             return Committed::Done(receipt(engine.commit_with_conflict_check(

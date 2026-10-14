@@ -1,8 +1,9 @@
 //! The commit path: how a write or a transaction's commit becomes durable,
 //! applied and visible.
 //!
-//! Every commit goes through the lock-free pipeline (`pipeline.rs`, plan
-//! 4.7): it takes a slot of the commit ring with one atomic add, and from
+//! Every commit that writes goes through the lock-free pipeline
+//! (`pipeline.rs`, plan 4.7): it takes a slot of the commit ring with one
+//! atomic add, and from
 //! there whichever thread reaches the slot decides it, applies it, writes
 //! its record, syncs the log and publishes it. A committer helps every
 //! commit ahead of its own and never waits for another thread to be
@@ -21,6 +22,10 @@
 //! or the step, as above, and a commit for a write stall to clear), `close`
 //! (for the commits and the background work in flight), and
 //! `wait_for_snapshots` (for the last snapshot to be released).
+//!
+//! A transaction that writes nothing takes no slot at any level: its commit
+//! is checked at the published horizon on the committing thread
+//! (`RegolithEngine::commit_write_free`, plan 3.8, E50).
 //!
 //! An optimistic transaction's commit is a slot like any write (E10). It is
 //! decided in ring order against the view, which by then holds every commit
@@ -100,6 +105,7 @@ mod turn;
 mod turn_wait;
 mod txn;
 mod write_check;
+mod write_free;
 mod write_unit;
 
 use super::wal::MAX_RECORD_LEN;
@@ -519,48 +525,6 @@ pub(crate) fn conclude_settled(
 }
 
 impl RegolithEngine {
-    /// Commit a transaction that writes nothing: check the reads it asked to
-    /// have validated, if any, and take no part in the write pipeline.
-    ///
-    /// The check runs against the newest published state and takes no slot
-    /// of the ring, so a commit decided and not yet published is not seen:
-    /// only a write at or below the sequence readers may see counts. That is a
-    /// commit point of its own, after every commit that returned before this
-    /// one began, which is all a transaction with nothing to apply needs.
-    /// A commit with no reads to check does nothing at all.
-    pub(crate) fn commit_write_free(
-        &self,
-        checks: &crate::engine::ValidationSet,
-    ) -> io::Result<CommitOutcome> {
-        self.ensure_open()?;
-        if checks.reads.is_empty() {
-            return Ok(CommitOutcome::Ok { seq: None });
-        }
-        // The view is loaded before the sequence is sampled, for the reason
-        // `get_slice_latest` gives.
-        let view = self.view.load();
-        let ceil = self.visible_seq.visible();
-        for check in &checks.reads {
-            if let Some((latest_seq, newest)) = self.latest_version_upto(&check.key, ceil, &view)?
-                && latest_seq > check.observed_seq
-                && let Some((seq, theirs)) =
-                    self.read_changed(check, (latest_seq, newest), ceil, &view)?
-            {
-                if let Some(s) = self.statistics() {
-                    s.add(Ticker::CommitConflictsOnRead, 1);
-                }
-                return Ok(CommitOutcome::Conflict(Conflict::new(
-                    check.key.clone(),
-                    check.access,
-                    theirs,
-                    check.observed_seq,
-                    seq,
-                )));
-            }
-        }
-        Ok(CommitOutcome::Ok { seq: None })
-    }
-
     /// Hand a plain write to the commit pipeline and block until it is
     /// durable and applied, or until the pipeline discards it. Returns the
     /// last sequence its operations took.
@@ -651,6 +615,12 @@ mod turn_wait_tests;
 
 #[cfg(test)]
 mod allocate_tests;
+
+#[cfg(test)]
+mod write_free_tests;
+
+#[cfg(test)]
+mod write_free_window_tests;
 
 #[cfg(test)]
 mod helping_tests;

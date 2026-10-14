@@ -28,6 +28,7 @@ use super::log_retirement::{self, RetiredLogs};
 use super::manifest::VersionEdit;
 use super::memtable::MemTable;
 use super::pending_outputs::PendingOutputs;
+use super::range_tombstone::RangeTombstoneSet;
 use super::read_view::ReadViewCell;
 use super::sstable::{LiveSst, SsTableMeta, SsTableReader, SsTableWriter, sst_filename};
 use super::version_store::VersionStore;
@@ -76,7 +77,9 @@ pub(crate) struct Flusher {
     /// memtable cap) waits for the flush in flight on its own thread
     /// ([`Flusher::flushing`]). An ordered unit a queue's poll runs may not
     /// wait: the poll takes the exclusion before the unit's body begins, or
-    /// parks ([`Flusher::hold_or_park`]).
+    /// parks ([`Flusher::hold_or_park`]). Built without spin (E48): it is
+    /// held for a whole memtable flush, table writes and syncs included, so
+    /// a caller that waits for it queues at once.
     flushing: Mutex<()>,
     /// The thread whose poll took the exclusion for a unit's body, as its
     /// thread token; zero otherwise. That thread's own calls for the
@@ -132,7 +135,7 @@ impl Flusher {
             options,
             health,
             stall_signal,
-            flushing: Mutex::new(()),
+            flushing: Mutex::new_without_spin(()),
             held_by: AtomicUsize::new(0),
             parked: Parked::new(),
         }
@@ -323,6 +326,14 @@ impl Flusher {
             self.options.keyring.as_deref(),
         )?;
 
+        // The table carries the memtable's range tombstones, so the entries
+        // they hide are counted with its deletions as they are written.
+        if !range_tombstones.is_empty() {
+            writer.hidden_by(Arc::new(RangeTombstoneSet::from_vec(
+                range_tombstones.clone(),
+            )));
+        }
+
         // Walk the memtable in internal-key order and copy every version
         // and tombstone into the SSTable unchanged, preserving MVCC.
         // The walk streams straight out of the arena: a flush holds one
@@ -377,6 +388,7 @@ impl Flusher {
                 file_size,
                 num_entries,
                 global_seq: None,
+                deletions: Some(summary.deletions),
             },
             reader,
         );

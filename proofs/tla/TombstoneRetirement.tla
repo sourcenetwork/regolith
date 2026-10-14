@@ -37,8 +37,17 @@
 \*   Retirement::carried_tombstones     src/engine/compaction/retire.rs
 \*     The range tombstones a pass writes out: all of its inputs' tombstones
 \*     but those it retires. One retires when the pass writes the deepest
-\*     level holding a key of its range and no live snapshot is below its
-\*     sequence. Never at L0.
+\*     run holding a key of its range and no live snapshot is below its
+\*     sequence. A run here is a level below L0, or one table of L0: L0 is
+\*     in age order and read newest first, so a pass that writes L0 (a
+\*     universal merge, a table rewritten in place) has the older L0 tables
+\*     it leaves out below it, like the levels (Retirement::new, `older`).
+\*   run_level_deletion_pass,           src/engine/compaction.rs
+\*   run_universal_deletion_merge
+\*     Passes picked for their deletions (D14). They retire by the rule
+\*     above and no other. One of them is new in shape: a single table
+\*     rewritten where it is, at the bottom level or as the only run of a
+\*     universal pool. Rewrite below is that pass.
 \*   Retirement::retire_deletion        src/engine/compaction/retire.rs
 \*     The same rule for a point deletion, which is a range tombstone over
 \*     its one key here, and which the engine retires only as the oldest
@@ -69,7 +78,12 @@
 \*   - Point deletions and merge operands, and dropping a put under a newer
 \*     put: StripeCompaction.tla checks those reductions. Here a pass drops
 \*     only what a tombstone covers, which is all a retirement relies on.
-\*   - L0, whose tables overlap: a pass writing L0 retires nothing.
+\*   - Which pass runs, and when: the size triggers, the deletion rule and
+\*     its turns only choose among passes. Here any pass may run at any
+\*     step, so every choice the engine can make is checked.
+\*   - Merges of more than two runs at once (a universal merge may take
+\*     several): the Lean proof takes any window of entries, newer ones
+\*     above and older ones below, and TLC shows two runs and one.
 \*   - Several concurrent passes and the capture window (E5): the passes'
 \*     inputs are disjoint, and the engine reads the live list once the
 \*     inputs are fixed (StripeCompaction.tla); here a pass is one step.
@@ -82,6 +96,16 @@
 \*                                                witness NothingRetired fails
 \*   MC_TombstoneRetirement_Red_IgnoreSnapshots   SnapshotReadsKept fails
 \*   MC_TombstoneRetirement_Red_IgnoreDeeper      SnapshotReadsKept fails
+\*   MC_TombstoneRetirement_Green_Rewrite         merges and one-run passes
+\*                                                together: reads kept
+\*   MC_TombstoneRetirement_Green_RewriteRetires  a one-run pass alone
+\*                                                retires: NothingRetired fails
+\*   MC_TombstoneRetirement_Red_RewriteIgnoreSnapshots
+\*                                                one-run passes only:
+\*                                                SnapshotReadsKept fails
+\*   MC_TombstoneRetirement_Red_RewriteIgnoreDeeper
+\*                                                one-run passes only:
+\*                                                SnapshotReadsKept fails
 
 \* Borrow the standard definitions of numbers, sequences (ordered lists) and finite sets, and TLC's
 \* Permutations.
@@ -99,7 +123,10 @@ CONSTANTS
   Readers,
   \* Which retirement rule compaction uses: "Fix" is the design; "IgnoreSnapshots" and
   \* "IgnoreDeeper" are the two planted bugs.
-  Retire
+  Retire,
+  \* Which shapes of pass may run: "Merge" is two adjacent runs into the deeper one; "Rewrite" is
+  \* one run rewritten where it is; "Both" allows either at every step.
+  Passes
 
 \* The keys are numbers, and there is at least one.
 ASSUME Keys \subseteq Nat /\ Keys # {}
@@ -107,6 +134,8 @@ ASSUME Keys \subseteq Nat /\ Keys # {}
 ASSUME MaxSeq \in Nat /\ MaxRuns \in Nat \ {0}
 \* TLC refuses a configuration that names no known rule.
 ASSUME Retire \in {"Fix", "IgnoreSnapshots", "IgnoreDeeper"}
+\* TLC refuses a configuration that names no known shape of pass.
+ASSUME Passes \in {"Merge", "Rewrite", "Both"}
 
 \* What a read of a key with no visible put returns. Puts read as their
 \* sequence, so every value is at least 1.
@@ -301,7 +330,9 @@ Flush ==
 \* window shadows and writes out every tombstone it does not retire. An
 \* output with nothing left in it is no run at all.
 Compact(i) ==
-  \* When: runs i and i + 1 both exist.
+  \* When: this configuration lets a pass merge two runs,
+  /\ Passes \in {"Merge", "Both"}
+  \* and runs i and i + 1 both exist.
   /\ i + 1 <= Len(runs)
   \* W is the window: every entry of the two runs.
   /\ LET W    == runs[i] \cup runs[i + 1]
@@ -312,6 +343,30 @@ Compact(i) ==
      \* The output replaces run i + 1 and run i disappears; an empty output removes both.
      IN /\ runs'    = Keep([runs EXCEPT ![i + 1] = out],
                            IF out = {} THEN {i, i + 1} ELSE {i}, 1)
+        \* The retired tombstones are counted.
+        /\ retired' = retired + Cardinality(gone)
+  \* Nothing else changes.
+  /\ UNCHANGED <<seq, mem, hist, live, used, snap, seen>>
+
+\* A pass rewrites run i where it is, with no other run in it: what a pass
+\* picked for its deletions does to a table of the bottom level, and to the
+\* only run of a universal pool. It drops what a tombstone of the run
+\* shadows in the run itself, and writes out every tombstone it does not
+\* retire. Everything after run i is deeper than its output.
+Rewrite(i) ==
+  \* When: this configuration lets a pass rewrite one run,
+  /\ Passes \in {"Rewrite", "Both"}
+  \* and run i exists.
+  /\ i <= Len(runs)
+  \* W is the window: every entry of the one run.
+  /\ LET W    == runs[i]
+         \* The tombstones of the run that the rule retires. A pass writing position i has the
+         \* runs from i + 1 on below it, which is what Retires asks of a pass writing (i - 1) + 1.
+         gone == {t \in W : Kind(t) = "rt" /\ Retires(i - 1, t)}
+         \* The output: every entry no tombstone shadows, without the retired tombstones.
+         out  == {e \in W : ~Shadowed(W, e)} \ gone
+     \* The output replaces run i; an empty output removes the run.
+     IN /\ runs'    = Keep([runs EXCEPT ![i] = out], IF out = {} THEN {i} ELSE {}, 1)
         \* The retired tombstones are counted.
         /\ retired' = retired + Cardinality(gone)
   \* Nothing else changes.
@@ -352,6 +407,8 @@ Next ==
   \/ Flush
   \* or a compaction pass over two adjacent runs,
   \/ \E i \in 1..MaxRuns : Compact(i)
+  \* or a compaction pass over one run alone,
+  \/ \E i \in 1..MaxRuns : Rewrite(i)
   \* or a reader takes or releases a snapshot.
   \/ \E r \in Readers : TakeSnapshot(r) \/ Release(r)
 

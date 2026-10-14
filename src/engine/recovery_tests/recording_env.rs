@@ -128,10 +128,6 @@ impl LogFile for RecordingLog {
         self.inner.set_len(len)
     }
 
-    fn len(&self) -> io::Result<u64> {
-        self.inner.len()
-    }
-
     fn start_writeback(&self, offset: u64, len: u64) {
         self.events
             .lock()

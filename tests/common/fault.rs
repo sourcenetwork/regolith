@@ -6,7 +6,8 @@
 //!
 //! 1. [`shim`] + [`child`]: a subprocess crash harness. The workload runs
 //!    in a real child process that really dies, at a kill point chosen by
-//!    meaning rather than by wall clock.
+//!    meaning rather than by wall clock. [`acks`] holds what the child was
+//!    told, in records a kill cannot cut.
 //! 2. [`power`]: power-loss simulation, which is a different failure from
 //!    a process crash and is the one that actually tests durability.
 //! 3. [`prefix`]: the valid-prefix validator, the property these tests
@@ -66,6 +67,7 @@
 
 #![allow(dead_code, unused_imports)]
 
+pub mod acks;
 pub mod bytes;
 pub mod child;
 pub mod journal;
@@ -73,6 +75,7 @@ pub mod power;
 pub mod prefix;
 pub mod shim;
 
+pub use acks::{ACK_BYTES, Acked, Acks, read_acks};
 pub use bytes::{
     copy_tree, file_len, find_manifest, find_ssts, find_wals, first_sst, flip_bit, garbage,
     newest_wal, overwrite_range, truncate_at,

@@ -240,6 +240,8 @@ impl BackupEngine {
             next_file_id,
             last_seq,
             sealed_under: sealer.as_ref().map(|s| s.id()),
+            // The database is open, so this build checked it at its open.
+            range_deletes_checked: true,
         };
         let bytes = format::encode(&manifest, id, sealer.as_ref()).map_err(Error::from)?;
         atomic_write(&*self.env, &self.meta_path(id), &bytes).map_err(Error::from)?;
@@ -295,7 +297,9 @@ impl BackupEngine {
     ///   [`Error::UnknownKey`];
     /// - metadata that does not verify under the key it names (a wrong
     ///   key, or a changed or moved byte) refuses with
-    ///   [`Error::Corruption`].
+    ///   [`Error::Corruption`], and so does a table whose footer does not
+    ///   verify under the key it names: the provider has that key, but not
+    ///   the bytes that sealed the table.
     ///
     /// Each of these refusals comes before anything is written: the target
     /// is left as it was. With a provider the MANIFEST the restore writes is
@@ -307,6 +311,10 @@ impl BackupEngine {
     /// target, so a restore that does not return `Ok` (an error, or a
     /// crash) leaves a directory that is not yet a database. Run the
     /// restore again into it before opening it.
+    ///
+    /// A backup does not carry the tables' deletion counts: the restored
+    /// database counts them again in the background once it is opened (see
+    /// [`CompactionStyle`](crate::CompactionStyle)).
     pub fn restore<P: AsRef<Path>>(
         &self,
         backup_id: BackupId,
@@ -325,11 +333,16 @@ impl BackupEngine {
         let manifest = self.read_manifest(backup_id, keyring.as_deref())?;
         // Every key the restored database needs, checked before the first
         // write as the open checks its own: the current key the MANIFEST is
-        // sealed under, and the key each table names.
+        // sealed under, and the key each table names. A table's key is
+        // checked against the table itself, by its footer's tag, so bytes
+        // that are present but not the ones that sealed it refuse here and
+        // not at the restored database's open.
         if let Some(ring) = &keyring {
             ring.current().map_err(Error::from)?;
-            for key in manifest.files.iter().filter_map(|f| f.seal_key) {
-                ring.sealer(key).map_err(Error::from)?;
+            for f in manifest.files.iter().filter(|f| f.seal_key.is_some()) {
+                let src = self.shared_dir.join(shared_filename(f.hash));
+                crate::engine::sstable::authenticate_footer(&*self.env, &src, Some(ring))
+                    .map_err(Error::from)?;
             }
         }
 
@@ -366,7 +379,9 @@ impl BackupEngine {
     /// crash copied and never listed.
     ///
     /// The deletion is durable before any shared file is removed, so a
-    /// power cut never leaves a backup that lists a removed file.
+    /// power cut never leaves a backup that lists a removed file. That holds
+    /// for a call run again after one that failed to make its deletion
+    /// durable, too: every collection syncs `meta/` first.
     ///
     /// The collection sweeps `shared/` a batch of tables at a time and, for
     /// each batch, reads every remaining listing one at a time: it holds one
@@ -414,32 +429,22 @@ impl BackupEngine {
         self.collect_shared()
     }
 
-    /// Remove the metadata of every backup in `ids`, oldest first, then sync
-    /// `meta/` once, before any shared file is removed: a removal undone by
-    /// a power cut must not bring back a backup listing a shared file that
-    /// is gone. A walk that breaks stops the removals there; the ones made
-    /// are synced all the same, and the error returned.
+    /// Remove the metadata of every backup in `ids`, oldest first. A walk
+    /// that breaks stops the removals there, and the error is returned.
+    ///
+    /// Nothing is synced here: the collection that follows syncs `meta/`
+    /// before it removes any shared file ([`BackupEngine::collect_shared`]),
+    /// which makes these removals durable, and any an earlier call made
+    /// whose own sync failed.
     fn remove_backups(&self, ids: impl IntoIterator<Item = io::Result<BackupId>>) -> Result<()> {
-        let mut removed = false;
-        let mut stopped = Ok(());
         for id in ids {
-            let removal = id.and_then(|id| match self.env.remove_file(&self.meta_path(id)) {
-                Ok(()) => {
-                    removed = true;
-                    Ok(())
-                }
-                Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
-                Err(e) => Err(e),
-            });
-            if let Err(e) = removal {
-                stopped = Err(Error::from(e));
-                break;
+            match self.env.remove_file(&self.meta_path(id?)) {
+                Ok(()) => {}
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => return Err(Error::from(e)),
             }
         }
-        if removed {
-            self.env.sync_dir(&self.meta_dir).map_err(Error::from)?;
-        }
-        stopped
+        Ok(())
     }
 
     /// Call `f` with the id of every backup in `meta/`, in the order one
@@ -638,6 +643,7 @@ fn encode_engine_manifest(
         m.next_file_id,
         m.last_seq,
         m.next_file_id,
+        m.range_deletes_checked,
         m.files.iter().map(|f| {
             (
                 f.level as usize,
@@ -648,6 +654,9 @@ fn encode_engine_manifest(
                     file_size: f.file_size,
                     num_entries: f.num_entries,
                     global_seq: f.global_seq,
+                    // Not in a backup's metadata: counted again after the
+                    // restored database opens (`compaction::census`).
+                    deletions: None,
                 },
             )
         }),
@@ -660,3 +669,6 @@ mod tests;
 
 #[cfg(test)]
 mod unreadable_tests;
+
+#[cfg(test)]
+mod sync_fault_tests;

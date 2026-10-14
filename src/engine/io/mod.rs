@@ -37,9 +37,12 @@
 //!   that starts after the mark answers `Closed`, one under way when the mark
 //!   lands releases its own unit when it ends, and one that ended before it
 //!   inserted its unit where close's sweep, which comes after the mark,
-//!   finds it. So once close returns, no unit is left in the table, and every
+//!   finds it. So once close has returned and every miss under way when it
+//!   marked the gate has ended, no unit is left in the table, and every
 //!   queue waiting on one has its completion (`NonBlocking.tla`, Release;
-//!   the loom model `no_unit_outlives_close`).
+//!   the loom model `no_unit_outlives_close`). Close does not wait for
+//!   those misses: at the instant it returns, one of them may still hold its
+//!   unit in the table, and releases it when it ends.
 //! - **A unit never waits for an open-file slot** (D60). Its reopen under
 //!   `max_open_files` sweeps the slot table once; finding every slot in use
 //!   by running reads, it parks the unit on the queue running it and the
@@ -50,6 +53,14 @@
 //!   it like any unit nobody runs; a park that comes after close's sweep sees
 //!   the mark (one read-modify-write after the park) and releases the unit
 //!   itself.
+//!
+//! - **A read run again finds what it found before.** What landed for a
+//!   queue is bounded by its bytes, but a landing a call run again still
+//!   needs is held past the bound until that run: the blocks the call read
+//!   before its wait, and the block it waited for (`io_queue::ledger`). So a
+//!   call that needs more blocks at once than the bound (a `multi_get`, a
+//!   collecting scan, a merge read) still finishes when it is run again after
+//!   each poll (`LandingHold.tla`).
 //!
 //! - **A poll waits for no other thread.** A job that needs something
 //!   another thread holds parks on its queue instead of waiting, and is
@@ -258,6 +269,29 @@ impl IoRuntime {
     /// The open queue `id` names on this database.
     pub(crate) fn queue(&self, id: QueueId) -> Option<Arc<QueueShared>> {
         self.queues.get(&id)
+    }
+
+    /// Record a timed wait on `queue`: the slot handed back is ready at the
+    /// first poll of that queue that finds its clock at `due` microseconds
+    /// or later, and only there. A queue whose owner idles is woken for the
+    /// record, once, so it learns how long it may idle
+    /// ([`crate::IoProgress::wake_in`]).
+    ///
+    /// When the queue is not open on this database, or was dropped, nothing
+    /// would ever complete the wait, so the slot comes back ready.
+    pub(crate) fn timer(&self, queue: QueueId, due: u64) -> Arc<WaitSlot> {
+        let slot = Arc::new(WaitSlot::new());
+        let recorded = self.queues.get(&queue).is_some_and(|queue| {
+            let timer = Message::Timer {
+                due,
+                slot: Arc::clone(&slot),
+            };
+            queue.deliver(timer).is_ok()
+        });
+        if !recorded {
+            slot.complete();
+        }
+        slot
     }
 
     /// Remember `id` as the calling thread's queue on this database.
@@ -485,11 +519,16 @@ impl IoRuntime {
             return Err(queue_gone());
         };
         match queue.landed(&key) {
-            Some(Landing::Ready(landed)) => return Ok(landed),
+            Some(Landing::Ready(landed)) => {
+                scope::note_hit(&queue, key);
+                return Ok(landed);
+            }
             Some(Landing::Failed(err)) => return Err(crate::Error::clone_io(&err)),
             None => {}
         }
-        let slot = Arc::new(WaitSlot::new());
+        // The call will be run again: its wait carries the landed blocks it
+        // read so far, which its queue keeps for that run.
+        let slot = Arc::new(WaitSlot::holding(scope::note_wait()));
         if !queue.admit(bytes) {
             // The queue owes its whole bound: wait for room instead of adding
             // a unit, and record the read when it is run again.

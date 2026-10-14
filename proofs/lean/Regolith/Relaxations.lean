@@ -7,7 +7,11 @@ import Regolith.Validation
 This file continues `Regolith/Validation.lean` and backs the same TLA+ model,
 `proofs/tla/RepeatableRead.tla`. Validation.lean proves that every class's
 rule gives a history serial in commit order. Here each class's declared
-relaxation is stated exactly, with the RED cases as counterexamples:
+relaxation is stated exactly, with the RED cases as counterexamples. (In the
+TLA+ model a GREEN configuration runs the rule as the engine has it and must
+break no promise in any order of events; a RED one plants one bug or misuse
+and must break the promise it names. A RED case here is the small worked
+counterexample that shows, in numbers, why that promise breaks.)
 
 * `blindMerge_commutes` (configuration `MC_DefraLevel_Green_Counters`,
   invariant `INV_IncrementsCommitUnlessReplaced`): with commuting operands, a
@@ -27,8 +31,10 @@ relaxation is stated exactly, with the RED cases as counterexamples:
   `INV_WriteFreeConsistent`): what a transaction read is the serial state at
   its snapshot, so a write-free one serializes there.
 * `exempt_decision_breaks_serial` (`MC_DefraLevel_Red_DecideOnLogRead`,
-  `MC_DefraLevel_Red_PartsNamesOther`) and `promoted_read_skew`
-  (`MC_DefraLevel_Red_WriteFreePessimistic`): the RED cases.
+  `MC_DefraLevel_Red_PartsNamesOther`), `promoted_read_skew`
+  (`MC_DefraLevel_Red_WriteFreePessimistic`) and `read_only_anomaly`
+  (`MC_Serializable_Red_ReadOnlyAnomaly`, `MC_SnapshotIsolation_Red_ReadOnlyAnomaly`):
+  the RED cases.
 
 ## The story, for a reader who has never seen the code
 
@@ -552,6 +558,70 @@ theorem promoted_read_skew :
   -- Key 1 and key 2 before the writer, and after it.
   simp [applyWrites, applyWrite, upd, demo]
 
+
+/-- The bank of the read-only anomaly (Fekete, O'Neil and O'Neil 2004), the
+worked example the TLA+ model, the Rust tests and the docs share: checking
+is key 1 and holds 30, savings is key 2 and holds 0 (absent). Built from
+`demo`, the small environment above, where every key starts absent. -/
+def bankStart : State := upd demo.init 1 30
+
+/-- The fee the withdrawal charges on the balances it saw in `σ`: 1 when
+their total is under 35, else 0. -/
+def fee (σ : State) : Nat := if σ 1 + σ 2 < 35 then 1 else 0
+
+/-- The withdrawal, decided on the state `σ` it read: checking, key 1, put
+to its balance less 25 and the fee. -/
+def withdrawal (σ : State) : List Write := [.put 1 (σ 1 - 25 - fee σ)]
+
+/-- The deposit, decided on the state `σ` it read: savings, key 2, put 20
+higher. -/
+def deposit (σ : State) : List Write := [.put 2 (σ 2 + 20)]
+
+/-- What the report reads: the state after the deposit alone, with the
+withdrawal not yet published. -/
+def afterDeposit : State := applyWrites demo bankStart (deposit bankStart)
+
+/-- The state after the withdrawal alone, run first on the starting state. -/
+def afterWithdrawal : State := applyWrites demo bankStart (withdrawal bankStart)
+
+/-- **`read_only_anomaly` (E50).** The worked example, in numbers. The
+withdrawal reads (30, 0), so it will charge the fee; the deposit commits
+savings = 20; the report reads (30, 20); the withdrawal commits checking =
+30 - 25 - 1 = 4, decided on what it read, so the history ends at (4, 20).
+
+Run one at a time, deposit then withdrawal ends at checking 5 (no fee: the
+withdrawal sees 50), not the history's state. Withdrawal then deposit ends
+at the history's state, passing through (30, 0), (4, 0) and (4, 20), none of
+which is the report's (30, 20). So a report that commits (30, 20) after the
+withdrawal claims a sheet no order of the three gives.
+
+The last line is why a report at RepeatableRead or Serializable is refused
+there: its check of checking (`.full 1`, key 1 checked by sequence),
+against the withdrawal's write, fails. `MC_Serializable_Red_ReadOnlyAnomaly`
+plants the bug of skipping that check, and
+`MC_Serializable_Red_ReadOnlyAnomalyPublishedOnly` the bug of counting only
+published writes while the withdrawal is decided and not yet visible. -/
+theorem read_only_anomaly :
+    -- The report reads checking 30 and savings 20;
+    (afterDeposit 1 = 30 ∧ afterDeposit 2 = 20) ∧
+      -- the history (the deposit, then the withdrawal decided at the start) ends at (4, 20);
+      (applyWrites demo afterDeposit (withdrawal bankStart) 1 = 4 ∧
+        applyWrites demo afterDeposit (withdrawal bankStart) 2 = 20) ∧
+      -- deposit then withdrawal, one at a time, leaves checking 5, not the history's 4;
+      applyWrites demo afterDeposit (withdrawal afterDeposit) 1 = 5 ∧
+      -- withdrawal then deposit starts at (30, 0), which is not the report's (30, 20),
+      (bankStart 1 = 30 ∧ bankStart 2 = 0) ∧
+      -- passes through (4, 0), which is not it either,
+      (afterWithdrawal 1 = 4 ∧ afterWithdrawal 2 = 0) ∧
+      -- and ends at the history's (4, 20), which is not it either;
+      (applyWrites demo afterWithdrawal (deposit afterWithdrawal) 1 = 4 ∧
+        applyWrites demo afterWithdrawal (deposit afterWithdrawal) 2 = 20) ∧
+      -- and the report's check of checking, against the withdrawal's write, fails.
+      ¬ Ok demo (.full 1) afterDeposit (withdrawal bankStart) := by
+  -- Every part is a computation on small numbers: unfold the states, the writes and the check, and
+  -- evaluate.
+  simp [afterDeposit, afterWithdrawal, bankStart, deposit, withdrawal, fee, applyWrites,
+    applyWrite, upd, demo, Ok, lastWhere, affects]
 
 /-- **`blindMerge_across_replacement`: why the blind-merge rule refuses a newer
 replacement.** With a put of key 7 between a merge's snapshot and its

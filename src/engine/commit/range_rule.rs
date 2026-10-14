@@ -6,7 +6,10 @@
 //! one it walked past. The check asks every source of the view for an entry of
 //! the range above the snapshot. It never merges sources or reads a value, but
 //! it does read every block of the range, so it costs about one more scan of
-//! it, under the write pipeline.
+//! it. That scan runs on the committing thread ahead of the pipeline, up to
+//! a sampled horizon; deciding the slot asks only the memtables for what
+//! landed above it, and the tables too only when one took a newer sequence
+//! since or the horizon's check was left open (`early.rs`, `txn.rs`).
 //
 // vertexia: a table keeps no sequence range, so every table that overlaps the
 // range is read. Recording each table's newest sequence in the manifest would
@@ -32,17 +35,21 @@ impl RegolithEngine {
         floor: u64,
         view: &ReadView,
     ) -> io::Result<Option<(Vec<u8>, u64, WriteKind)>> {
-        self.written_in_range_of(lo, hi, floor, view, false)
+        self.written_in_range_of(lo, hi, floor, u64::MAX, view, false)
     }
 
-    /// [`Self::written_in_range`], asking only the memtables when
-    /// `memtables_only` is set: exact when no table holds a sequence above
-    /// `floor` (see `early.rs`).
+    /// [`Self::written_in_range`] among the writes at or below `ceil` in the
+    /// memtables, asking only the memtables when `memtables_only` is set:
+    /// exact when no table holds a sequence above `floor` (see `early.rs`).
+    /// The tables are asked unbounded: a caller with a `ceil` below
+    /// `u64::MAX` asks only when no table holds a sequence above it
+    /// (`write_free.rs`).
     pub(super) fn written_in_range_of(
         &self,
         lo: &[u8],
         hi: &[u8],
         floor: u64,
+        ceil: u64,
         view: &ReadView,
         memtables_only: bool,
     ) -> io::Result<Option<(Vec<u8>, u64, WriteKind)>> {
@@ -50,10 +57,10 @@ impl RegolithEngine {
             return Ok(None);
         }
         for mt in std::iter::once(&view.active).chain(view.frozen.iter().rev()) {
-            if let Some((key, seq, value_type)) = mt.newer_in_range(lo, hi, floor) {
+            if let Some((key, seq, value_type)) = mt.newer_in_range(lo, hi, floor, ceil) {
                 return Ok(Some((key, seq, write_kind(value_type))));
             }
-            if let Some((key, seq)) = mt.newer_range_tombstone(lo, hi, floor) {
+            if let Some((key, seq)) = mt.newer_range_tombstone(lo, hi, floor, ceil) {
                 return Ok(Some((key, seq, WriteKind::RangeDelete)));
             }
         }
@@ -164,8 +171,10 @@ mod tests {
         // Each case opens a database, so far fewer than the default 256.
         #![proptest_config(ProptestConfig::with_cases(96))]
 
-        /// A range holds a newer write exactly when the write log says one
-        /// landed inside it, and the write named is one that did.
+        /// A range holds a newer write, at or below a ceiling at or above every
+        /// sequence a table holds, exactly when the write log says one landed
+        /// inside it between the floor and the ceiling, and the write named is
+        /// one that did.
         #[test]
         fn a_range_reports_a_write_exactly_when_one_landed_in_it(
             ops in proptest::collection::vec(op(), 0..40),
@@ -208,13 +217,22 @@ mod tests {
                 for hi in lo..=KEYS.len() {
                     // The end of the key space is "just past the last key".
                     let hi_key = if hi == KEYS.len() { prefix_key(DEFAULT_CF_ID, b"g") } else { key_of(hi) };
+                    // No ceiling, then every ceiling the contract allows: at or
+                    // above the newest sequence a table holds.
+                    let ceilings = std::iter::once(u64::MAX)
+                        .chain(view.version.last_seq..=db.latest_sequence() + 1);
+                    for ceil in ceilings {
                     for floor in 0..=db.latest_sequence() + 1 {
                         let found = engine
-                            .written_in_range(&key_of(lo), &hi_key, floor, &view)
+                            .written_in_range_of(&key_of(lo), &hi_key, floor, ceil, &view, false)
                             .unwrap();
-                        let landed = |seq: u64, op: &Op| seq > floor && op.lands_in(lo, hi);
+                        let landed = |seq: u64, op: &Op| {
+                            seq > floor && seq <= ceil && op.lands_in(lo, hi)
+                        };
                         let any = lo < hi && log.iter().any(|(seq, op)| landed(*seq, op));
-                        prop_assert_eq!(found.is_some(), any, "[{}, {}) above {}", lo, hi, floor);
+                        prop_assert_eq!(
+                            found.is_some(), any, "[{}, {}) in ({}, {}]", lo, hi, floor, ceil
+                        );
                         if let Some((key, seq, kind)) = found {
                             let named = log.iter().any(|(s, op)| {
                                 landed(*s, op) && *s == seq && op.kind() == kind
@@ -225,6 +243,7 @@ mod tests {
                                 "the key named lies inside the range"
                             );
                         }
+                    }
                     }
                 }
             }

@@ -31,12 +31,16 @@ impl crate::MergeOperator for Concat {
 }
 
 fn open() -> (TempDir, Arc<RegolithEngine>) {
+    open_with(EngineOptions::default())
+}
+
+fn open_with(options: EngineOptions) -> (TempDir, Arc<RegolithEngine>) {
     let dir = TempDir::new().unwrap();
     let engine = RegolithEngine::open(
         dir.path(),
         EngineOptions {
             merge_operator: Some(Arc::new(Concat)),
-            ..EngineOptions::default()
+            ..options
         },
     )
     .unwrap();
@@ -311,8 +315,12 @@ proptest! {
                 apply(engine, s);
             }
         }
-        let snapshot = split.snapshot_seq();
-        prop_assert_eq!(snapshot, whole.snapshot_seq());
+        // Pinned, as a transaction pins the snapshot it validates against:
+        // a compaction on the worker keeps every version above it, a
+        // deletion included, until both commits are decided.
+        let (snapshot, split_pin) = split.register_snapshot_at_horizon();
+        let (whole_snapshot, whole_pin) = whole.register_snapshot_at_horizon();
+        prop_assert_eq!(snapshot, whole_snapshot);
         for engine in [&split, &whole] {
             for s in &until_horizon {
                 apply(engine, s);
@@ -332,12 +340,96 @@ proptest! {
         // Every write has landed: the check at the horizon sees them all and
         // nothing lands above it, so this is one check of every version.
         let (whole_outcome, _) = split_commit(&whole, checks, ops, || {});
+        split.release_snapshot(split_pin);
+        whole.release_snapshot(whole_pin);
         match (&split_outcome, &whole_outcome) {
             (Outcome::Lost { .. }, Outcome::Lost { .. }) if settled_early => {}
             _ => prop_assert_eq!(&split_outcome, &whole_outcome),
         }
         prop_assert_eq!(read_all(&split), read_all(&whole));
     }
+}
+
+/// What made the property test above disagree with itself: it took its
+/// snapshot without pinning it, and the engine's worker raced it. A table
+/// that holds one deletion and nothing else is mostly dead, so a pass picked
+/// for its deletions compacts it; with no snapshot pinned below the deletion
+/// that pass retires it, and a check against the unpinned snapshot then
+/// finds no newer version of the key. Which engine the worker reached
+/// first decided the outcome. A transaction pins its snapshot from `begin`
+/// until its commit is decided, and with the pin the deletion stays and the
+/// check conflicts. Run here without a worker, one pass at a time.
+#[test]
+fn a_deletion_newer_than_a_pinned_snapshot_stays_for_the_check() {
+    let quiet = || EngineOptions {
+        max_background_compactions: 0,
+        ..EngineOptions::default()
+    };
+    let entries = |engine: &RegolithEngine| {
+        engine
+            .current_version()
+            .levels
+            .iter()
+            .flatten()
+            .map(|t| t.meta.num_entries)
+            .sum::<u64>()
+    };
+    let read_of_b = |snapshot| ValidationSet {
+        reads: vec![ConflictKey {
+            key: key_of(b"b"),
+            observed_seq: snapshot,
+            found: false,
+            access: Access::Read,
+            rule: ReadRule::Seq,
+        }],
+        writes_at: None,
+        blind_merges_commute: false,
+        exempt: Vec::new(),
+        ranges: Vec::new(),
+    };
+
+    // Nothing pinned: the pass runs and the deletion leaves the tree.
+    let (_dir, engine) = open_with(quiet());
+    apply(&engine, &Step::Delete(1));
+    apply(&engine, &Step::Flush);
+    assert_eq!(entries(&engine), 1);
+    assert_eq!(
+        engine.run_one_compaction_pass().unwrap(),
+        crate::CompactionOutcome::DidWork
+    );
+    assert_eq!(entries(&engine), 0, "the deletion retired");
+
+    // Pinned below the deletion: no pass is picked for it, a compaction of
+    // the whole range keeps it, and the check sees it.
+    let (_dir, engine) = open_with(quiet());
+    let (snapshot, pin) = engine.register_snapshot_at_horizon();
+    apply(&engine, &Step::Delete(1));
+    apply(&engine, &Step::Flush);
+    assert_eq!(
+        engine.run_one_compaction_pass().unwrap(),
+        crate::CompactionOutcome::Idle
+    );
+    engine
+        .start_foreground(crate::engine::Work::CompactRange {
+            lower: key_of(b"a"),
+            upper: key_of(b"z"),
+        })
+        .wait()
+        .unwrap();
+    assert!(engine.current_version().levels[0].is_empty(), "compacted");
+    assert_eq!(
+        entries(&engine),
+        1,
+        "the pinned snapshot keeps the deletion"
+    );
+    match engine.check_early(&read_of_b(snapshot), &[]).unwrap() {
+        EarlyVerdict::Conflict(conflict) => {
+            assert_eq!(conflict.key(), key_of(b"b").as_slice());
+            assert_eq!(conflict.latest_seq(), snapshot + 1);
+        }
+        EarlyVerdict::Marks(_) => panic!("the check missed the deletion of b"),
+    }
+    engine.release_snapshot(pin);
 }
 
 /// A commit the check at the horizon settles never enters the pipeline: it

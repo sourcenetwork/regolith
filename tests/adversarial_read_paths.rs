@@ -7,6 +7,7 @@
 //! every surface agree with the model and with each other, across the
 //! memtable, frozen memtables and every SSTable level, with range
 //! tombstones and snapshots in the mix.
+#![cfg(not(target_arch = "wasm32"))]
 
 use std::collections::BTreeMap;
 use std::ops::Bound;

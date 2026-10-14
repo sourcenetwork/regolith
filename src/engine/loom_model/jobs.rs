@@ -124,17 +124,33 @@ pub fn every_member_queue_gets_one_completion() {
 
 /// A ticket's `on_complete` registered on one thread races the delivery of
 /// the outcome on the queue's thread: the callback runs exactly once, with
-/// the outcome, whichever side gets there first.
+/// the outcome, whichever side gets there first. It runs on the registering
+/// thread only once the ticket is ready, and on the delivering thread only
+/// before: the public contract. The witness is the registering thread
+/// running it, which needs the delivery to have closed the list first.
 pub fn a_ticket_callback_runs_exactly_once() {
     explore("a_ticket_callback_runs_exactly_once", 4, 1, |witness| {
         let completion: StdArc<Completion<u32>> = Completion::new(StdWeak::new(), "on_complete");
         let ran = Arc::new(AtomicUsize::new(0));
+        // What the callback saw. Recorded and checked after the join: a
+        // panic inside a callback is caught and reported, not propagated.
+        let (on_registrar, saw_ready) = (
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+        );
         let registrar = {
             let (completion, ran) = (StdArc::clone(&completion), Arc::clone(&ran));
+            let (on_registrar, saw_ready) = (Arc::clone(&on_registrar), Arc::clone(&saw_ready));
             thread::spawn(move || {
+                let me = thread::current().id();
+                let ticket = StdArc::downgrade(&completion);
                 completion.on_complete(Box::new(move |outcome| {
-                    assert_eq!(*outcome, 7);
-                    ran.fetch_add(1, Ordering::SeqCst);
+                    let ready = ticket.upgrade().is_some_and(|ticket| ticket.is_ready());
+                    on_registrar.store(thread::current().id() == me, Ordering::SeqCst);
+                    saw_ready.store(ready, Ordering::SeqCst);
+                    if *outcome == 7 {
+                        ran.fetch_add(1, Ordering::SeqCst);
+                    }
                 }));
             })
         };
@@ -143,7 +159,16 @@ pub fn a_ticket_callback_runs_exactly_once() {
         registrar.join().expect("registrar");
         assert_eq!(ran.load(Ordering::SeqCst), 1, "the callback ran once");
         assert!(completion.is_ready());
-        witness.record();
+        let here = on_registrar.load(Ordering::SeqCst);
+        assert_eq!(
+            here,
+            saw_ready.load(Ordering::SeqCst),
+            "a callback ran on the registering thread before the ticket was ready, \
+             or on the delivering thread after"
+        );
+        if here {
+            witness.record();
+        }
     });
 }
 
@@ -178,6 +203,38 @@ pub fn calibration_a_job_claimed_without_a_cas_runs_twice() {
             }
             other.join().expect("other");
             assert_eq!(runs.load(Ordering::SeqCst), 1, "the group synced twice");
+        },
+    );
+}
+
+/// Calibration: a delivery that closes the callback list when it first takes
+/// it, and marks the ticket ready only after running what it took, refuses a
+/// registration in between, and the refused callback runs on the
+/// registering thread while the ticket is not ready yet.
+pub fn calibration_a_list_closed_before_readiness_runs_a_callback_early() {
+    explore(
+        "calibration_a_list_closed_before_readiness_runs_a_callback_early",
+        1,
+        0,
+        |_| {
+            let ready = Arc::new(AtomicBool::new(false));
+            let callbacks: StdArc<Stack<usize>> = StdArc::new(Stack::new());
+            let registrar = {
+                let (ready, callbacks) = (Arc::clone(&ready), StdArc::clone(&callbacks));
+                thread::spawn(move || {
+                    if !ready.load(Ordering::SeqCst) && callbacks.push(1, SHUT).is_err() {
+                        // Refused: the callback runs here, now.
+                        assert!(
+                            ready.load(Ordering::SeqCst),
+                            "a callback ran on the registering thread before the ticket was ready"
+                        );
+                    }
+                })
+            };
+            // The bug: close on the first take, mark ready after running.
+            for _ in callbacks.take(SHUT) {}
+            ready.store(true, Ordering::SeqCst);
+            registrar.join().expect("registrar");
         },
     );
 }

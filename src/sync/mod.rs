@@ -12,7 +12,21 @@
 //!
 //! - **No runtime.** A contended acquire queues a waiter, registers the
 //!   caller's `Waker` and returns `Pending`. What a wake does belongs to
-//!   the caller's executor.
+//!   the caller's executor. Within one poll, a contended acquire of a lock
+//!   or a semaphore may first spin for a short while (up to the lock's
+//!   spin budget, a count of pause instructions it adapts to how long holds
+//!   last, about 5 microseconds at most on the cores it was tuned on):
+//!   before it queues, and again after a retry it lost. The spin makes no
+//!   system call, reads no clock, and ends in the same queueing or the same
+//!   `Pending` as before. Locks whose holders keep them across long waits
+//!   of their own do not spin, and their contended callers queue at once:
+//!   the transaction lock table, the once-cell's initializer turn, the
+//!   bounded channel's send slots, and, in the engine, the compaction gate
+//!   (held for a pass, a job or a checkpoint copy), the flush exclusion
+//!   (held for a memtable flush), the close lock (held for a whole close)
+//!   and the serial log's lock (held across an append's device calls). The
+//!   engine's census and a late commit's snapshot pin are only ever tried,
+//!   never waited for, so they never spin either.
 //! - **Fast under contention.** The locks and the semaphore let a caller
 //!   take what is free even while others wait, so a release never waits
 //!   for a suspended task to run: the thread that released takes the lock
@@ -108,6 +122,7 @@ mod reentrant_mutex;
 mod reentrant_rwlock;
 mod rwlock;
 mod semaphore;
+mod spin;
 #[cfg(all(test, not(loom)))]
 pub(crate) mod test_support;
 mod waiter;
@@ -123,6 +138,8 @@ pub use lazy::Lazy;
 pub use mutex::{Lock, LockOwned, Mutex, MutexGuard, OwnedMutexGuard};
 pub use notify::{Notified, Notify};
 pub use once_cell::OnceCell;
+#[cfg(test)]
+pub(crate) use owned_lock::between_take_and_grant;
 pub(crate) use owned_lock::{OwnedLock, OwnedWait, OwnerId, TryLock};
 pub use owner::{Owner, ThreadOwner};
 pub use reentrant_mutex::{ReentrantMutex, ReentrantMutexGuard, ReentrantMutexLock};
@@ -190,9 +207,14 @@ mod tests {
         send_sync::<BoundedReceiver<u8>>();
         // An owner moves with its task but is never shared (see `Owner`).
         send::<Owner>();
+        // A value that may be shared but not moved: the upgradable read
+        // can still be shared, and its doc test pins that it cannot move.
+        sync::<RwLockUpgradableReadGuard<'static, Option<std::sync::MutexGuard<'static, ()>>>>();
     }
 
     fn send<T: Send>() {}
+
+    fn sync<T: Sync>() {}
 
     #[test]
     fn async_entry_points_return_send_and_sync_futures() {

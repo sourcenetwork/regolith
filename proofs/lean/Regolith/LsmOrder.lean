@@ -1,5 +1,5 @@
 /-!
-# LsmOrder: the read order of the LSM tree, the L0 closure rule, flush order, ingest placement, overlap demotion, binary search
+# LsmOrder: the read order of the LSM tree, the L0 closure rule, flush order, ingest placement, a merge inside L0, overlap demotion, binary search
 
 ## The story, for a reader who has never seen the code
 
@@ -19,7 +19,8 @@ database went back in time.
 What is proved here: as long as every layer is "newer" than every layer
 read after it, a read returns the newest version its snapshot may see; and
 each step that moves data between layers (a write, a flush, a compaction
-of a well-chosen set of files, an ingest, a demotion) keeps that order.
+of a well-chosen set of files, an ingest, a merge of L0 files that lie next
+to one another, a demotion) keeps that order.
 The bad ways of doing each step are shown as small counterexamples.
 
 ## Which model this backs
@@ -31,7 +32,9 @@ closed input set (`l0_inputs`, src/engine/compaction.rs). The same model's
 flush order, ingest placement, overlap demotion (E14, D13) and binary
 search configurations (`MC_LsmOrder_*_Flush*`, `*_Ingest*`, `*_Demote*`,
 `*_NoDemotion`, and the invariant `BisectIsScan`) are backed by items 6 to
-9 below. `BatchRead.tla` (one view per batch read, E6) is backed by
+9 below, and its universal merge configurations
+(`MC_LsmOrder_Green_L0Merge`, `MC_LsmOrder_Red_L0MergeGap`, defect E38) by
+item 10. `BatchRead.tla` (one view per batch read, E6) is backed by
 `Regolith/BatchView.lean`, which builds on the reads defined here.
 
 TLC checks the model for a few keys and versions. The theorems here hold
@@ -78,6 +81,11 @@ What is proved, in plain words:
 9. `bsearch_eq_scan` and `level_read_bsearch`: on a level in key order
    whose tables do not overlap, binary search finds the table a linear scan
    finds, and reads what a linear read of the level reads.
+10. `merge_window_ordered` and `merge_window_reads_newest`: merging L0
+   files that lie next to one another into one file, put where they were,
+   keeps the sources ordered and changes no read;
+   `merge_gapped_breaks_reads` is the RED case (defect E38) of a merge that
+   leaves out a file lying between the files it takes.
 
 How to read the Lean: `def` defines a function or a property, `theorem`
 states a fact and its proof follows `:= by`. Lines starting with `--` are
@@ -1739,6 +1747,155 @@ theorem ingest_below_holder_breaks_reads :
   -- Both reads are small computations: compute them.
   decide
 
+/-! ## A merge inside L0 (E38)
+
+The story. Under universal compaction nothing leaves L0: a merge takes some
+L0 files, writes their versions as one file, and puts that file in L0 in
+the place of the oldest file it took (`perform_compaction_to` with source
+and target level 0, src/engine/compaction.rs). In the read order that is:
+some sources `pre` read first (the memtables and the newer L0 files, a file
+flushed while the merge ran among them), then the files merged, `win`, then
+the sources `post` read after them (the older L0 files and the deeper
+levels). The merged file is `win.flatten`: every version of every file
+merged.
+
+What can go wrong: key 1 is in three L0 files, at sequence 3 in the newest,
+2 in the middle one, 1 in the oldest. A merge that takes the newest and the
+oldest and leaves the middle one out puts sequence 3 below sequence 2, and
+the read of key 1 goes back from 3 to 2. The engine picked like that when
+it took the order of file ids for the order of L0 (E38): a merge's output
+draws its id late and takes its oldest input's place, so a file flushed
+while the merge ran has the smaller id and the newer place. It now takes
+the files in the order L0 lists them, so the files merged lie next to one
+another (`pick_and_run_universal`). The theorems below show a merge of
+neighbours keeps the order and changes no read, for any number of files,
+keys and versions, and the merge with a file left out breaking one. The
+TLA+ configurations `MC_LsmOrder_Green_L0Merge` and
+`MC_LsmOrder_Red_L0MergeGap` check the same over interleavings. -/
+
+/-- The merged file holds exactly the versions the files merged held, so
+the read order after the merge holds exactly the versions the read order
+before it held. -/
+theorem merge_window_same_versions (pre win post : List Source) (v : Version) :
+    -- The statement: a version is held after the merge exactly when it was held before.
+    Holds (pre ++ win.flatten :: post) v ↔ Holds (pre ++ win ++ post) v := by
+  -- "Held" means: some source of the list holds it.
+  unfold Holds
+  -- Two directions to show.
+  constructor
+  -- Held after the merge, so held before: take the source `src` that holds v after.
+  · rintro ⟨src, hsrc, hv⟩
+    -- That source is read before the merged file, or is the merged file or one read after it.
+    rcases List.mem_append.mp hsrc with hpre | hrest
+    -- Read before: it was there before the merge too.
+    · exact ⟨src, List.mem_append_left _ (List.mem_append_left _ hpre), hv⟩
+    -- Otherwise it is the merged file, or a source read after it.
+    · rcases List.mem_cons.mp hrest with rfl | hpost
+      -- The merged file: v comes from one of the files merged, call it `w`,
+      · obtain ⟨w, hw, hvw⟩ := List.mem_flatten.mp hv
+        -- and that file held v before the merge.
+        exact ⟨w, List.mem_append_left _ (List.mem_append_right _ hw), hvw⟩
+      -- A source read after: it was there before the merge too.
+      · exact ⟨src, List.mem_append_right _ hpost, hv⟩
+  -- Held before the merge, so held after: take the source `src` that held v before.
+  · rintro ⟨src, hsrc, hv⟩
+    -- That source was read before the older sources, or is one of them.
+    rcases List.mem_append.mp hsrc with hpw | hpost
+    -- Read before them: it is read before the files merged, or is one of the files merged.
+    · rcases List.mem_append.mp hpw with hpre | hw
+      -- Read before the files merged: it is still there.
+      · exact ⟨src, List.mem_append_left _ hpre, hv⟩
+      -- One of the files merged: the merged file holds v.
+      · exact ⟨win.flatten, List.mem_append_right _ List.mem_cons_self,
+          List.mem_flatten.mpr ⟨src, hw, hv⟩⟩
+    -- One of the older sources: it is still there.
+    · exact ⟨src, List.mem_append_right _ (List.mem_cons_of_mem _ hpost), hv⟩
+
+/-- **`merge_window_ordered`.** Merge the files `win`, which lie next to
+one another in the read order, into one file put where they were. If the
+read order was ordered, it still is: the merged file is older than
+everything that was read before every file merged, and newer than
+everything that was read after every one of them. -/
+theorem merge_window_ordered {pre win post : List Source}
+    -- The read order before the merge is ordered.
+    (hord : Ordered (pre ++ win ++ post)) :
+    -- The statement: with the merged file in the place of the files merged, the read order is
+    -- ordered.
+    Ordered (pre ++ win.flatten :: post) := by
+  -- Unfold "ordered" to "pairwise newer", in the assumption and the goal.
+  unfold Ordered at *
+  -- Read the order before the merge as: pre, then "the files merged followed by post".
+  rw [List.append_assoc] at hord
+  -- Split "pairwise" over "pre followed by the rest", on both.
+  rw [List.pairwise_append] at hord ⊢
+  -- Name the three facts: pre is ordered, "the files merged, then post" is ordered, and every
+  -- source of pre is newer than every source after it.
+  obtain ⟨hp, hwp, hpre⟩ := hord
+  -- Split "pairwise" once more, over "the files merged, followed by post".
+  rw [List.pairwise_append] at hwp
+  -- Name what that gives: post is ordered, and every file merged is newer than every source of
+  -- post. (The order among the files merged is not needed.)
+  obtain ⟨_, hq, hwq⟩ := hwp
+  -- pre is ordered as before; two things are left: the merged file against post, and pre against
+  -- "the merged file, then post".
+  refine ⟨hp, List.Pairwise.cons ?_ hq, ?_⟩
+  -- The merged file is newer than every source after it.
+  ·
+    -- Take a source b after it, and versions (k, s) of the merged file and (k, t) of b.
+    intro b hb k s t hs ht
+    -- (k, s) comes from one of the files merged, call it `src`,
+    obtain ⟨src, hsrc, hin⟩ := List.mem_flatten.mp hs
+    -- and that file was newer than b before the merge.
+    exact hwq src hsrc b hb k s t hin ht
+  -- A source before the merged file is newer than it and than every source after it.
+  ·
+    -- Take a source a of pre, and a source b among "the merged file, then post".
+    intro a ha b hb
+    -- b is the merged file, or b is in post.
+    rcases List.mem_cons.mp hb with rfl | hb'
+    -- The merged file: take versions (k, s) of a and (k, t) of the merged file.
+    · intro k s t hs ht
+      -- (k, t) comes from one of the files merged, call it `src`,
+      obtain ⟨src, hsrc, hin⟩ := List.mem_flatten.mp ht
+      -- and a was newer than that file before the merge.
+      exact hpre a ha src (List.mem_append_left _ hsrc) k s t hs hin
+    -- In post: a was newer than b before.
+    · exact hpre a ha b (List.mem_append_right _ hb')
+
+/-- **`merge_window_reads_newest`.** After a merge of files that lie next
+to one another, every read of every key at every snapshot answers what it
+answered before the merge: by `read_newest`, the newest visible version. -/
+theorem merge_window_reads_newest {pre win post : List Source}
+    -- The read order before the merge is ordered.
+    (hord : Ordered (pre ++ win ++ post))
+    -- (for any key and snapshot)
+    (k snap : Nat) :
+    -- The statement: the read after the merge equals the read before it.
+    read (pre ++ win.flatten :: post) k snap = read (pre ++ win ++ post) k snap :=
+  -- Both read orders are ordered,
+  read_eq_of_same_versions (merge_window_ordered hord) hord
+    -- and they hold the same versions: so they read the same.
+    (merge_window_same_versions pre win post) k snap
+
+/-- **`merge_gapped_breaks_reads`.** Three L0 files hold key 1: the newest
+at sequence 3, the middle one at 2, the oldest at 1. The read order is
+ordered and the read of key 1 answers 3. A merge that takes the newest and
+the oldest file and leaves the middle one out puts its file in the oldest
+one's place, behind the middle file: the read answers 2. This is defect
+E38 and the TLA+ configuration `MC_LsmOrder_Red_L0MergeGap`. -/
+theorem merge_gapped_breaks_reads :
+    -- Before the merge the three files are ordered,
+    Ordered [[(1, 3)], [(1, 2)], [(1, 1)]] ∧
+    -- and the read of key 1 finds 3 in the newest file.
+    read [[(1, 3)], [(1, 2)], [(1, 1)]] 1 10 = some 3 ∧
+    -- After the merge of the newest and the oldest file, the middle file is asked first and
+    -- answers 2.
+    read [[(1, 2)], [(1, 3)] ++ [(1, 1)]] 1 10 = some 2 := by
+  -- Unfold "ordered" to "pairwise newer", which Lean can compute on these lists.
+  unfold Ordered
+  -- Concrete lists: evaluate the comparison and both reads.
+  decide
+
 /-! ## Demotion of an overlapping level at open (E14, D13)
 
 A tree's read order is its memtables, its L0 files newest first, then each
@@ -1750,9 +1907,12 @@ answers what reading the one table binary search finds answers
 search; the TLA+ configuration `MC_LsmOrder_Red_NoDemotion` shows the read
 it gets wrong.
 
-The engine on this branch still refuses such a database at open
-(`Version::find_overlap`, src/engine/manifest.rs); the demotion proved
-correct here is the plan's rule (D13), ahead of the code. -/
+The engine demotes while it replays the manifest (`Repair::prepare`,
+src/engine/manifest/legacy_overlap.rs): every level from 1 down to the
+deepest overlapping one goes to the old end of L0, level after level, each
+level's tables in the order the manifest lists them. Range tombstones are
+not part of this file: what the open does with those of the tables it
+moves is `Regolith/RangeDelete.lean`. -/
 
 /-- The flat read order of a tree. -/
 def treeOrder (mems l0 : List Source) (levels : List (List Source)) : List Source :=
@@ -1760,8 +1920,9 @@ def treeOrder (mems l0 : List Source) (levels : List (List Source)) : List Sourc
   mems ++ l0 ++ levels.flatten
 
 /-- The L0 files after the open demotes levels `1..d`: the old L0 files,
-then those levels' tables, level by level, each level in the order given
-(age order: newest first). -/
+then those levels' tables, level by level, each level in the order given.
+The engine takes a level's tables in the order the manifest lists them;
+`noShared_level_ordered` below is why any order of one level will do. -/
 def demoteL0 (d : Nat) (l0 : List Source) (levels : List (List Source)) : List Source :=
   -- The old L0 files, then the tables of the first d levels, level after level.
   l0 ++ (levels.take d).flatten
