@@ -552,7 +552,9 @@ pub(crate) struct RegolithEngine {
     /// One close at a time; a second caller waits for the first and then
     /// reads what it left in `close_state`. A [`crate::sync::Mutex`], so no
     /// thread sleeps in the kernel on it: close is a call that chose to
-    /// block, and waits on its own thread.
+    /// block, and waits on its own thread. Built without spin (E48): a close
+    /// holds it for the whole close, flushes and syncs included, so a second
+    /// close queues at once.
     close_lock: crate::sync::Mutex<()>,
     /// Transactions that `close` must abort. See `open_transactions`.
     open_transactions: open_transactions::OpenTransactions,
@@ -868,7 +870,7 @@ impl RegolithEngine {
             cache,
             visible_seq: ReadHorizon::new(latest_seq),
             close_state: AtomicU8::new(CLOSE_STATE_OPEN),
-            close_lock: crate::sync::Mutex::new(()),
+            close_lock: crate::sync::Mutex::new_without_spin(()),
             open_transactions: open_transactions::OpenTransactions::new(),
             wal_id: AtomicU64::new(wal_id),
             sst_dir,
@@ -1054,7 +1056,7 @@ impl RegolithEngine {
             cache,
             visible_seq: ReadHorizon::new(latest_seq),
             close_state: AtomicU8::new(CLOSE_STATE_OPEN),
-            close_lock: crate::sync::Mutex::new(()),
+            close_lock: crate::sync::Mutex::new_without_spin(()),
             open_transactions: open_transactions::OpenTransactions::new(),
             wal_id: AtomicU64::new(wal_id),
             sst_dir,

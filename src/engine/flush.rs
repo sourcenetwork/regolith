@@ -77,7 +77,9 @@ pub(crate) struct Flusher {
     /// memtable cap) waits for the flush in flight on its own thread
     /// ([`Flusher::flushing`]). An ordered unit a queue's poll runs may not
     /// wait: the poll takes the exclusion before the unit's body begins, or
-    /// parks ([`Flusher::hold_or_park`]).
+    /// parks ([`Flusher::hold_or_park`]). Built without spin (E48): it is
+    /// held for a whole memtable flush, table writes and syncs included, so
+    /// a caller that waits for it queues at once.
     flushing: Mutex<()>,
     /// The thread whose poll took the exclusion for a unit's body, as its
     /// thread token; zero otherwise. That thread's own calls for the
@@ -133,7 +135,7 @@ impl Flusher {
             options,
             health,
             stall_signal,
-            flushing: Mutex::new(()),
+            flushing: Mutex::new_without_spin(()),
             held_by: AtomicUsize::new(0),
             parked: Parked::new(),
         }
