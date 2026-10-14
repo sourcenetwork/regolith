@@ -53,7 +53,7 @@ use super::manifest::{MAX_LEVELS, Version, VersionEdit, overlapping};
 use super::memtable::MemTable;
 use super::pending_outputs::PendingOutputs;
 use super::range_tombstone::table_key_range;
-use super::sstable::{LiveSst, SsTableMeta, SsTableReader, sst_filename};
+use super::sstable::{LiveSst, SsTableMeta, SsTableReader, SsTableWriter, sst_filename};
 use super::{RegolithEngine, event_listener};
 
 /// Block-cache ids for tables being validated, handed out downward from the
@@ -198,8 +198,12 @@ impl RegolithEngine {
     where
         F: FnMut(&[u8]) -> io::Result<()>,
     {
-        let named =
-            |e: io::Error| io::Error::new(e.kind(), format!("ingest: {}: {e}", source.display()));
+        let named = |e: io::Error| {
+            if crate::Error::is_typed(&e) {
+                return e;
+            }
+            io::Error::new(e.kind(), format!("ingest: {}: {e}", source.display()))
+        };
         let file_id = {
             let mut versions = self.versions.lock();
             let id = versions.current().next_file_id;
@@ -214,10 +218,16 @@ impl RegolithEngine {
         // caller lets the file move: a source rewritten in place later
         // would rewrite the table. A link that fails, across devices say,
         // falls back to a copy.
-        let linked = opts.move_files
+        // An encrypted database holds no table in plaintext, so a source that
+        // is not sealed is written in sealed instead of copied or linked.
+        let resealed = self.reseal_if_plain(source, &path, probes).map_err(named)?;
+        let linked = !resealed
+            && opts.move_files
             && self.env.capabilities().hard_link
             && self.env.hard_link(source, &path).is_ok();
-        if linked {
+        if resealed {
+            // Written and synced, file and directory, by the table writer.
+        } else if linked {
             // The source's writer may never have synced it.
             self.env
                 .open_write(&path, WriteMode::Update)
@@ -239,6 +249,7 @@ impl RegolithEngine {
             &path,
             probes.next(),
             self.options.metadata_policy(),
+            self.options.keyring.as_deref(),
         )
         .map_err(named)?;
         let (points, num_entries) = self
@@ -280,6 +291,61 @@ impl RegolithEngine {
             num_entries,
             pending,
         })
+    }
+
+    /// On an encrypted database, write the table `source` to `dest` sealed
+    /// under the current key when `source` is not sealed, entry for entry
+    /// and range tombstone for range tombstone, synced with its directory;
+    /// `true` when it did. An unencrypted database, or a source sealed under
+    /// any key the provider has, is left to the copy or link: a sealed
+    /// table's frames are bound to its own salt and offsets, not to a file
+    /// id, so it opens as it is under the id the ingest gives it.
+    ///
+    /// Holds one data block at a time, as the validation does.
+    fn reseal_if_plain(
+        &self,
+        source: &Path,
+        dest: &Path,
+        probes: &mut ProbeIds<'_>,
+    ) -> io::Result<bool> {
+        let Some(keyring) = self.options.keyring.as_deref() else {
+            return Ok(false);
+        };
+        let reader = SsTableReader::open_with(
+            &self.env,
+            source,
+            probes.next(),
+            self.options.metadata_policy(),
+            Some(keyring),
+        )?;
+        if reader.seal_key().is_some() {
+            return Ok(false);
+        }
+        let mut writer = SsTableWriter::new_in(
+            &self.env,
+            dest,
+            self.options.block_size,
+            self.options.bloom_bits_per_key,
+            self.options.compression,
+            self.options.prefix_extractor.clone(),
+            self.options.partitioned_index,
+            self.options.metadata_block_size,
+            Some(keyring),
+        )?;
+        for rt in reader.range_tombstones() {
+            writer.add_range_tombstone(&rt.start, &rt.end, rt.seq);
+        }
+        let mut entries = reader.iter_internal_stream(&self.cache)?;
+        while let Some((key, value)) = entries.next_entry()? {
+            writer.add(&key, &value)?;
+        }
+        if writer.finish()?.is_none() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "the source file is empty",
+            ));
+        }
+        Ok(true)
     }
 
     /// Stream every entry of a staged table once, holding one data block:

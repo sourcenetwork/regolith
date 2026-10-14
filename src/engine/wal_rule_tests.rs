@@ -118,7 +118,7 @@ fn red_close_without_sync_close_follows_a_sync_of_everything_before_it() {
     let path = dir.path().join("closed.wal");
     let recording = Arc::new(crate::engine::recovery_tests::RecordingEnv::default());
     let env: Arc<dyn Env> = recording.clone();
-    let mut wal = Wal::create_in(&env, &path).unwrap();
+    let mut wal = Wal::create_in(&env, &path, None).unwrap();
     wal.append_put(b"a", b"v", 1).unwrap();
     wal.append_put(b"b", b"v", 2).unwrap();
     let before_close = wal.offset();
@@ -137,8 +137,13 @@ fn red_close_without_sync_close_follows_a_sync_of_everything_before_it() {
     drop(events);
 
     let bytes = fs::read(&path).unwrap();
-    let close = wal_frame::decode_header(&bytes[before_close as usize..], wal.nonce, before_close)
-        .expect("CLOSE ends the log");
+    let close = wal_frame::decode_header(
+        &bytes[before_close as usize..],
+        wal.nonce,
+        before_close,
+        false,
+    )
+    .expect("CLOSE ends the log");
     assert_eq!(close.kind, KIND_CLOSE);
     assert_eq!(
         close.synced_through, before_close,
@@ -267,7 +272,8 @@ fn a_verified_header_running_past_the_file_allocates_nothing() {
         STAMP_LEN as u64,
     ));
     fs::write(&path, &bytes).unwrap();
-    let mut iter = WalReplayIter::open(&crate::env::std_env(), &path, WalPosition::Newest).unwrap();
+    let mut iter =
+        WalReplayIter::open(&crate::env::std_env(), &path, WalPosition::Newest, None).unwrap();
     assert!(iter.next_entry().unwrap().is_none());
     assert_eq!(iter.high_water_bytes(), 0);
     assert_eq!(iter.discarded_tail().unwrap().offset, STAMP_LEN as u64);
@@ -425,6 +431,10 @@ struct CrashCase {
     /// Damage the last synced record (`Residual`).
     rot: bool,
     seed: u64,
+    /// The log is sealed (`Frame = "AEAD"`).
+    sealed: bool,
+    /// A sealed log is opened under the wrong key (`keyOk = FALSE`).
+    wrong_key: bool,
 }
 
 fn crash_case() -> impl proptest::strategy::Strategy<Value = CrashCase> {
@@ -442,15 +452,21 @@ fn crash_case() -> impl proptest::strategy::Strategy<Value = CrashCase> {
         proptest::collection::vec(fate, 10),
         any::<bool>(),
         any::<u64>(),
+        any::<bool>(),
+        any::<bool>(),
     )
-        .prop_map(|(syncs, close, keep, fates, rot, seed)| CrashCase {
-            syncs,
-            close,
-            keep,
-            fates,
-            rot,
-            seed,
-        })
+        .prop_map(
+            |(syncs, close, keep, fates, rot, seed, sealed, wrong_key)| CrashCase {
+                syncs,
+                close,
+                keep,
+                fates,
+                rot,
+                seed,
+                sealed,
+                wrong_key,
+            },
+        )
 }
 
 /// Seeded bytes, never a valid record but by astronomical chance.
@@ -504,10 +520,21 @@ proptest::proptest! {
     /// record (`KeepsSynced`), keeps a prefix (`NoGap`), never drops a
     /// record a surviving stamp proves synced (`NoProvenLoss`), and
     /// reports any loss of synced data it opens on (`LossIsReported`).
+    ///
+    /// Half the cases seal the log (`MC_WalRecovery_Green_Aead`): a failed
+    /// tag is an unusable record under the same rule, and an open under the
+    /// wrong key refuses (`WrongKeyRefuses`) instead of dropping the log.
     #[test]
     fn replay_gives_every_crash_state_the_models_verdict(case in crash_case()) {
         let dir = TempDir::new().unwrap();
-        let (mut wal, path) = new_wal(&dir);
+        let ring = crate::engine::seal::test_keys::keyring(&[1]);
+        let path = dir.path().join("test.wal");
+        let mut wal = Wal::create_in(
+            &crate::env::std_env(),
+            &path,
+            case.sealed.then_some(&*ring),
+        )
+        .unwrap();
         let mut claims = Vec::new();
         let mut synced = 0usize;
         for (i, sync) in case.syncs.iter().enumerate() {
@@ -535,7 +562,7 @@ proptest::proptest! {
         // record; the file keeps `kept` records, each past the prefix
         // given its fate, a partial one only last.
         let kept = case.keep.clamp(synced, records);
-        let mut bytes = pristine[..STAMP_LEN].to_vec();
+        let mut bytes = pristine[..stamp_len_of(&pristine)].to_vec();
         let mut usable = Vec::new();
         for i in 0..kept {
             let record = &pristine[offsets[i] as usize..offsets[i + 1] as usize];
@@ -566,9 +593,26 @@ proptest::proptest! {
         }
         fs::write(&path, &bytes).unwrap();
 
-        let verdict = model_verdict(&usable, &claims[..kept], close_at.filter(|&c| c < kept));
+        let wrong_key = case.sealed && case.wrong_key;
+        let verdict = if wrong_key {
+            None
+        } else {
+            model_verdict(&usable, &claims[..kept], close_at.filter(|&c| c < kept))
+        };
         let rotted = case.rot && synced > 0;
-        match (replay_at(&path, WalPosition::Newest), verdict) {
+        let opened_with = if wrong_key {
+            crate::engine::seal::test_keys::wrong_keyring(&[1])
+        } else {
+            ring
+        };
+        match (replay_with(&path, WalPosition::Newest, Some(&opened_with)), verdict) {
+            (Err(e), None) if wrong_key => {
+                proptest::prop_assert!(
+                    e.to_string().contains("does not verify under key id 1"),
+                    "a wrong key refused for another reason: {}",
+                    e
+                );
+            }
             (Err(e), None) => {
                 proptest::prop_assert!(rotted, "refused a crash the flush honoured: {}", e);
             }

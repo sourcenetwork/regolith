@@ -89,7 +89,7 @@ fn a_checksummed_database_survives_backup_and_restore() {
 
         let target = TempDir::new().expect("tempdir");
         let restored_root = target.path().join("restored");
-        engine.restore(id, &restored_root).expect("restore");
+        engine.restore(id, &restored_root, None).expect("restore");
         let restored = Db::open(&restored_root, opts(partitioned)).expect("open restored");
         check(&restored, &format!("restored (partitioned={partitioned})"));
         println!(

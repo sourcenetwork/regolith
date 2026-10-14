@@ -1,9 +1,8 @@
 //! An ingest across a power cut (D48).
 //!
-//! The child writes the first half of a workload under `Eventual`
-//! durability, flushing once a quarter in so the version holds a table,
-//! ingests a table, records that the ingest returned, writes the second half
-//! and dies without closing. It runs under the `LD_PRELOAD`
+//! The child opens a new database, writes the first half of a workload
+//! under `Eventual` durability, ingests a table, records that the ingest
+//! returned, writes the second half and dies without closing. It runs under the `LD_PRELOAD`
 //! shim, which kills it at a chosen I/O call of the ingest; the directory is
 //! then rebuilt as the filesystem would have left it, every byte that was
 //! never synced discarded, and the database is reopened. Whatever the cut:
@@ -20,13 +19,10 @@
 //! the other carries a key the memtable holds, so the ingest flushes it
 //! first and lands in L0.
 //!
-//! The version holds a table before the ingest on purpose. With none, a cut
-//! that tears the manifest's unsynced tail while a table that carries data
-//! sits in the table directory makes the open refuse, naming the table: the
-//! manifest has no record of how far it was synced, so it cannot tell a
-//! torn record that named the table from one that did not. That is the
-//! open's guard for every first table, a flush's as much as an ingest's,
-//! and not what this file is about.
+//! The database holds no table before the ingest, so the ingest's table,
+//! and the table of the flush it may run first, is the first one: a cut
+//! tears the manifest's unsynced tail while that table sits in the table
+//! directory, and the open must still succeed (E29).
 //!
 //! # Linux only
 //!
@@ -43,6 +39,7 @@ use common::fault::{
     self, ChildSpec, CrashRun, CutPoint, DieKind, OpValue, Phase, PowerLossOptions, TearMode,
     Trigger,
 };
+use common::keys::Keys;
 use regolith::{Db, IngestOptions, Options, SstFileWriter};
 use tempfile::TempDir;
 
@@ -86,16 +83,14 @@ fn workload(spec: &ChildSpec, over: bool) {
     let history = spec.history();
     let ops = history.ops();
     let half = ops.len() / 2;
-    for op in &ops[..half / 2] {
-        apply(&db, &op.key, &op.value);
-    }
-    db.flush().expect("child: flush");
-    for op in &ops[half / 2..half] {
+    for op in &ops[..half] {
         apply(&db, &op.key, &op.value);
     }
 
     let source = sidecar(&spec.db_path, "ingest-source");
-    let mut writer = SstFileWriter::create(&source, &Options::default()).expect("child: writer");
+    // Under the database's own options, so an encrypted run ingests a
+    // sealed table, installed as it is.
+    let mut writer = SstFileWriter::create(&source, &spec.options()).expect("child: writer");
     let mut keys: Vec<Vec<u8>> = (0..INGESTED).map(ingested_key).collect();
     if over {
         // The key of the last write before the ingest, which the memtable
@@ -143,10 +138,17 @@ enum Ingest {
     Present,
 }
 
-fn cut(name: &str, trigger: Trigger, tear: TearMode) -> Ingest {
+fn cut(name: &str, trigger: Trigger, tear: TearMode, encrypted: bool) -> Ingest {
     let tmp = TempDir::new().unwrap();
     let db_path = tmp.path().join("db");
-    let spec = ChildSpec::new(Phase::Custom(name.to_string()), &db_path).delete_every(0);
+    let spec = ChildSpec::new(Phase::Custom(name.to_string()), &db_path)
+        .delete_every(0)
+        .encrypted(encrypted);
+    let reopen = if encrypted {
+        Options::default().key_provider(Keys::new(&[1]))
+    } else {
+        Options::default()
+    };
     let history = spec.history();
     let out = CrashRun::new(spec)
         .trigger(trigger.clone())
@@ -173,8 +175,18 @@ fn cut(name: &str, trigger: Trigger, tear: TearMode) -> Ingest {
         &PowerLossOptions::default().tear(tear),
     );
     let returned = sidecar(&db_path, "ingested").exists();
+    if encrypted {
+        // The run really was encrypted: without the key nothing opens.
+        assert!(
+            matches!(
+                Db::open_read_only(&db_path, Options::default()),
+                Err(regolith::Error::KeyProviderRequired)
+            ),
+            "{name}: an encrypted run left a database that opens without its key"
+        );
+    }
 
-    let db = Db::open(&db_path, Options::default()).unwrap_or_else(|e| {
+    let db = Db::open(&db_path, reopen).unwrap_or_else(|e| {
         panic!(
             "{name}, {trigger:?}, {tear:?}: the database refuses to open after a power cut \
              during an ingest: {e}\n{}",
@@ -242,23 +254,32 @@ fn cut(name: &str, trigger: Trigger, tear: TearMode) -> Ingest {
     outcome
 }
 
+/// The cut under both tear modes, on a plain and on an encrypted database,
+/// which must all agree.
 fn both_tears(name: &str, trigger: Trigger) -> Ingest {
-    let truncated = cut(name, trigger.clone(), TearMode::Truncate);
-    let torn = cut(name, trigger, TearMode::TornSector);
-    assert_eq!(truncated, torn, "the two tear modes disagree");
+    let truncated = cut(name, trigger.clone(), TearMode::Truncate, false);
+    for encrypted in [false, true] {
+        let torn = cut(name, trigger.clone(), TearMode::TornSector, encrypted);
+        assert_eq!(
+            truncated, torn,
+            "the tear modes disagree (encrypted: {encrypted})"
+        );
+    }
+    let sealed = cut(name, trigger, TearMode::Truncate, true);
+    assert_eq!(truncated, sealed, "an encrypted database disagrees");
     truncated
 }
 
 /// The staged copy's name. File ids are handed out in order: the first log
-/// takes 1, the flush's rotation takes the second log's 2, its table 3, and
-/// the ingest reserves 4 before it copies, whether or not it later flushes.
-const STAGED: &str = "000004.sst";
+/// takes 1 and the ingest reserves 2 before it copies, whether or not it
+/// later flushes.
+const STAGED: &str = "000002.sst";
 
 /// The manifest sync that makes the ingest's record durable: after the
-/// manifest's creation and the flush's record, and the record of the
-/// ingest's own flush when it has a memtable to flush first.
+/// manifest's creation, and after the record of the ingest's own flush when
+/// it has a memtable to flush first.
 fn manifest_sync(name: &str) -> u64 {
-    if name == OVER { 4 } else { 3 }
+    if name == OVER { 3 } else { 2 }
 }
 
 #[test]

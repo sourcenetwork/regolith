@@ -23,7 +23,8 @@ use std::sync::Arc;
 
 use crate::column_family::{DEFAULT_CF_ID, cf_lower_bound, cf_upper_bound, prefix_key};
 use crate::engine::range_tombstone::exclusive_successor;
-use crate::{CfIter, DbSlice, Error, Iter};
+use crate::io_queue::wait::take_would_block;
+use crate::{CfIter, DbSlice, Error, Iter, WouldBlock};
 
 use super::scan_range::OpenRun;
 use super::validated_range::RangeRecord;
@@ -115,6 +116,26 @@ impl Failure {
     }
 }
 
+/// Why a step stopped short of an entry.
+enum Stop {
+    /// A read failed; the failure is final.
+    Failed(Failure),
+    /// A read needs a block a `CacheOnly` transaction does not have cached.
+    /// The walk is where it was, and the step is run again on the next call.
+    Blocked(WouldBlock),
+}
+
+impl Stop {
+    /// A failed read of `key` (`None` when it was the snapshot cursor's),
+    /// or the wait it returned instead of reading.
+    fn of(io: std::io::Error, key: Option<Vec<u8>>) -> Self {
+        match take_would_block(io) {
+            Ok(would_block) => Self::Blocked(would_block),
+            Err(io) => Self::Failed(Failure { io, key }),
+        }
+    }
+}
+
 /// One entry of a scan: its key without the column-family prefix, and its value.
 type Entry = (Vec<u8>, DbSlice);
 
@@ -139,10 +160,16 @@ type BufferedWrites = Peekable<std::vec::IntoIter<(Vec<u8>, KeyWrites)>>;
 /// `get` serves it.
 ///
 /// An error is final: once a call returns one, every later call returns it
-/// again and the scan never reports the end of its range.
+/// again and the scan never reports the end of its range. The exception is
+/// [`TransactionError::WouldBlock`], from a transaction begun with
+/// [`ReadMode::CacheOnly`](crate::ReadMode::CacheOnly): poll the queue it
+/// names and call again, and the walk continues exactly where it stopped.
 pub struct TxnCursor {
     cursor: CfIter<'static>,
     cursor_done: bool,
+    /// The snapshot cursor stopped on a `WouldBlock`: the next step resumes
+    /// it first.
+    cursor_blocked: bool,
     buffered: BufferedWrites,
     /// The write buffer's generation when `buffered` was folded.
     folded_at: u64,
@@ -192,6 +219,7 @@ impl Transaction {
         direction: ScanDirection,
         check: ScanCheck,
     ) -> TxnCursor {
+        let _scope = self.read_scope();
         TxnCursor::new(self, start, end, direction, check)
     }
 
@@ -216,19 +244,15 @@ impl TxnCursor {
         let reverse = direction == ScanDirection::Reverse;
 
         let mut cursor: CfIter<'static> = CfIter::new(
-            Iter::from_internal(txn.engine.new_iter_at(txn.snapshot_seq)),
+            Iter::from_internal(txn.engine.new_iter_at(txn.snapshot_seq))
+                .resumable(txn.reading.mode.is_cache_only()),
             DEFAULT_CF_ID,
         );
         if reverse {
             match &hi {
-                // `end` is exclusive, so a backward walk starts below it.
-                Some(hi) => {
-                    let end = &hi[CF_PREFIX_LEN..];
-                    cursor.seek_for_prev(end);
-                    if cursor.valid() && cursor.key() == Some(end) {
-                        cursor.prev();
-                    }
-                }
+                // `end` is exclusive, so a backward walk starts below it. One
+                // seek, so a seek that has to wait resumes as the same seek.
+                Some(hi) => cursor.seek_before(&hi[CF_PREFIX_LEN..]),
                 None => cursor.seek_to_last(),
             }
         } else {
@@ -273,6 +297,7 @@ impl TxnCursor {
         let mut cursor = Self {
             cursor,
             cursor_done: false,
+            cursor_blocked: false,
             buffered: Vec::new().into_iter().peekable(),
             folded_at: txn.write_mark(),
             lo,
@@ -306,12 +331,21 @@ impl TxnCursor {
     /// the transaction merged into. When it strikes after the page already
     /// holds entries, that page is returned and the next call reports the
     /// error.
+    ///
+    /// Under [`ReadMode::CacheOnly`](crate::ReadMode::CacheOnly) a page that
+    /// needs a block the cache does not hold returns
+    /// [`TransactionError::WouldBlock`] (or, when it already holds entries,
+    /// is returned short). Poll the queue the wait names and call again: the
+    /// next page starts at the entry the stopped one would have, so a walk
+    /// interrupted any number of times yields the same entries as one that
+    /// never was.
     pub fn next_page(&mut self, txn: &Transaction, max_bytes: usize) -> TxResult<Page> {
         if owner_of(txn) != self.owner {
             return Err(TransactionError::Engine(Error::invalid_argument(
                 "the cursor belongs to a different transaction",
             )));
         }
+        let _scope = txn.read_scope();
         let mut entries = Vec::new();
         let mut taken = 0usize;
         let mut done = false;
@@ -396,11 +430,17 @@ impl TxnCursor {
         self.folded_at = generation;
     }
 
-    /// Record `failure` and return the error it reports.
-    fn fail(&mut self, failure: Failure) -> TransactionError {
-        let error = failure.error();
-        self.failure = Some(failure);
-        error
+    /// Record a failure and return the error it reports; hand a wait out
+    /// without recording anything, so the next step runs again.
+    fn stop(&mut self, stop: Stop) -> TransactionError {
+        match stop {
+            Stop::Failed(failure) => {
+                let error = failure.error();
+                self.failure = Some(failure);
+                error
+            }
+            Stop::Blocked(would_block) => TransactionError::WouldBlock(would_block),
+        }
     }
 
     /// The next entry of the walk, or `None` at the end of the range.
@@ -413,13 +453,22 @@ impl TxnCursor {
         if self.exhausted {
             return Ok(None);
         }
+        if self.cursor_blocked {
+            // Its queue has been polled: the interrupted seek or step runs
+            // again, and lands where it would have.
+            self.cursor_blocked = false;
+            self.cursor.resume();
+        }
         if txn.write_mark() != self.folded_at {
             self.fold(txn);
         }
         loop {
             let cursor_key = match self.peek_cursor() {
                 Ok(key) => key,
-                Err(failure) => return Err(self.fail(failure)),
+                Err(stop) => {
+                    self.cursor_blocked = matches!(stop, Stop::Blocked(_));
+                    return Err(self.stop(stop));
+                }
             };
             // Buffered keys carry the CF prefix; the cursor reports the
             // user-visible key, so compare on the stripped form.
@@ -453,7 +502,7 @@ impl TxnCursor {
                 },
             };
             match flow {
-                Err(failure) => return Err(self.fail(failure)),
+                Err(stop) => return Err(self.stop(stop)),
                 Ok(ControlFlow::Continue(())) => {}
                 Ok(ControlFlow::Break(None)) => {
                     self.exhausted = true;
@@ -475,18 +524,20 @@ impl TxnCursor {
     /// Whichever way the walk runs, it stops at the bound it is running
     /// towards: `end` is exclusive going forward, `start` inclusive going
     /// back. A cursor that went invalid because its walk failed, and not
-    /// because the range ended, is a failure.
-    fn peek_cursor(&mut self) -> Result<Option<Vec<u8>>, Failure> {
+    /// because the range ended, is a failure; one that stopped on a block a
+    /// `CacheOnly` transaction does not have cached is a wait.
+    fn peek_cursor(&mut self) -> Result<Option<Vec<u8>>, Stop> {
         if self.cursor_done || !self.cursor.valid() {
             // The cursor going invalid means one of two things and this is
             // where they become distinguishable: the range ended, or the
             // walk failed.
             return match self.cursor.status() {
                 Ok(()) => Ok(None),
-                Err(error) => Err(Failure {
+                Err(Error::WouldBlock(would_block)) => Err(Stop::Blocked(would_block)),
+                Err(error) => Err(Stop::Failed(Failure {
                     io: error.into_io_error(),
                     key: None,
-                }),
+                })),
             };
         }
         let Some(key) = self.cursor.key().map(<[u8]>::to_vec) else {
@@ -544,22 +595,24 @@ impl TxnCursor {
         &mut self,
         txn: &Transaction,
         key: Vec<u8>,
-    ) -> Result<ControlFlow<Option<Entry>>, Failure> {
+    ) -> Result<ControlFlow<Option<Entry>>, Stop> {
         self.probe.clear();
         self.probe.extend_from_slice(&DEFAULT_CF_ID.to_be_bytes());
         self.probe.extend_from_slice(&key);
         let read_seq = txn.scan_read_seq(&self.probe);
         if read_seq > txn.snapshot_seq {
+            // Read before the cursor moves, so a read that has to wait leaves
+            // the walk on this key.
+            let found = txn
+                .engine
+                .get_slice_at(&self.probe, read_seq)
+                .map_err(|io| Stop::of(io, Some(self.probe.clone())))?;
             self.step_cursor();
             self.run = None;
-            return match txn.engine.get_slice_at(&self.probe, read_seq) {
-                Ok(Some(value)) => Ok(ControlFlow::Break(Some((key, value)))),
-                Ok(None) => Ok(ControlFlow::Continue(())),
-                Err(io) => Err(Failure {
-                    io,
-                    key: Some(self.probe.clone()),
-                }),
-            };
+            return Ok(match found {
+                Some(value) => ControlFlow::Break(Some((key, value))),
+                None => ControlFlow::Continue(()),
+            });
         }
         let Some(value) = self.cursor.value_slice() else {
             self.run = None;
@@ -616,37 +669,46 @@ impl TxnCursor {
     /// promotion moved it past that, and recording a read of it only at
     /// Serializable. Every other entry comes from the write buffer and ends
     /// the stretch. A merge the operator declines is a failure.
-    fn yield_buffered(&mut self, txn: &Transaction) -> Result<ControlFlow<Option<Entry>>, Failure> {
-        let Some((prefixed, writes)) = self.buffered.next() else {
+    fn yield_buffered(&mut self, txn: &Transaction) -> Result<ControlFlow<Option<Entry>>, Stop> {
+        let Some((prefixed, writes)) = self.buffered.peek() else {
             return Ok(ControlFlow::Break(None));
         };
-        // Only an entry that reads its base uses the sequence: `apply` takes
-        // the closure below for nothing else.
+        let merge = txn.engine.merge_operator();
+        // Only an entry that reads its base uses the sequence: `apply` reads
+        // the database for nothing else.
         let read_seq = if writes.reads_base() {
-            let read_seq = txn.scan_read_seq(&prefixed);
+            let read_seq = txn.scan_read_seq(prefixed);
             if read_seq > txn.snapshot_seq {
                 self.run = None;
             } else {
-                Self::join_stretch(txn, &mut self.run, &self.recording, self.reverse, &prefixed);
+                Self::join_stretch(txn, &mut self.run, &self.recording, self.reverse, prefixed);
             }
             read_seq
         } else {
             self.run = None;
             txn.snapshot_seq
         };
-        let found = writes.apply(txn.engine.merge_operator(), &prefixed, || {
-            txn.engine.get_slice_at(&prefixed, read_seq)
-        });
-        match found {
+        // The base is read while the entry is still at the head of the
+        // buffer, so a read that has to wait leaves it there for the next
+        // step. Joining the stretch again then changes nothing.
+        let base = if merge.is_some() && writes.reads_base() {
+            match txn.engine.get_slice_at(prefixed, read_seq) {
+                Ok(base) => base,
+                Err(io) => return Err(Stop::of(io, Some(prefixed.clone()))),
+            }
+        } else {
+            None
+        };
+        let Some((prefixed, writes)) = self.buffered.next() else {
+            return Ok(ControlFlow::Break(None));
+        };
+        match writes.apply(merge, &prefixed, || Ok(base)) {
             Ok(Some(Some(value))) => Ok(ControlFlow::Break(Some((
                 prefixed[CF_PREFIX_LEN..].to_vec(),
                 DbSlice::from(value),
             )))),
             Ok(_) => Ok(ControlFlow::Continue(())),
-            Err(io) => Err(Failure {
-                io,
-                key: Some(prefixed),
-            }),
+            Err(io) => Err(Stop::of(io, Some(prefixed))),
         }
     }
 }
@@ -672,6 +734,10 @@ fn owner_of(txn: &Transaction) -> (usize, u64) {
 /// are not recorded and end the stretch, except a merged key whose operands
 /// lie on a snapshot entry, which joins it. The stretch is closed when the
 /// stream is exhausted or dropped.
+///
+/// [`TransactionError::WouldBlock`] does not end the stream: poll the queue
+/// it names and take the next item, and the scan carries on where it
+/// stopped.
 pub struct TxnScanStream<'txn> {
     txn: &'txn Transaction,
     cursor: TxnCursor,
@@ -700,12 +766,14 @@ impl Iterator for TxnScanStream<'_> {
         if self.ended {
             return None;
         }
+        let _scope = self.txn.read_scope();
         match self.cursor.step(self.txn) {
             Ok(Some(entry)) => Some(Ok(entry)),
             Ok(None) => {
                 self.ended = true;
                 None
             }
+            Err(error @ TransactionError::WouldBlock(_)) => Some(Err(error)),
             Err(error) => {
                 self.ended = true;
                 Some(Err(error))

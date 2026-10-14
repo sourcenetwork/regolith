@@ -273,6 +273,18 @@ impl Gate {
         GateReadGuard { gate: self }
     }
 
+    /// Enter shared if no writer holds or waits for the gate, without
+    /// waiting.
+    pub(crate) fn try_read(&self) -> Option<GateReadGuard<'_>> {
+        let mut state = self.state.lock();
+        if state.writing || state.writers_waiting > 0 {
+            return None;
+        }
+        state.readers += 1;
+        drop(state);
+        Some(GateReadGuard { gate: self })
+    }
+
     /// Enter exclusive, blocking until no reader and no writer holds
     /// the gate.
     pub(crate) fn write(&self) -> GateWriteGuard<'_> {

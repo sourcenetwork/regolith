@@ -313,6 +313,110 @@ fn corrupted_completed_compaction_refuses_missing_inputs_without_rewriting() {
     assert_eq!(count_sst_files(dir.path()), 1);
 }
 
+/// Three flushes, one table each, and the manifest's length after each.
+fn three_flushes(dir: &Path) -> [usize; 3] {
+    let manifest = dir.join("MANIFEST");
+    let db = Db::open(dir, manifest_options()).unwrap();
+    let mut ends = [0; 3];
+    for (i, end) in ends.iter_mut().enumerate() {
+        db.put(format!("k{i}").as_bytes(), b"v").unwrap();
+        db.flush().unwrap();
+        *end = fs::metadata(&manifest).unwrap().len() as usize;
+    }
+    db.close().unwrap();
+    ends
+}
+
+/// E29: damage below a batch that needed a sync and has bytes after it is
+/// no crash's doing, because those bytes were written only once that sync
+/// had made everything before it durable. The open refuses, naming the file
+/// and both offsets, and leaves the manifest as it found it.
+#[test]
+fn damage_below_a_batch_a_later_sync_proves_refuses_naming_both_offsets() {
+    let dir = TempDir::new().unwrap();
+    let manifest = dir.path().join("MANIFEST");
+    let [first, second, _] = three_flushes(dir.path());
+    flip_byte(&manifest, first - 1);
+    let damaged = fs::read(&manifest).unwrap();
+    let err = match Db::open(dir.path(), manifest_options()) {
+        Err(Error::Corruption(e)) => e.to_string(),
+        Err(e) => panic!("expected a corruption error, got {e:?}"),
+        Ok(_) => panic!("damage a later sync proves durable must not open"),
+    };
+    assert!(err.contains("MANIFEST is damaged at offset"), "{err}");
+    assert!(err.contains(&format!("below offset {second}")), "{err}");
+    assert_eq!(fs::read(&manifest).unwrap(), damaged);
+}
+
+/// E29: bytes after the last batch that read back whole, which no later
+/// batch proves durable, are a crash's unsynced tail. A read-write open
+/// drops them, truncates the file and reports it with a warn line and two
+/// tickers; every table stays.
+#[test]
+fn a_torn_manifest_tail_is_dropped_truncated_and_reported() {
+    let dir = TempDir::new().unwrap();
+    let manifest = dir.path().join("MANIFEST");
+    three_flushes(dir.path());
+    let whole = fs::read(&manifest).unwrap();
+    let mut torn = whole.clone();
+    torn.extend_from_slice(&[0xAB; 37]);
+    fs::write(&manifest, &torn).unwrap();
+
+    let stats = Arc::new(Statistics::new());
+    let db = Db::open(
+        dir.path(),
+        manifest_options().statistics(Some(Arc::clone(&stats))),
+    )
+    .unwrap();
+    assert_eq!(stats.get_ticker(Ticker::ManifestTailDiscarded), 1);
+    assert_eq!(stats.get_ticker(Ticker::ManifestTailDiscardedBytes), 37);
+    for i in 0..3 {
+        assert_eq!(
+            db.get(format!("k{i}").as_bytes()).unwrap().as_deref(),
+            Some(&b"v"[..])
+        );
+    }
+    assert!(
+        fs::read(&manifest).unwrap().starts_with(&whole),
+        "the open keeps every batch that read back whole"
+    );
+    drop(db);
+    let stats = Arc::new(Statistics::new());
+    Db::open(
+        dir.path(),
+        manifest_options().statistics(Some(Arc::clone(&stats))),
+    )
+    .unwrap();
+    assert_eq!(
+        stats.get_ticker(Ticker::ManifestTailDiscarded),
+        0,
+        "the first open truncated the tail"
+    );
+}
+
+/// E29: a read-only open reports a torn manifest tail and leaves it.
+#[test]
+fn a_read_only_open_reports_a_torn_manifest_tail_and_leaves_it() {
+    let dir = TempDir::new().unwrap();
+    let manifest = dir.path().join("MANIFEST");
+    three_flushes(dir.path());
+    let mut torn = fs::read(&manifest).unwrap();
+    torn.extend_from_slice(&[0; 21]);
+    fs::write(&manifest, &torn).unwrap();
+
+    let stats = Arc::new(Statistics::new());
+    let db = Db::open_read_only(
+        dir.path(),
+        manifest_options().statistics(Some(Arc::clone(&stats))),
+    )
+    .unwrap();
+    assert_eq!(stats.get_ticker(Ticker::ManifestTailDiscarded), 1);
+    assert_eq!(stats.get_ticker(Ticker::ManifestTailDiscardedBytes), 21);
+    assert_eq!(db.get(b"k2").unwrap().as_deref(), Some(&b"v"[..]));
+    drop(db);
+    assert_eq!(fs::read(&manifest).unwrap(), torn);
+}
+
 // ── SSTable corruption ──────────────────────────────────────────
 
 #[test]

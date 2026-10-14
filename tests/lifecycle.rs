@@ -763,9 +763,10 @@ fn an_sstable_from_an_unknown_format_version_is_rejected_with_a_clear_error() {
         sst.display()
     );
 
-    // 0x05 and 0x06 are real versions now, so probing them here would
-    // assert that regolith refuses a table it wrote itself.
-    for future_version in [0x07u8, 0x7F, 0xFF] {
+    // 0x05 to 0x08 are real versions now (0x07 and 0x08 are the sealed
+    // layouts of an encrypted database), so probing them here would assert
+    // that regolith refuses a table it wrote itself.
+    for future_version in [0x09u8, 0x7F, 0xFF] {
         overwrite_range(&sst, offset, &[future_version]);
         match Db::open(dir.path(), opts()) {
             Ok(_) => panic!(

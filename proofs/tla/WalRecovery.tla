@@ -62,9 +62,32 @@
 \* reports every byte it held: the outcome of the crash state in which
 \* every record is unusable, which CrashStates holds whenever synced = 0.
 \* Every invariant below is checked against that outcome, so the model
-\* needs no state of its own for it. (With AEAD the stamp is sealed and
-\* synced at creation, RED StampNotSealed; the engine has no encryption
-\* at rest yet.)
+\* needs no state of its own for it.
+\*
+\* THE ENGINE UNDER AEAD (Frame = "AEAD"; src/engine/wal_seal.rs, with
+\* Options::key_provider set).
+\*   Usable         a sealed record is usable when its header check holds
+\*                  and its AES-256-GCM-SIV tag verifies under the key the
+\*                  stamp names (wal_seal::open_record); the tag's
+\*                  associated data is the header check's input, so it
+\*                  binds the payload to `st`, the offset and the log. The
+\*                  scan past damage (wal_frame::proof_past) reads P only
+\*                  from records whose tag verifies.
+\*   StampKeyOk     the stamp is sealed under the log's key: a stamp whose
+\*                  tag fails refuses the open, naming the file
+\*                  (wal_seal::open_stamp), so a wrong key refuses and
+\*                  never drops the log (WrongKeyRefuses; RED
+\*                  StampNotSealed).
+\*   NewestStampOk  and it is whole: the engine writes the sealed stamp to
+\*                  a staging file, syncs it, renames it into place and
+\*                  syncs the directory (wal_seal::create_durably) before
+\*                  the log takes a record, which is the model's Init and
+\*                  Rotate creating a log whose stamp is already synced. A
+\*                  crash leaves no log, or one whose whole stamp is
+\*                  durable (RED StampUnsynced).
+\*   keyOk = FALSE  a provider handing other bytes under the key id the
+\*                  stamp names; a key id it does not provide at all is
+\*                  refused before any tag is checked (Error::UnknownKey).
 \*
 \* WHAT A CRASH LEAVES (the crash states, `CrashStates`).
 \*   - Under powersafe overwrite (D6: assumed, synced groups are not padded
@@ -106,9 +129,12 @@
 \*   - With AEAD, the stamp at the head of each log is sealed under the key
 \*     and synced when the log is created, so it is always inside the
 \*     synced prefix: a stamp whose tag fails is refused ("wrong key or
-\*     damaged header"). Without that, a wrong key fails every record, P is
-\*     0, and replay would drop the whole log as a torn tail
-\*     (RED StampNotSealed).
+\*     damaged header"). Without the seal, a wrong key fails every record,
+\*     P is 0, and replay would drop the whole log as a torn tail
+\*     (RED StampNotSealed). Without the sync at creation, a power cut
+\*     before the log's first sync can tear the stamp, and since a torn
+\*     sealed stamp cannot be told from a wrong key, the open refuses a
+\*     crash it must survive (RED StampUnsynced).
 \*   - A group of commits is one record here, so it holds one commit; a
 \*     group of several survives or is lost whole, like one commit.
 \*
@@ -124,6 +150,7 @@
 \*   MC_WalRecovery_Red_CloseWithoutSync     RecoveryOpens fails
 \*   MC_WalRecovery_Red_NoTruncate           RecoveryOpens fails
 \*   MC_WalRecovery_Red_StampNotSealed       AckedSurvive fails
+\*   MC_WalRecovery_Red_StampUnsynced        RecoveryOpens fails
 
 EXTENDS Naturals, Sequences, FiniteSets
 
@@ -141,7 +168,8 @@ ASSUME Mode \in {"Immediate", "Eventual"}
 ASSUME Frame \in {"Checksum", "AEAD"}
 ASSUME Residual \in BOOLEAN
 ASSUME Mutant \in {"none", "DropBelowP", "RefuseAboveP", "Format1",
-                   "CloseWithoutSync", "NoTruncate", "StampNotSealed"}
+                   "CloseWithoutSync", "NoTruncate", "StampNotSealed",
+                   "StampUnsynced"}
 
 VARIABLES
   sealed,   \* the earlier logs, oldest first; each a sequence of records
@@ -192,47 +220,104 @@ Acked ==
 
 ----------------------------------------------------------------------------
 \* Crash states of the newest log. A crash state is a record:
-\*   st     [1..Len(log) -> state] of each record: "intact", "garbage",
-\*          "zero", "partial" (the file ends inside it) or "absent";
-\*   keyOk  whether the key provider returned the key the log was sealed
-\*          under (always TRUE with checksums);
-\*   rot    whether the last synced group was damaged (Residual only).
+\*   st         [1..Len(log) -> state] of each record: "intact", "garbage",
+\*              "zero", "partial" (the file ends inside it) or "absent";
+\*   keyOk      whether the key provider returned the key the log was
+\*              sealed under (always TRUE with checksums);
+\*   rot        whether the last synced group was damaged (Residual only);
+\*   stampTorn  whether the crash tore the newest log's stamp (only the
+\*              StampUnsynced defect can, see StampTears).
 
 \* What an unsynced record may become. Format 2 treats every unusable
 \* record alike, so one kind suffices; format 1 tells zeros and a partial
 \* record from garbage.
 UnsyncedKinds ==
+  \* Format 1 must tell four shapes apart, so its defect gets all four.
   IF Mutant = "Format1" THEN {"intact", "garbage", "zero", "partial"}
+  \* Format 2 only asks "usable or not", so two shapes cover every case.
   ELSE {"intact", "garbage"}
+
+\* Whether a crash can tear the newest log's stamp. The engine writes a
+\* sealed stamp to a staging file, syncs it, and only then renames it to
+\* the log's name (src/engine/wal_seal.rs, create_durably): after a power
+\* cut the log either does not exist or carries its whole stamp, so there
+\* is nothing to tear. The StampUnsynced defect writes the stamp in place
+\* and lets the first record's sync carry it, the way an unsealed log does;
+\* until that sync (synced = 0) a power cut may leave half a stamp.
+StampTears ==
+  \* Only the defect, only with sealed frames, only before the first sync.
+  IF Frame = "AEAD" /\ Mutant = "StampUnsynced" /\ synced = 0
+    \* Then the stamp may come back torn or whole.
+    THEN BOOLEAN
+    \* Otherwise it always comes back whole.
+    ELSE {FALSE}
 
 \* Every crash state at this moment. L is how many records the file keeps
 \* (never fewer than the synced prefix); records past the synced prefix and
 \* up to L each take an unsynced kind, a partial record only as the last;
 \* the rest are absent.
 CrashStates ==
+  \* n: how many records the newest log held when the power went.
   LET n == Len(log) IN
+  \* Collect one crash state for every combination of the choices below.
   UNION {
+    \* One crash state: what became of each record, the key, rot, the stamp.
     {[st |-> [i \in 1..n |->
+               \* A synced record survives, but for rot in the last synced one.
                IF i <= synced THEN (IF rot /\ i = synced THEN "garbage" ELSE "intact")
+               \* An unsynced record still in the file takes its chosen kind.
                ELSE IF i <= L THEN f[i] ELSE "absent"],
-      keyOk |-> key, rot |-> rot] :
+      \* Whether the reopen comes with the right key.
+      keyOk |-> key,
+      \* Whether the last synced record rotted.
+      rot |-> rot,
+      \* Whether the stamp came back torn.
+      stampTorn |-> torn] :
+       \* f picks a kind for each unsynced record the file still holds...
        f \in {g \in [(synced + 1)..L -> UnsyncedKinds] :
+                \* ...and only the last of them may be cut short.
                 \A i \in (synced + 1)..L : g[i] = "partial" => i = L}} :
+    \* The file keeps at least the synced prefix and at most every record.
     L \in synced..n,
+    \* With sealed frames the reopen may come with the wrong key.
     key \in (IF Frame = "AEAD" THEN BOOLEAN ELSE {TRUE}),
-    rot \in (IF Residual /\ synced > 0 THEN BOOLEAN ELSE {FALSE})}
+    \* Rot only in the Residual configurations, and only of a synced record.
+    rot \in (IF Residual /\ synced > 0 THEN BOOLEAN ELSE {FALSE}),
+    \* A torn stamp only under the defect.
+    torn \in StampTears}
 
 \* How many records the crash left in the file: they are a prefix.
 PLen(cs) == Cardinality({i \in DOMAIN cs.st : cs.st[i] # "absent"})
 
-\* A record is usable when its bytes survived and its checksum or tag
-\* verifies; a tag verifies only under the right key.
-Usable(cs, i) == cs.st[i] = "intact" /\ (Frame = "Checksum" \/ cs.keyOk)
+\* A record is usable when its bytes survived and its check verifies.
+\* Under AEAD the tag is the check: the engine opens the record's sealed
+\* payload under the key the stamp names (wal_seal::open_record), and a
+\* wrong key fails every tag exactly as damage fails it.
+Usable(cs, i) ==
+  \* The bytes are the ones the writer wrote...
+  /\ cs.st[i] = "intact"
+  \* ...and, with sealed frames, the key is the one that sealed them.
+  /\ (Frame = "Checksum" \/ cs.keyOk)
 
-\* The stamp at the head of each log verifies. It is synced when the log is
-\* created, so it survives every crash; with AEAD it is sealed under the
-\* key, so a wrong key fails it. The mutant leaves it unsealed.
-StampOk(cs) == Frame = "Checksum" \/ cs.keyOk \/ Mutant = "StampNotSealed"
+\* The key half of a stamp's check: a sealed stamp's tag holds only under
+\* the key that sealed it (wal_seal::open_stamp).
+StampKeyOk(cs) ==
+  \* A checksummed log has no key to get wrong.
+  \/ Frame = "Checksum"
+  \* A sealed stamp opened under the right key.
+  \/ cs.keyOk
+  \* The StampNotSealed defect: a stamp nobody sealed passes under any key.
+  \/ Mutant = "StampNotSealed"
+
+\* The newest log's stamp verifies: right key, and every byte there. An
+\* earlier log was synced whole before the next one existed, so only the
+\* newest log's stamp can be torn.
+NewestStampOk(cs) ==
+  \* The key half, as for every log.
+  /\ StampKeyOk(cs)
+  \* And the stamp is whole: a torn sealed stamp cannot be told from one
+  \* under another key, so it refuses like a wrong key.
+  /\ ~cs.stampTorn
 
 \* The present records that are not usable.
 Bad(cs) == {i \in 1..PLen(cs) : ~Usable(cs, i)}
@@ -254,10 +339,14 @@ Format1Refuses(cs) ==
   /\ cs.st[O(cs)] # "partial"
   /\ ~(\A j \in O(cs)..PLen(cs) : cs.st[j] = "zero")
 
-\* Replay refuses the newest log. The design refuses a bad stamp, and an
-\* unusable record below P. Each mutant changes this rule as named.
+\* Replay refuses the newest log. The design refuses a stamp that fails,
+\* and an unusable record below P. A record whose tag fails is unusable
+\* like any damaged one, so in the tail above P it is dropped and
+\* reported, and below P it refuses. Each mutant changes this rule as named.
 RefusedNewest(cs) ==
-  \/ ~StampOk(cs)
+  \* A stamp that fails refuses the open, naming the file.
+  \/ ~NewestStampOk(cs)
+  \* Then the O < P rule, or the defect that replaces it.
   \/ CASE Mutant = "DropBelowP"   -> FALSE
        [] Mutant = "RefuseAboveP" -> Bad(cs) # {}
        [] Mutant = "Format1"      -> Format1Refuses(cs)
@@ -266,8 +355,11 @@ RefusedNewest(cs) ==
 \* Replay refuses an earlier log: they are complete, so any unusable
 \* record there, or a stamp that fails, is damage.
 RefusedSealed(cs) ==
+  \* Some earlier log j...
   \E j \in 1..Len(sealed) :
-    \/ ~StampOk(cs)
+    \* ...whose stamp fails under this key...
+    \/ ~StampKeyOk(cs)
+    \* ...or that holds a record that is not usable: rot, or a failed tag.
     \/ \E i \in 1..Len(sealed[j]) : ~(sealed[j][i].ok /\ (Frame = "Checksum" \/ cs.keyOk))
 
 \* Recovery refuses to open.
@@ -373,8 +465,18 @@ TypeOK ==
   /\ crashes \in 0..MaxCrashes
 
 \* A crash the device's flush honoured, opened with the right key, never
-\* leaves a database that refuses to open. Lean: recovers_prefix2.
-RecoveryOpens == \A cs \in CrashStates : cs.keyOk /\ ~cs.rot => ~Refused(cs)
+\* leaves a database that refuses to open. It rules out, say, a power cut
+\* just after a rotation created log 2: reopened with the right key, the
+\* database must open, whatever state log 2's records are in. Lean:
+\* recovers_prefix2, and sealed_stamp_opens_after_honest_crash with its
+\* RED unsynced_stamp_refuses_honest_crash.
+RecoveryOpens ==
+  \* Every crash state...
+  \A cs \in CrashStates :
+    \* ...reopened with the right key, with no rot in the synced prefix...
+    cs.keyOk /\ ~cs.rot
+      \* ...opens.
+      => ~Refused(cs)
 
 \* Whatever recovery yields when it opens is commits 1..n: the Eventual
 \* promise, and true in every mode. Lean: recovers_prefix2.
@@ -405,7 +507,14 @@ LossIsReported ==
     ~Refused(cs) /\ ~(SyncedCommits \subseteq Range(Recovered(cs))) => Discarded(cs)
 
 \* An open under the wrong key refuses; it never drops the log as a tail.
-\* Lean: wrong_key_refuses, and unsealed_stamp_drops_log for the RED.
-WrongKeyRefuses == \A cs \in CrashStates : ~cs.keyOk => Refused(cs)
+\* It rules out a provider that hands back other bytes under the right key
+\* id and a database that opens empty because every tag failed. Lean:
+\* wrong_key_refuses and wrong_key_refuses_sealed, and
+\* unsealed_stamp_drops_log for the RED.
+WrongKeyRefuses ==
+  \* Every crash state reopened under the wrong key...
+  \A cs \in CrashStates : ~cs.keyOk
+    \* ...refuses to open.
+    => Refused(cs)
 
 ====

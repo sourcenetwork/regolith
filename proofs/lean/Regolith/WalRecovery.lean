@@ -756,4 +756,128 @@ theorem unsealed_stamp_drops_log :
     replay2 false ⟨[0, 1], 2, false⟩ [false, false] = none := by
   decide
 
+/-! ### Encryption at rest: the sealed stamp, durable before the log exists
+
+The story. A database encrypted at rest seals each log's records and its
+stamp with AES-256-GCM-SIV (`src/engine/wal_seal.rs`). Picture one log with
+two records, a power cut, and a reopen. Two things can happen to the stamp:
+it can be opened under the wrong key, and the power cut can tear it. The
+engine seals the stamp under the key, so a wrong key fails it, and it makes
+the stamp durable before the log has its name (`create_durably`: write a
+staging file, sync it, rename it, sync the directory), so no power cut can
+tear it. What this part shows:
+
+1. `durable_stamp_whole`: with that creation, a power cut leaves the stamp
+   whole.
+2. `sealed_stamp_opens_after_honest_crash`: so the right key opens after
+   any crash the device's flush honoured, with the same gap-free prefix as
+   an unsealed log (`recovers_prefix2`).
+3. `wrong_key_refuses_sealed`: the wrong key never opens, whatever the
+   power cut left.
+4. RED `unsynced_stamp_refuses_honest_crash`: written in place and left
+   for the first record's sync, a stamp can be torn, and the right key is
+   refused after an honest crash. (The other RED, a stamp nobody sealed, is
+   `unsealed_stamp_drops_log` above.)
+-/
+
+/-- What a power cut left of a log's stamp: the bytes before the first
+record of a file under `wal/`. -/
+inductive StampState where
+  /-- Every byte of the stamp reached the disk. -/
+  | whole
+  /-- Some byte of the stamp never reached the disk. -/
+  | torn
+  -- Two states can be compared, so `decide` can check small examples.
+  deriving DecidableEq
+
+/-- Whether a sealed stamp verifies, as `wal_seal::open_stamp` decides.
+`keyOk` says whether the provider handed back the bytes the stamp was
+sealed with. -/
+def sealedStampOk (keyOk : Bool) : StampState → Bool
+  -- A whole stamp's tag holds exactly when the key is right.
+  | .whole => keyOk
+  -- A torn stamp's tag fails whatever the key, like a wrong key.
+  | .torn => false
+
+/-- The stamp states a power cut can leave behind. `durableAtCreation` is
+the engine's `create_durably`; without it (the defect) the stamp is
+written in place, and can be torn only while nothing in the log is synced:
+the first sync of a record makes the stamp before it durable too. -/
+def StampSurvives (durableAtCreation : Bool) (l : Log2) (s : StampState) : Prop :=
+  -- A whole stamp is always a possible outcome...
+  s = .whole ∨
+  -- ...a torn one only under the defect, before the log's first sync.
+  (durableAtCreation = false ∧ l.synced = 0 ∧ s = .torn)
+
+/-- **A stamp made durable at creation is whole after any power cut.** -/
+theorem durable_stamp_whole {l : Log2} {s : StampState}
+    -- What the power cut left, with the engine's creation.
+    (h : StampSurvives true l s) :
+    s = .whole := by
+  -- Two cases: the stamp is whole, or the defect's torn case.
+  rcases h with h | ⟨hdefect, _, _⟩
+  -- Whole: that is the goal.
+  · exact h
+  -- Torn needs `true = false`, which is impossible, so this case is empty.
+  · exact absurd hdefect (by decide)
+
+/-- **The right key opens after an honest crash.** A reachable log, a crash
+the device's flush honoured, a stamp made durable at creation: replay of
+the sealed log opens, keeping a gap-free prefix that holds every synced
+group, exactly as `recovers_prefix2` says of an unsealed log. -/
+theorem sealed_stamp_opens_after_honest_crash {w : Wal2} {ok : List Bool} {s : StampState}
+    -- `w` is reachable by the format 2 writer.
+    (hreach : Steps2 init2 w)
+    -- The crash kept the synced prefix; a failed tag counts as damage in `ok`.
+    (hsurv : Survives2 w.log ok)
+    -- What became of the stamp, with the engine's creation.
+    (hstamp : StampSurvives true w.log s) :
+    ∃ kept, replay2 (sealedStampOk true s) w.log ok = some kept ∧
+      recovered2 w kept = List.range (w.earlier.length + kept) ∧
+      min w.log.synced w.log.stamps.length ≤ kept ∧ kept ≤ w.log.stamps.length := by
+  -- The stamp is whole...
+  rw [durable_stamp_whole hstamp]
+  -- ...so under the right key it verifies, and replay is the unsealed one,
+  -- which `recovers_prefix2` already shows opens on a gap-free prefix.
+  exact recovers_prefix2 hreach hsurv
+
+/-- **The wrong key never opens a sealed log.** Whatever the power cut left
+of the stamp, its tag fails under the wrong key, and replay refuses. -/
+theorem wrong_key_refuses_sealed (l : Log2) (ok : List Bool) (s : StampState) :
+    replay2 (sealedStampOk false s) l ok = none := by
+  -- Look at both things the stamp can be.
+  cases s
+  -- Whole under the wrong key: the stamp check is `false`, and replay
+  -- refuses at its first line.
+  · rfl
+  -- Torn: the stamp check is `false` too, and replay refuses the same way.
+  · rfl
+
+/-- **RED `unsynced_stamp_refuses_honest_crash`.** The defect writes the
+sealed stamp in place. A fresh log, nothing synced in it, and the power
+goes: the stamp comes back torn, which `StampSurvives false` allows, and the
+crash honoured every flush (`Survives2`). Reopened with the right key, the
+torn stamp fails and replay refuses: a database the right key cannot open
+after a crash it should survive. With the engine's creation that stamp
+state cannot happen (`durable_stamp_whole`). -/
+theorem unsynced_stamp_refuses_honest_crash :
+    -- The defect allows a torn stamp on a fresh, unsynced log...
+    StampSurvives false ⟨[], 0, false⟩ .torn ∧
+    -- ...the crash kept everything a sync covered (nothing)...
+    Survives2 ⟨[], 0, false⟩ [] ∧
+    -- ...and the right key is refused.
+    replay2 (sealedStampOk true .torn) ⟨[], 0, false⟩ [] = none := by
+  -- Prove the three parts one at a time.
+  refine ⟨?_, ?_, ?_⟩
+  -- The torn case of `StampSurvives`: defect, nothing synced, torn.
+  · unfold StampSurvives
+    -- Take the second alternative, all three of whose equalities hold.
+    exact Or.inr ⟨rfl, rfl, rfl⟩
+  -- `Survives2`: nothing was synced, and the empty file holds no record.
+  · unfold Survives2
+    -- `0 ≤ 0` and `0 ≤ total`, both by arithmetic Lean can evaluate.
+    exact ⟨Nat.le_refl _, Nat.zero_le _⟩
+  -- Replay with a stamp check of `false` refuses at its first line.
+  · rfl
+
 end Regolith.WalRecovery

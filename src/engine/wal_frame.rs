@@ -62,6 +62,7 @@
 use std::io;
 
 use super::checksum;
+use super::seal::Sealer;
 use super::wal::{
     MAX_RECORD_LEN, RECORD_DELETE, RECORD_DELETE_RANGE, RECORD_MERGE, RECORD_PUT, WAL_MAGIC,
     WalEntry, parse_delete_range_record, parse_delete_record, parse_merge_record, parse_put_record,
@@ -143,6 +144,16 @@ impl Header {
             self.synced_through
         }
     }
+
+    /// The header's first 17 bytes, as they were written.
+    pub(super) fn fields(&self) -> [u8; 17] {
+        let mut fields = [0u8; 17];
+        fields[0..4].copy_from_slice(&self.len.to_le_bytes());
+        fields[4] = self.kind;
+        fields[5..13].copy_from_slice(&self.synced_through.to_le_bytes());
+        fields[13..17].copy_from_slice(&self.payload_check.to_le_bytes());
+        fields
+    }
 }
 
 /// Frame a record of `kind` whose payload is `payload`, written at
@@ -173,8 +184,10 @@ pub(super) fn encode_header(
 
 /// The header at the start of `bytes`, read at `offset` of the log stamped
 /// with `nonce`, or `None` when those bytes are not a header this log's
-/// writer produced there.
-pub(super) fn decode_header(bytes: &[u8], nonce: u64, offset: u64) -> Option<Header> {
+/// writer produced there. `sealed` says the log's payloads are sealed
+/// frames (`super::wal_seal`), which changes what lengths the writer
+/// produces.
+pub(super) fn decode_header(bytes: &[u8], nonce: u64, offset: u64, sealed: bool) -> Option<Header> {
     let h = bytes.get(..HEADER_LEN)?;
     let kind = h[4];
     if kind != KIND_GROUP && kind != KIND_CLOSE {
@@ -186,17 +199,26 @@ pub(super) fn decode_header(bytes: &[u8], nonce: u64, offset: u64) -> Option<Hea
     }
     let len = u32::from_le_bytes([h[0], h[1], h[2], h[3]]);
     let synced_through = u64::from_le_bytes(h[5..13].try_into().ok()?);
+    let payload_check = u32::from_le_bytes([h[13], h[14], h[15], h[16]]);
     // A verified header that breaks the writer's own rules is not one the
-    // writer produced: a stamp never runs ahead of its record, and CLOSE
-    // carries nothing.
-    if len > MAX_RECORD_LEN || synced_through > offset || (kind == KIND_CLOSE && len != 0) {
+    // writer produced: a stamp never runs ahead of its record, CLOSE
+    // carries nothing, and a sealed record carries a frame and no payload
+    // check.
+    let shape_ok = if sealed {
+        len <= MAX_RECORD_LEN + super::wal_seal::CLOSE_PAYLOAD_LEN
+            && payload_check == 0
+            && super::wal_seal::sealed_len_ok(kind, len)
+    } else {
+        len <= MAX_RECORD_LEN && (kind != KIND_CLOSE || len == 0)
+    };
+    if !shape_ok || synced_through > offset {
         return None;
     }
     Some(Header {
         len,
         kind,
         synced_through,
-        payload_check: u32::from_le_bytes([h[13], h[14], h[15], h[16]]),
+        payload_check,
     })
 }
 
@@ -266,13 +288,16 @@ pub(super) fn decode_entry(entries: &[u8]) -> io::Result<(WalEntry, usize)> {
 /// no more than `damaged_at` cannot change the verdict and is passed over
 /// without reading its payload. Holds one chunk and, for a candidate,
 /// streams its payload through the hash, so memory stays bounded whatever
-/// the file's length.
+/// the file's length. In a log sealed under `seal` a candidate is usable
+/// when its tag verifies, which takes its whole payload: memory is then
+/// bounded by one record, as replay itself is.
 pub(super) fn proof_past(
     file: &dyn ReadFile,
     nonce: u64,
     from: u64,
     end: u64,
     damaged_at: u64,
+    seal: Option<&Sealer>,
 ) -> io::Result<Option<u64>> {
     let mut chunk = vec![0u8; SCAN_CHUNK + HEADER_LEN - 1];
     let mut start = from;
@@ -291,14 +316,19 @@ pub(super) fn proof_past(
             i += skip;
             let offset = start + i as u64;
             i += 1;
-            let Some(header) = decode_header(&chunk[i - 1..], nonce, offset) else {
+            let Some(header) = decode_header(&chunk[i - 1..], nonce, offset, seal.is_some()) else {
                 continue;
             };
             let proves = header.proves(end);
             if proves <= damaged_at || offset + header.record_len() > end {
                 continue;
             }
-            if payload_verifies(file, offset + HEADER_LEN as u64, &header)? {
+            let at = offset + HEADER_LEN as u64;
+            let usable = match seal {
+                Some(sealer) => sealed_payload_verifies(file, at, &header, sealer, nonce, offset)?,
+                None => payload_verifies(file, at, &header)?,
+            };
+            if usable {
                 return Ok(Some(proves));
             }
         }
@@ -321,6 +351,24 @@ fn payload_verifies(file: &dyn ReadFile, at: u64, header: &Header) -> io::Result
         done += n as u64;
     }
     Ok(hasher.finish() == header.payload_check)
+}
+
+/// Whether the sealed payload of `header`, at `at` in `file`, opens under
+/// `sealer` for the record at `offset` of the log stamped with `nonce`.
+fn sealed_payload_verifies(
+    file: &dyn ReadFile,
+    at: u64,
+    header: &Header,
+    sealer: &Sealer,
+    nonce: u64,
+    offset: u64,
+) -> io::Result<bool> {
+    let mut payload = vec![0u8; header.len as usize];
+    file.read_exact_at(at, &mut payload)?;
+    Ok(
+        super::wal_seal::open_record(sealer, &header.fields(), nonce, offset, &mut payload)
+            .is_some_and(|ops| entries_are_whole(&payload[ops])),
+    )
 }
 
 #[cfg(test)]
@@ -385,17 +433,23 @@ mod tests {
     fn a_header_verifies_only_in_its_own_log_at_its_own_offset() {
         let payload = entries();
         let header = encode_header(KIND_GROUP, &payload, 20, 99, 40);
-        let decoded = decode_header(&header, 99, 40).expect("verifies where it was written");
+        let decoded = decode_header(&header, 99, 40, false).expect("verifies where it was written");
         assert_eq!(decoded.len as usize, payload.len());
         assert_eq!(decoded.synced_through, 20);
         assert!(decoded.payload_matches(&payload));
-        assert!(decode_header(&header, 98, 40).is_none(), "another log");
-        assert!(decode_header(&header, 99, 41).is_none(), "another offset");
+        assert!(
+            decode_header(&header, 98, 40, false).is_none(),
+            "another log"
+        );
+        assert!(
+            decode_header(&header, 99, 41, false).is_none(),
+            "another offset"
+        );
         for byte in 0..HEADER_LEN {
             let mut bad = header;
             bad[byte] ^= 0x01;
             assert!(
-                decode_header(&bad, 99, 40).is_none(),
+                decode_header(&bad, 99, 40, false).is_none(),
                 "damage at byte {byte} passed"
             );
         }
@@ -404,20 +458,22 @@ mod tests {
     #[test]
     fn a_header_that_claims_more_than_its_offset_is_refused() {
         let mut header = encode_header(KIND_GROUP, b"", 40, 5, 40);
-        assert!(decode_header(&header, 5, 40).is_some());
+        assert!(decode_header(&header, 5, 40, false).is_some());
         // Re-sign a claim one byte past the record, as only a broken writer
         // could produce, and check the reader still refuses it.
         header[5..13].copy_from_slice(&41u64.to_le_bytes());
         let check = checksum::wal_group_header(5, 40, header[..17].try_into().unwrap());
         header[17..21].copy_from_slice(&check.to_le_bytes());
-        assert!(decode_header(&header, 5, 40).is_none());
+        assert!(decode_header(&header, 5, 40, false).is_none());
     }
 
     #[test]
     fn close_proves_the_whole_file_and_a_group_proves_its_stamp() {
-        let close = decode_header(&encode_header(KIND_CLOSE, b"", 30, 1, 30), 1, 30).unwrap();
+        let close =
+            decode_header(&encode_header(KIND_CLOSE, b"", 30, 1, 30), 1, 30, false).unwrap();
         assert_eq!(close.proves(1000), 1000);
-        let group = decode_header(&encode_header(KIND_GROUP, b"x", 30, 1, 30), 1, 30).unwrap();
+        let group =
+            decode_header(&encode_header(KIND_GROUP, b"x", 30, 1, 30), 1, 30, false).unwrap();
         assert_eq!(group.proves(1000), 30);
     }
 
@@ -481,7 +537,7 @@ mod tests {
         let damaged = offsets[1];
         bytes[damaged as usize + 2] ^= 0xFF;
         let end = bytes.len() as u64;
-        let proof = proof_past(&Bytes(bytes), 3, damaged + 1, end, damaged).unwrap();
+        let proof = proof_past(&Bytes(bytes), 3, damaged + 1, end, damaged, None).unwrap();
         assert_eq!(proof, Some(offsets[2]));
     }
 
@@ -492,7 +548,7 @@ mod tests {
         bytes[damaged as usize + 30] ^= 0xFF;
         let end = bytes.len() as u64;
         assert_eq!(
-            proof_past(&Bytes(bytes), 3, damaged + 1, end, damaged).unwrap(),
+            proof_past(&Bytes(bytes), 3, damaged + 1, end, damaged, None).unwrap(),
             None
         );
     }
@@ -506,12 +562,12 @@ mod tests {
         let damaged = offsets[1];
         bytes[damaged as usize] ^= 0xFF;
         assert_eq!(
-            proof_past(&Bytes(bytes.clone()), 3, damaged + 1, end, damaged).unwrap(),
+            proof_past(&Bytes(bytes.clone()), 3, damaged + 1, end, damaged, None).unwrap(),
             Some(end),
             "a usable CLOSE proves the whole file"
         );
         assert_eq!(
-            proof_past(&Bytes(bytes), 4, damaged + 1, end, damaged).unwrap(),
+            proof_past(&Bytes(bytes), 4, damaged + 1, end, damaged, None).unwrap(),
             None,
             "records of another log never verify"
         );
@@ -531,13 +587,21 @@ mod tests {
         let end = bytes.len() as u64;
         let damaged = filler_at as u64;
         assert_eq!(
-            proof_past(&Bytes(bytes.clone()), nonce, damaged + 1, end, damaged).unwrap(),
+            proof_past(
+                &Bytes(bytes.clone()),
+                nonce,
+                damaged + 1,
+                end,
+                damaged,
+                None
+            )
+            .unwrap(),
             Some(offset)
         );
         let last = bytes.len() - 1;
         bytes[last] ^= 1;
         assert_eq!(
-            proof_past(&Bytes(bytes), nonce, damaged + 1, end, damaged).unwrap(),
+            proof_past(&Bytes(bytes), nonce, damaged + 1, end, damaged, None).unwrap(),
             None,
             "a record whose payload fails proves nothing"
         );

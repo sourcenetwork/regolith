@@ -12,9 +12,17 @@ use crate::env::{BufferedWriter, Env, WriteMode};
 use crate::sync::internal::RwLock;
 
 use super::checksum;
+use super::seal::Keyring;
 use super::sstable::{
     LiveSst, MetadataPolicy, SsTableMeta, SsTableReader, sst_filename, table_carries_data,
 };
+use crate::encryption::KeyId;
+
+mod sealed;
+use sealed::{MANIFEST_FORMAT_SEALED, ManifestSeal, SEALED_STAMP_LEN};
+
+mod tail;
+pub(crate) use tail::DroppedTail;
 
 /// Maximum number of levels in the LSM tree.
 pub(crate) const MAX_LEVELS: usize = 7;
@@ -131,6 +139,7 @@ pub(crate) enum VersionEdit {
     RemoveFile { level: usize, file_id: u64 },
     SetLastSeq(u64),
     SetNextFileId(u64),
+    SetMinWalId(u64),
     Reset { next_file_id: u64, min_wal_id: u64 },
 }
 
@@ -170,6 +179,7 @@ impl VersionEdit {
             },
             VersionEdit::SetLastSeq(seq) => ManifestRecord::SetLastSeq(*seq),
             VersionEdit::SetNextFileId(id) => ManifestRecord::SetNextFileId(*id),
+            VersionEdit::SetMinWalId(id) => ManifestRecord::SetMinWalId(*id),
             VersionEdit::Reset {
                 next_file_id,
                 min_wal_id,
@@ -179,16 +189,26 @@ impl VersionEdit {
             },
         }
     }
-
-    fn requires_manifest_sync(&self) -> bool {
-        // File-id reservations do not make new data reachable on
-        // their own. They are flushed here and become durable with
-        // the next synced AddFile/RemoveFile/SetLastSeq edit.
-        !matches!(self, VersionEdit::SetNextFileId(_))
-    }
 }
 
 impl ManifestRecord {
+    /// Whether a batch holding this record is synced before
+    /// [`VersionSet::apply`] returns. The one rule both the writer and the
+    /// open's tail judgment (`tail.rs`) read, so the two cannot disagree on
+    /// which batches a crash may lose.
+    ///
+    /// A file-id reservation and a log retirement change no read if lost:
+    /// the ids a lost reservation handed out name nothing a durable batch
+    /// names, and the logs a lost retirement covered are replayed again,
+    /// holding only writes that the log the open rewrote them into also
+    /// holds. Each becomes durable with the next synced batch.
+    fn requires_sync(&self) -> bool {
+        !matches!(
+            self,
+            ManifestRecord::SetNextFileId(_) | ManifestRecord::SetMinWalId(_)
+        )
+    }
+
     fn encode(&self, buf: &mut Vec<u8>) {
         match self {
             ManifestRecord::AddFile { level, meta } => {
@@ -369,12 +389,32 @@ fn raised_last_seq(current: u64, stamp: u64) -> u64 {
 ///
 /// The one encoder of a canonical manifest: the rewrite that bounds the log
 /// and a backup restore both write it, so the two cannot drift apart.
+///
+/// With a `keyring` the image is sealed, under a fresh salt and the
+/// keyring's current key, exactly as the open's rewrite seals one; a
+/// current key the keyring cannot provide fails with
+/// [`crate::Error::UnknownKey`].
 pub(crate) fn encode_manifest_image(
     next_file_id: u64,
     last_seq: u64,
     min_wal_id: u64,
     files: impl IntoIterator<Item = (usize, SsTableMeta)>,
+    keyring: Option<&Arc<Keyring>>,
 ) -> io::Result<Vec<u8>> {
+    let sealing = VersionSet::fresh_sealing(keyring)?;
+    Ok(encode_image(next_file_id, last_seq, min_wal_id, files, sealing.as_ref())?.0)
+}
+
+/// [`encode_manifest_image`], sealed under `sealing` when given: its salt in
+/// the stamp and the batch under the keyring's current key, which is handed
+/// back.
+fn encode_image(
+    next_file_id: u64,
+    last_seq: u64,
+    min_wal_id: u64,
+    files: impl IntoIterator<Item = (usize, SsTableMeta)>,
+    sealing: Option<&ManifestSeal>,
+) -> io::Result<(Vec<u8>, Option<KeyId>)> {
     let mut records = vec![
         ManifestRecord::SetNextFileId(next_file_id),
         ManifestRecord::SetLastSeq(last_seq),
@@ -384,9 +424,10 @@ pub(crate) fn encode_manifest_image(
         validate_level_index(level)?;
         records.push(ManifestRecord::AddFile { level, meta });
     }
-    let mut image = VersionSet::encode_stamp().to_vec();
-    image.extend_from_slice(&VersionSet::encode_records(&records)?);
-    Ok(image)
+    let mut image = VersionSet::stamp_bytes(sealing.map(|s| &s.salt));
+    let (batch, sealed_under) = VersionSet::encode_records(&records, image.len() as u64, sealing)?;
+    image.extend_from_slice(&batch);
+    Ok((image, sealed_under))
 }
 
 /// Identifier at the head of a MANIFEST: `REGOMAN` plus a format byte.
@@ -428,11 +469,29 @@ pub(crate) struct VersionSet {
     /// and rewrites are refused until recovery reopens the log.
     manifest_writer: Option<BufferedWriter>,
     env: Arc<dyn Env>,
+    /// The damaged end the open dropped, for the engine to report.
+    dropped_tail: Option<DroppedTail>,
+    /// Set when the database is encrypted at rest. Tables are opened
+    /// through it, and a manifest it finds unsealed is rewritten sealed.
+    keyring: Option<Arc<Keyring>>,
+    /// Set when the manifest on disk is sealed: every batch appended to it
+    /// is sealed under the keyring's current key and bound to its salt.
+    sealing: Option<ManifestSeal>,
+    /// Every key a batch of the manifest on disk is sealed under, so a
+    /// rotation can tell whether the file still names a retired key.
+    sealed_under: Vec<KeyId>,
 }
 
 struct ManifestReplay {
     version: Version,
     valid_len: usize,
+    /// Bytes of the stamp replay found; `0` when the file is too short to
+    /// hold one, which is a crash while the manifest was created.
+    stamp_len: usize,
+    /// The salt of a sealed manifest, `None` for an unsealed one.
+    salt: Option<[u8; 16]>,
+    /// Every key a replayed batch was sealed under.
+    key_ids: Vec<KeyId>,
 }
 
 /// An unreferenced `*.sst` file that the discarded-table guard could not
@@ -477,19 +536,35 @@ impl VersionSet {
     /// SSTable the manifest references, so the policy decides whether
     /// that whole set of indexes and filters is pinned or bounded by
     /// the block cache.
+    ///
+    /// With a `keyring`, a sealed manifest is read under it and a manifest
+    /// found unsealed is rewritten sealed before this returns, once; without
+    /// one, a sealed manifest refuses with
+    /// [`crate::Error::KeyProviderRequired`].
     pub(crate) fn open_with_policy(
         env: &Arc<dyn Env>,
         db_dir: &Path,
         sst_dir: &Path,
         policy: MetadataPolicy,
+        keyring: Option<Arc<Keyring>>,
     ) -> io::Result<Self> {
         let manifest_path = db_dir.join("MANIFEST");
 
         let manifest_bytes;
+        let mut dropped_tail = None;
+        let salt;
+        let mut sealed_under = Vec::new();
         let (version, writer) = if env.exists(&manifest_path) {
             let data = env.read(&manifest_path)?;
-            let replay = Self::replay_manifest(env, &data, sst_dir, policy)?;
-            Self::reject_discarded_tables(&**env, &replay, data.len(), sst_dir, &manifest_path)?;
+            let replay = Self::replay_manifest(env, &data, sst_dir, policy, keyring.as_deref())?;
+            dropped_tail = Self::judge_end(
+                &**env,
+                &replay,
+                &data,
+                sst_dir,
+                &manifest_path,
+                keyring.as_deref(),
+            )?;
             // A torn tail means the log lost records; keep every table
             // until a clean replay says which ones are unreferenced. And
             // only when the directory lock excludes other processes: where
@@ -516,35 +591,98 @@ impl VersionSet {
             // it of hiding live tables. The append path never writes a
             // stamp, so it is written here instead: without it the next
             // open would find a stamp-less record stream and refuse.
-            if data.len() < MANIFEST_STAMP_LEN {
-                let mut file = env.open_write(&manifest_path, WriteMode::Truncate)?;
-                file.write_all(&Self::encode_stamp())?;
-                file.sync_all()?;
-                crate::env::sync_parent_dir(&**env, &manifest_path)?;
-                manifest_bytes = MANIFEST_STAMP_LEN as u64;
-                (replay.version, BufferedWriter::new(file))
+            if replay.stamp_len == 0 {
+                let (file, stamp_salt, len) =
+                    Self::create_stamped(env, &manifest_path, keyring.is_some())?;
+                manifest_bytes = len;
+                salt = stamp_salt;
+                (replay.version, file)
             } else {
                 let file = env.open_write(&manifest_path, WriteMode::Append)?;
                 manifest_bytes = replay.valid_len as u64;
+                salt = replay.salt;
+                sealed_under = replay.key_ids;
                 (replay.version, BufferedWriter::new(file))
             }
         } else {
-            let version = Version::new();
-            let mut file = env.open_write(&manifest_path, WriteMode::Truncate)?;
-            file.write_all(&Self::encode_stamp())?;
-            file.sync_all()?;
-            crate::env::sync_parent_dir(&**env, &manifest_path)?;
-            manifest_bytes = MANIFEST_STAMP_LEN as u64;
-            (version, BufferedWriter::new(file))
+            let (file, stamp_salt, len) =
+                Self::create_stamped(env, &manifest_path, keyring.is_some())?;
+            manifest_bytes = len;
+            salt = stamp_salt;
+            (Version::new(), file)
         };
 
-        Ok(Self {
+        let sealing = Self::sealing(keyring.as_ref(), salt)?;
+        let convert = keyring.is_some() && sealing.is_none();
+        let mut set = Self {
             current: Arc::new(RwLock::new(Arc::new(version))),
             manifest_path,
             manifest_bytes,
             manifest_writer: Some(writer),
             env: Arc::clone(env),
-        })
+            dropped_tail,
+            keyring,
+            sealing,
+            sealed_under,
+        };
+        // The one-time conversion of a database written without encryption
+        // and opened with a key provider: its manifest names every table
+        // and key range in plaintext, so it is rewritten sealed now rather
+        // than whenever it next grows past its rewrite threshold.
+        if convert {
+            set.compact_manifest()?;
+        }
+        Ok(set)
+    }
+
+    /// Create a manifest at `path` holding only its stamp, sealed with a
+    /// fresh salt when `sealed`, and make it durable. Returns the append
+    /// writer, the salt and the stamp's length.
+    fn create_stamped(
+        env: &Arc<dyn Env>,
+        path: &Path,
+        sealed: bool,
+    ) -> io::Result<(BufferedWriter, Option<[u8; 16]>, u64)> {
+        let salt = sealed.then(sealed::fresh_salt).transpose()?;
+        let stamp = Self::stamp_bytes(salt.as_ref());
+        let mut file = env.open_write(path, WriteMode::Truncate)?;
+        file.write_all(&stamp)?;
+        file.sync_all()?;
+        crate::env::sync_parent_dir(&**env, path)?;
+        Ok((BufferedWriter::new(file), salt, stamp.len() as u64))
+    }
+
+    /// The stamp a manifest begins with: sealed under `salt` when there is
+    /// one, else the format 1 stamp.
+    fn stamp_bytes(salt: Option<&[u8; 16]>) -> Vec<u8> {
+        match salt {
+            Some(salt) => sealed::encode_stamp(&MANIFEST_MAGIC, salt).to_vec(),
+            None => Self::encode_stamp().to_vec(),
+        }
+    }
+
+    /// How batches are sealed for a manifest whose salt is `salt`. A sealed
+    /// manifest without a keyring cannot happen: its stamp refused the open.
+    fn sealing(
+        keyring: Option<&Arc<Keyring>>,
+        salt: Option<[u8; 16]>,
+    ) -> io::Result<Option<ManifestSeal>> {
+        match (keyring, salt) {
+            (Some(keyring), Some(salt)) => Ok(Some(ManifestSeal {
+                keyring: Arc::clone(keyring),
+                salt,
+            })),
+            (None, Some(_)) => Err(crate::Error::KeyProviderRequired.into_io_error()),
+            (_, None) => Ok(None),
+        }
+    }
+
+    /// How a manifest written whole is sealed: under a fresh salt when there
+    /// is a keyring, not at all when there is none. The rewrite and a
+    /// backup restore both seal through this.
+    fn fresh_sealing(keyring: Option<&Arc<Keyring>>) -> io::Result<Option<ManifestSeal>> {
+        let salt = keyring.is_some().then(sealed::fresh_salt).transpose()?;
+        Self::sealing(keyring, salt)
     }
 
     /// Create or recover a VersionSet through the standard
@@ -556,6 +694,7 @@ impl VersionSet {
             db_dir,
             sst_dir,
             MetadataPolicy::Pinned,
+            None,
         )
     }
 
@@ -569,11 +708,20 @@ impl VersionSet {
         db_dir: &Path,
         sst_dir: &Path,
         policy: MetadataPolicy,
+        keyring: Option<Arc<Keyring>>,
     ) -> io::Result<Self> {
         let manifest_path = db_dir.join("MANIFEST");
         let data = env.read(&manifest_path)?;
-        let replay = Self::replay_manifest(env, &data, sst_dir, policy)?;
-        Self::reject_discarded_tables(&**env, &replay, data.len(), sst_dir, &manifest_path)?;
+        let replay = Self::replay_manifest(env, &data, sst_dir, policy, keyring.as_deref())?;
+        let dropped_tail = Self::judge_end(
+            &**env,
+            &replay,
+            &data,
+            sst_dir,
+            &manifest_path,
+            keyring.as_deref(),
+        )?;
+        let sealing = Self::sealing(keyring.as_ref(), replay.salt)?;
 
         Ok(Self {
             current: Arc::new(RwLock::new(Arc::new(replay.version))),
@@ -581,7 +729,22 @@ impl VersionSet {
             manifest_bytes: replay.valid_len as u64,
             manifest_writer: None,
             env: Arc::clone(env),
+            dropped_tail,
+            keyring,
+            sealing,
+            sealed_under: replay.key_ids,
         })
+    }
+
+    /// Whether, on an encrypted database, the manifest on disk is unsealed
+    /// or holds a batch sealed under a key other than the current one, so
+    /// a rewrite is what retires that key.
+    pub(crate) fn has_stale_seals(&self) -> bool {
+        let Some(keyring) = &self.keyring else {
+            return false;
+        };
+        let current = keyring.current_id();
+        self.sealing.is_none() || self.sealed_under.iter().any(|&id| id != current)
     }
 
     /// Get the current version.
@@ -592,6 +755,13 @@ impl VersionSet {
     /// Path of the manifest file on disk.
     pub(crate) fn manifest_path(&self) -> &Path {
         &self.manifest_path
+    }
+
+    /// The damaged end of the manifest this open dropped as a crash's
+    /// unsynced tail, if there was one. A read-write open has already
+    /// truncated it; a read-only open left it in the file.
+    pub(crate) fn dropped_tail(&self) -> Option<DroppedTail> {
+        self.dropped_tail
     }
 
     fn writer_unavailable(&self) -> io::Error {
@@ -611,6 +781,7 @@ impl VersionSet {
                 }
                 VersionEdit::SetLastSeq(_)
                 | VersionEdit::SetNextFileId(_)
+                | VersionEdit::SetMinWalId(_)
                 | VersionEdit::Reset { .. } => {}
             }
         }
@@ -630,6 +801,9 @@ impl VersionSet {
                 }
                 VersionEdit::SetNextFileId(id) => {
                     version.next_file_id = *id;
+                }
+                VersionEdit::SetMinWalId(id) => {
+                    version.min_wal_id = *id;
                 }
                 VersionEdit::Reset {
                     next_file_id,
@@ -652,8 +826,9 @@ impl VersionSet {
         );
 
         let records: Vec<ManifestRecord> = edits.iter().map(VersionEdit::to_record).collect();
-        let encoded = Self::encode_records(&records)?;
-        let requires_sync = edits.iter().any(VersionEdit::requires_manifest_sync);
+        let (encoded, sealed_under) =
+            Self::encode_records(&records, self.manifest_bytes, self.sealing.as_ref())?;
+        let requires_sync = records.iter().any(ManifestRecord::requires_sync);
         // An append or sync error leaves an uncertain tail. Only reopen
         // may decide which complete frames survived; neither a later
         // append nor a rewrite from the old version may bypass that tail.
@@ -672,6 +847,11 @@ impl VersionSet {
         let live_files: u64 = version.levels.iter().map(|l| l.len() as u64).sum();
         *self.current.write() = Arc::new(version);
         self.manifest_bytes += encoded.len() as u64;
+        if let Some(id) = sealed_under
+            && !self.sealed_under.contains(&id)
+        {
+            self.sealed_under.push(id);
+        }
 
         // The log is append-only, so a database that runs for years
         // replays every edit it ever made unless the file is rewritten.
@@ -696,12 +876,17 @@ impl VersionSet {
     /// Rewrite the manifest from scratch, emitting the current version as
     /// a single compact sequence of records. Readers in the live
     /// `Version` are preserved - we never close their file descriptors.
+    ///
+    /// With a keyring the new manifest is sealed, under a fresh salt and the
+    /// current key, whatever the old one was: this is how a manifest is
+    /// sealed for the first time and how a rotation reaches every batch.
     pub(crate) fn compact_manifest(&mut self) -> io::Result<()> {
         if self.manifest_writer.is_none() {
             return Err(self.writer_unavailable());
         }
+        let sealing = Self::fresh_sealing(self.keyring.as_ref())?;
         let version = self.current();
-        let image = encode_manifest_image(
+        let (image, sealed_under) = encode_image(
             version.next_file_id,
             version.last_seq,
             version.min_wal_id,
@@ -712,6 +897,7 @@ impl VersionSet {
                 .flat_map(|(level, files)| {
                     files.iter().map(move |file| (level, file.meta.clone()))
                 }),
+            sealing.as_ref(),
         )?;
 
         let tmp_path = self.manifest_path.with_extension("tmp");
@@ -731,6 +917,8 @@ impl VersionSet {
         self.env.rename(&tmp_path, &self.manifest_path)?;
         crate::env::sync_parent_dir(&*self.env, &self.manifest_path)?;
         self.manifest_bytes = image.len() as u64;
+        self.sealing = sealing;
+        self.sealed_under = sealed_under.into_iter().collect();
 
         let file = self
             .env
@@ -759,9 +947,13 @@ impl VersionSet {
     /// file length and the open guard still weighs the tables on disk
     /// rather than treating the replay as clean. A file long enough to
     /// carry a stamp but not carrying one is refused.
-    fn stamp_len(data: &[u8]) -> io::Result<usize> {
+    ///
+    /// A sealed stamp also hands back the manifest's salt. Without a
+    /// `keyring` it refuses with [`crate::Error::KeyProviderRequired`]: the
+    /// batches after it cannot be read, and must not read as none.
+    fn stamp_len(data: &[u8], keyring: Option<&Keyring>) -> io::Result<(usize, Option<[u8; 16]>)> {
         if data.len() < MANIFEST_STAMP_LEN {
-            return Ok(0);
+            return Ok((0, None));
         }
         if data[0..7] != MANIFEST_MAGIC {
             return Err(io::Error::new(
@@ -770,6 +962,15 @@ impl VersionSet {
             ));
         }
         let format = data[7];
+        if format == MANIFEST_FORMAT_SEALED {
+            let Some(salt) = sealed::decode_stamp(data)? else {
+                return Ok((0, None));
+            };
+            if keyring.is_none() {
+                return Err(crate::Error::KeyProviderRequired.into_io_error());
+            }
+            return Ok((SEALED_STAMP_LEN, Some(salt)));
+        }
         let stored = u32::from_le_bytes([data[8], data[9], data[10], data[11]]);
         if stored != checksum::manifest_record(0, &data[0..8]) {
             return Err(io::Error::new(
@@ -777,21 +978,38 @@ impl VersionSet {
                 "MANIFEST stamp checksum mismatch",
             ));
         }
-        if format > MANIFEST_FORMAT_V1 {
+        if format > MANIFEST_FORMAT_SEALED {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!(
                     "MANIFEST format {format} was written by a newer regolith than this build, \
-                     which understands up to {MANIFEST_FORMAT_V1}"
+                     which understands up to {MANIFEST_FORMAT_SEALED}"
                 ),
             ));
         }
-        Ok(MANIFEST_STAMP_LEN)
+        Ok((MANIFEST_STAMP_LEN, None))
     }
 
-    fn encode_records(records: &[ManifestRecord]) -> io::Result<Vec<u8>> {
+    /// One batch holding `records`, whose `len` field lands at `offset` of
+    /// the manifest: sealed under the current key when `sealing` is set, in
+    /// which case that key is handed back too.
+    fn encode_records(
+        records: &[ManifestRecord],
+        offset: u64,
+        sealing: Option<&ManifestSeal>,
+    ) -> io::Result<(Vec<u8>, Option<KeyId>)> {
         if records.is_empty() {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), None));
+        }
+        if let Some(sealing) = sealing {
+            let mut plain = Vec::new();
+            for record in records {
+                record.encode(&mut plain);
+            }
+            let sealer = sealing.keyring.current()?;
+            let mut buf = Vec::with_capacity(plain.len() + 64);
+            sealed::encode_batch(&sealer, &sealing.salt, offset, &plain, &mut buf)?;
+            return Ok((buf, Some(sealer.id())));
         }
         // V1 readers already decode every edit inside a frame. Keep that
         // format, but checksum the whole apply so a torn compaction drops
@@ -809,60 +1027,64 @@ impl VersionSet {
         buf[..4].copy_from_slice(&len.to_le_bytes());
         let checksum = checksum::manifest_record(len, &buf[4..]);
         buf.extend_from_slice(&checksum.to_le_bytes());
-        Ok(buf)
+        Ok((buf, None))
     }
 
-    /// Refuse to open when a manifest that did not replay cleanly ends up
-    /// referencing no SSTable at all while the table directory still holds
-    /// one that could carry data.
+    /// What the open makes of the end of the manifest, when replay
+    /// stopped short of it.
     ///
-    /// Replay stops at the first unreadable record and the tail is
-    /// discarded, which is correct for a record that a crash left half
-    /// written. When the *first* record is unreadable the same rule
-    /// silently turns a populated database into an empty one, so that
-    /// combination is reported instead of served: the table files are
-    /// still on disk and only the manifest needs repairing.
+    /// With its stamp in place the end is judged as a write-ahead log's is
+    /// (`tail.rs`): a crash's unsynced tail is dropped and handed back for
+    /// the engine to report, and damage that a later batch proves was
+    /// synced refuses the open, naming the file and both offsets.
     ///
-    /// A crash inside the very first flush leaves the opposite shape: a
-    /// table file that holds nothing, next to a WAL that holds every
-    /// acknowledged write. Refusing on that file would lose the writes
-    /// the WAL still has, so `suspect_tables` rules it out
-    /// before the count is taken.
-    fn reject_discarded_tables(
+    /// Without its stamp the file is one a crash caught while the database
+    /// was created, because the stamp is synced before any table exists. A
+    /// table that may hold data beside it is then no crash's doing, so the
+    /// open refuses, naming the tables, rather than serve an empty database
+    /// over them. A table that provably holds nothing is passed over.
+    fn judge_end(
         env: &dyn Env,
         replay: &ManifestReplay,
-        manifest_len: usize,
+        data: &[u8],
         sst_dir: &Path,
         manifest_path: &Path,
-    ) -> io::Result<()> {
-        let replayed_cleanly = manifest_len > 0 && replay.valid_len == manifest_len;
-        if replayed_cleanly || replay.version.levels.iter().any(|level| !level.is_empty()) {
-            return Ok(());
+        keyring: Option<&Keyring>,
+    ) -> io::Result<Option<DroppedTail>> {
+        if replay.stamp_len == 0 {
+            let suspects = Self::suspect_tables(env, sst_dir, keyring);
+            if !suspects.is_empty() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "{} is damaged at offset 0: it has no header, yet {} table file(s) in {} \
+                         may hold data ({}); the database is left untouched",
+                        manifest_path.display(),
+                        suspects.len(),
+                        sst_dir.display(),
+                        describe_suspects(&suspects),
+                    ),
+                ));
+            }
+            return Ok((!data.is_empty()).then_some(DroppedTail {
+                offset: 0,
+                bytes: data.len() as u64,
+            }));
         }
-        let suspects = Self::suspect_tables(env, sst_dir);
-        if suspects.is_empty() {
-            return Ok(());
+        if replay.valid_len == data.len() {
+            return Ok(None);
         }
-        Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!(
-                "{} is corrupt: it references no SSTable, but {} table file(s) in {} may still hold data. \
-                 Opening would discard them, so the database is left untouched. Suspect tables: {}",
-                manifest_path.display(),
-                suspects.len(),
-                sst_dir.display(),
-                describe_suspects(&suspects),
-            ),
-        ))
+        let sealed = keyring
+            .zip(replay.salt.as_ref())
+            .map(|(keyring, salt)| tail::Opener { keyring, salt });
+        tail::judge(data, replay.valid_len, manifest_path, sealed).map(Some)
     }
 
     /// The unreferenced `*.sst` files that could plausibly hold live data.
     ///
     /// A zero-length table, or one whose footer records no entry and no
-    /// range tombstone, is what a crash inside a flush leaves behind: the
-    /// directory entry reached the journal, the delayed-allocated data
-    /// blocks did not. Such a file cannot be a live table the manifest is
-    /// about to discard, so it is logged and skipped rather than counted.
+    /// range tombstone, holds nothing an open could lose, so it is logged
+    /// and skipped rather than counted.
     ///
     /// Everything else counts, including a file whose footer will not
     /// parse. An unreadable file cannot be proved empty, and keeping the
@@ -871,7 +1093,11 @@ impl VersionSet {
     /// Nothing is deleted here, so a crash part way through recovery
     /// leaves the directory exactly as this pass found it and the next
     /// open reaches the same verdict.
-    fn suspect_tables(env: &dyn Env, sst_dir: &Path) -> Vec<SuspectTable> {
+    fn suspect_tables(
+        env: &dyn Env,
+        sst_dir: &Path,
+        keyring: Option<&Keyring>,
+    ) -> Vec<SuspectTable> {
         let entries = match env.read_dir(sst_dir) {
             Ok(entries) => entries,
             Err(e) => {
@@ -908,7 +1134,7 @@ impl VersionSet {
                 );
                 continue;
             }
-            match table_carries_data(env, &path) {
+            match table_carries_data(env, &path, keyring) {
                 Ok(true) => suspects.push(SuspectTable {
                     path,
                     len,
@@ -931,11 +1157,18 @@ impl VersionSet {
 
     /// Replay every record, then open a reader for each surviving file
     /// through `env` under `policy`.
+    ///
+    /// In a sealed manifest a batch is checked twice: its checksum first,
+    /// which a torn batch fails and which ends replay as in format 1, then
+    /// its tag under the key it names, which only a wrong key or tampering
+    /// fails, and which refuses the open. A batch naming a key `keyring`
+    /// does not provide refuses with [`crate::Error::UnknownKey`].
     fn replay_manifest(
         env: &Arc<dyn Env>,
         data: &[u8],
         sst_dir: &Path,
         policy: MetadataPolicy,
+        keyring: Option<&Keyring>,
     ) -> io::Result<ManifestReplay> {
         // Two-pass replay. The first pass walks every record and tracks
         // the *logical* state of each level - which file ids are live -
@@ -954,39 +1187,33 @@ impl VersionSet {
         let mut min_wal_id: u64 = 0;
         // The stamp is not a record. `valid_len` starts past it so a
         // clean replay ends exactly at the file length, which is what
-        // `reject_discarded_tables` compares against.
-        let stamp = Self::stamp_len(data)?;
+        // `judge_end` compares against.
+        let (stamp, salt) = Self::stamp_len(data, keyring)?;
         let mut offset = stamp;
         let mut valid_len = stamp;
+        let mut key_ids = Vec::new();
 
         while offset < data.len() {
-            if data.len() - offset < 4 {
-                tracing::warn!("Truncated manifest record header, stopping replay");
+            // The first batch that does not read back whole ends replay;
+            // `judge_end` decides what the bytes from there on are.
+            let Some(batch) = tail::batch_at(data, offset) else {
                 break;
-            }
-
-            let len = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap()) as usize;
-            offset += 4;
-
-            if len
-                .checked_add(4)
-                .is_none_or(|framed_len| framed_len > data.len() - offset)
-            {
-                tracing::warn!("Truncated manifest record, stopping replay");
-                break;
-            }
-
-            let record_data = &data[offset..offset + len];
-            offset += len;
-
-            let stored_checksum = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap());
-            offset += 4;
-
-            let computed_checksum = checksum::manifest_record(len as u32, record_data);
-            if stored_checksum != computed_checksum {
-                tracing::warn!("Manifest checksum mismatch, stopping replay");
-                break;
-            }
+            };
+            // A sealed batch's edits, decrypted into a buffer of their own.
+            let opened;
+            let record_data = match (&salt, keyring) {
+                (Some(salt), Some(keyring)) => {
+                    let (id, edits) =
+                        sealed::open_batch(keyring, salt, offset as u64, batch.records)?;
+                    if !key_ids.contains(&id) {
+                        key_ids.push(id);
+                    }
+                    opened = edits;
+                    opened.as_slice()
+                }
+                _ => batch.records,
+            };
+            offset = batch.end;
 
             let mut pos = 0;
             while let Some(record) = ManifestRecord::decode(record_data, &mut pos)? {
@@ -1038,8 +1265,11 @@ impl VersionSet {
             for meta in files {
                 let path = sst_dir.join(sst_filename(meta.file_id));
                 let reader = Arc::new(
-                    SsTableReader::open_with(env, &path, meta.file_id, policy)
+                    SsTableReader::open_with(env, &path, meta.file_id, policy, keyring)
                         .map_err(|e| {
+                            if crate::Error::is_typed(&e) {
+                                return e;
+                            }
                             std::io::Error::new(e.kind(), format!("open {}: {e}", path.display()))
                         })?
                         .with_global_seq(meta.global_seq),
@@ -1059,7 +1289,13 @@ impl VersionSet {
             ));
         }
 
-        Ok(ManifestReplay { version, valid_len })
+        Ok(ManifestReplay {
+            version,
+            valid_len,
+            stamp_len: stamp,
+            salt,
+            key_ids,
+        })
     }
 }
 
@@ -1434,7 +1670,11 @@ mod tests {
             meta: test_meta(1),
         }];
         let mut bytes = VersionSet::encode_stamp().to_vec();
-        bytes.extend(VersionSet::encode_records(&records).unwrap());
+        bytes.extend(
+            VersionSet::encode_records(&records, MANIFEST_STAMP_LEN as u64, None)
+                .unwrap()
+                .0,
+        );
         std::fs::write(dir.path().join("MANIFEST"), bytes).unwrap();
 
         let kind = match VersionSet::open(dir.path(), &sst_dir) {
@@ -1737,11 +1977,12 @@ mod tests {
     #[test]
     fn a_manifest_from_a_newer_format_is_refused() {
         let mut stamp = VersionSet::encode_stamp();
-        stamp[7] = MANIFEST_FORMAT_V1 + 1;
+        stamp[7] = MANIFEST_FORMAT_SEALED + 1;
         let checksum = checksum::manifest_record(0, &stamp[0..8]);
         stamp[8..12].copy_from_slice(&checksum.to_le_bytes());
 
-        let err = VersionSet::stamp_len(&stamp).expect_err("a newer format must not be parsed");
+        let err =
+            VersionSet::stamp_len(&stamp, None).expect_err("a newer format must not be parsed");
         assert!(err.to_string().contains("newer regolith"), "{err}");
     }
 

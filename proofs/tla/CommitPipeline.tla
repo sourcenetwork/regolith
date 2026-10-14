@@ -72,9 +72,10 @@
 \*     slots at or below its own (4.7 item 10). That is enough for
 \*     progress, and nobody does work it does not need.
 \*   - The ingest's install is helpable, as a queued background job (4.10:
-\*     ingest returns a ticket and runs as a background job or under
-\*     poll_io). Were it runnable only by the ingesting thread, a stopped
-\*     ingest would block every later commit: the NoHelping shape.
+\*     ingest returns a ticket and runs as a background job or as a unit
+\*     on the caller's I/O queue, D53). Were it runnable only by the
+\*     ingesting thread, a stopped ingest would block every later commit:
+\*     the NoHelping shape.
 \*   - The ingest is not validated and conflicts with later commits that
 \*     write a key it installs from a snapshot below it.
 \*

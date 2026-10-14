@@ -302,7 +302,16 @@ loom-sync-deep model="":
     RUSTFLAGS="--cfg loom" cargo test --release --test loom_sync --no-run
     RUSTFLAGS="--cfg loom" timeout 15m cargo test --release --test loom_sync -- --ignored {{model}}
 
-loom-all: loom loom-debug loom-sync
+# Loom models for the per-thread I/O queues (D53): the unit claim, the
+# completion pushed to every waiting queue, the idle waker, a read's wait,
+# and close meeting a miss under way, with five calibrations that must
+# fail. Release only, like
+# `loom-sync`: the wait model explores close to 0.8 million interleavings.
+loom-io:
+    RUSTFLAGS="--cfg loom" cargo test --release --test loom_io_queue --no-run
+    RUSTFLAGS="--cfg loom" timeout 10m cargo test --release --test loom_io_queue
+
+loom-all: loom loom-debug loom-sync loom-io
 
 # The read-view chaos workload at full size: 6 instances x 2 rounds x 400
 # versions. Measured at over 20 minutes wall and 4h of CPU unoptimized,
@@ -489,7 +498,8 @@ tla:
     check MC_IngestPublication_Green                   GREEN
     check MC_IngestPublication_Red_CommitPassesSlot    RED RepeatableSnapshot
     check MC_IngestPublication_Red_IngestPublishesEarly RED RepeatableSnapshot
-    # D48: an ingest syncs the log before its manifest record. TLC only.
+    # D48: an ingest syncs the log before its manifest record. Lean:
+    # Regolith/IngestDurability.lean, surviving_ingest_keeps_prefix.
     spec=IngestDurability
     check MC_IngestDurability_Green                    GREEN
     check MC_IngestDurability_Red_NoLogSync            RED GapFreePrefix
@@ -557,6 +567,48 @@ tla:
     check MC_WalRecovery_Red_CloseWithoutSync          RED RecoveryOpens
     check MC_WalRecovery_Red_NoTruncate                RED RecoveryOpens
     check MC_WalRecovery_Red_StampNotSealed            RED AckedSurvive
+    check MC_WalRecovery_Red_StampUnsynced             RED RecoveryOpens
+    # E29, E30: the manifest's torn end and the logs a flush retires, on a
+    # sealed manifest and with flushes on several threads. Lean:
+    # Regolith/ManifestRecovery.lean, crash_never_proves, replay_keeps_synced,
+    # replay_never_above_newer_table, crash_never_proves_opened,
+    # oldest_first_keeps_every_log.
+    spec=ManifestRecovery
+    check MC_ManifestRecovery_Green                    GREEN
+    check MC_ManifestRecovery_Green_Refuses            RED NeverRefusesRot
+    check MC_ManifestRecovery_Red_OldGuard             RED RecoveryOpens
+    check MC_ManifestRecovery_Red_NoSyncBeforeNext     RED RecoveryOpens
+    check MC_ManifestRecovery_Red_UnlinkBeforeSync     RED AckedSurvive
+    check MC_ManifestRecovery_Red_RetireBeforeTable    RED AckedSurvive
+    check MC_ManifestRecovery_Red_NoMinWalId           RED ReadsNewest
+    check MC_ManifestRecovery_Red_IgnoreProof          RED RotSafe
+    check MC_ManifestRecovery_Green_Sealed             GREEN
+    check MC_ManifestRecovery_Red_JudgeCiphertext      RED RecoveryOpens
+    check MC_ManifestRecovery_Green_Frozen2            GREEN
+    check MC_ManifestRecovery_Red_NewestFirst          RED AckedSurvive
+    # 4.12, D45: a sealed manifest batch keeps its checksum, checked before
+    # any key. Lean: Regolith/ManifestSeal.lean, replay_opens_with_right_keys,
+    # open_ends_only_at_a_torn_batch.
+    spec=ManifestSeal
+    check MC_ManifestSeal_Green                        GREEN
+    check MC_ManifestSeal_Red_TagOnlyStop              RED OnlyTornEnds
+    check MC_ManifestSeal_Red_TagOnlyRefuse            RED RecoveryOpens
+    # 4.12, D57: a backup of an encrypted database seals its metadata, and a
+    # restore checks every key before its first write. Lean:
+    # Regolith/BackupSeal.lean, entitled_restore_is_faithful,
+    # refusal_writes_nothing, collect_keeps_listed, last_write_holds_all.
+    spec=BackupSeal
+    check MC_BackupSeal_Green                          GREEN
+    check MC_BackupSeal_Red_PlainMeta                  RED SealedMetadata
+    check MC_BackupSeal_Red_PlainRestore               RED SealedMetadata
+    check MC_BackupSeal_Red_OpenUnderCurrent           RED RightKeysRestore
+    check MC_BackupSeal_Red_ListingUnbound             RED FaithfulRestore
+    check MC_BackupSeal_Red_IdUnbound                  RED FaithfulRestore
+    check MC_BackupSeal_Red_ManifestFirst              RED FaithfulRestore
+    check MC_BackupSeal_Red_OverDatabase               RED FaithfulRestore
+    check MC_BackupSeal_Red_CheckAfterCopy             RED RefusalWritesNothing
+    check MC_BackupSeal_Red_GcSkipsSealed              RED ListedRestores
+    check MC_BackupSeal_Red_MetaFirst                  RED ListedRestores
     # 4.8, E5: compaction per snapshot stripe. Lean: Regolith/Stripes.lean,
     # reduce_reads.
     spec=StripeCompaction
@@ -568,7 +620,7 @@ tla:
     check MC_StripeCompaction_Red_IgnoreStripes        RED SnapshotReadsKept
     # E27: a pass retires a range tombstone below its range and every
     # snapshot. Green_Retires is the witness that the fix retires at all.
-    # TLC only.
+    # Lean: Regolith/TombstoneRetirement.lean, retire_keeps_reads.
     spec=TombstoneRetirement
     check MC_TombstoneRetirement_Green                 GREEN
     check MC_TombstoneRetirement_Green_Retires         RED NothingRetired
@@ -584,8 +636,13 @@ tla:
     spec=GroupCommit
     check MC_GroupCommit_Green                         GREEN
     check MC_GroupCommit_Green_Live                    GREEN
+    check MC_GroupCommit_Green_LivePlain               GREEN
+    check MC_GroupCommit_Green_ReadOnly                GREEN
     check MC_GroupCommit_Red_ViewOnly                  RED SerialEquivalent
+    check MC_GroupCommit_Red_TrustEarly                RED SerialEquivalent
     check MC_GroupCommit_Red_PublishBeforeSync         RED DurableBeforeVisible
+    # E21, the bounded leader: one group per turn, then hand off.
+    check MC_GroupCommit_Red_DrainAll                  RED BoundedTurn
     # 4.7, the lock-free commit pipeline. Lean: Regolith/Pipeline.lean,
     # seqs_dense and reader_sees_published.
     spec=CommitPipeline
@@ -598,14 +655,23 @@ tla:
     check MC_CommitPipeline_Red_NoHelping              RED NoLiveThreadBlocked
     check MC_CommitPipeline_Red_SyncPastGap            RED DurableImpliesWritten
     check MC_CommitPipeline_Red_ValidatePublished      RED NoLostUpdate
-    # R13, non-blocking calls: tickets, poll_io, io_pending, CacheOnly reads.
-    # TLC only; wakeups are interleavings with no law over sizes to prove.
+    # R13 and D53, non-blocking reads on per-thread I/O queues: single-flight
+    # units claimed by one CAS, completions only on the asking queue, idle
+    # wakeups. Lean: Regolith/IoQueue.lean, claim_once, told_at_most_once,
+    # every_waiter_told, no_lost_idle_wakeup, busy_never_woken,
+    # single_thread_finishes.
     spec=NonBlocking
     check MC_NonBlocking_Green_Pool                    GREEN
     check MC_NonBlocking_Green_PoolLive                GREEN
+    check MC_NonBlocking_Green_Jobs                    GREEN
+    check MC_NonBlocking_Green_JobsLive                GREEN
     check MC_NonBlocking_Green_Single                  GREEN
-    check MC_NonBlocking_Red_LostWakeup                RED NoLostWakeup
-    check MC_NonBlocking_Red_SilentSelfIo              RED IoPendingFires
+    check MC_NonBlocking_Green_SingleLive              GREEN
+    check MC_NonBlocking_Red_WrongQueue                RED OwnQueue
+    check MC_NonBlocking_Red_LostIdleWakeup            RED NoLostIdleWakeup
+    check MC_NonBlocking_Red_DoubleRun                 RED SingleRun
+    check MC_NonBlocking_Red_SelfIoNowhere             RED NoOrphanUnit
+    check MC_NonBlocking_Red_BusyWoken                 RED BusyNeverWoken
     # regolith::sync's locks after D49: barging with bounded bypass, for
     # Mutex, Semaphore and ReentrantMutex. Lean: Regolith/Sync.lean,
     # mutual_exclusion, bounded_bypass, owed_exclusive.

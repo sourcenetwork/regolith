@@ -109,6 +109,7 @@ impl SstFileWriter {
             opts.prefix_extractor.clone(),
             opts.partitioned_index,
             opts.metadata_block_size,
+            opts.keyring().as_deref(),
         )
         .map_err(crate::Error::from)?;
         Ok(Self {

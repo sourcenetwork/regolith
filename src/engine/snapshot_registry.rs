@@ -159,14 +159,41 @@ impl SnapshotRegistry {
     /// Too short burns a core during a shutdown that is waiting on a
     /// long scan; too long adds its own latency to every clean
     /// shutdown. Waiting on the release itself has neither cost.
+    ///
+    /// Time is read through the env (E15): `Instant::now` panics on
+    /// `wasm32-unknown-unknown`. On a target with one thread no other thread
+    /// can release a pin while this one waits, so it reports what is still
+    /// pinned at once instead of waiting on a signal nobody can send.
     pub(crate) fn wait_until_drained(&self, timeout: std::time::Duration) -> u64 {
+        self.wait_until_drained_on(timeout, crate::env::PLATFORM_THREADS)
+    }
+
+    /// [`Self::wait_until_drained`] on a target that has other threads
+    /// (`threads`) or only this one.
+    fn wait_until_drained_on(&self, timeout: std::time::Duration, threads: bool) -> u64 {
+        if !threads {
+            return self.live_count();
+        }
+        let timeout_micros = u64::try_from(timeout.as_micros()).unwrap_or(u64::MAX);
+        // `None` where the env has no clock: the wait is then one wait of
+        // the whole timeout, ended early only by a release.
+        let deadline = self
+            .env
+            .now_micros()
+            .map(|now| now.saturating_add(timeout_micros));
         self.waiters.fetch_add(1, Ordering::AcqRel);
-        let deadline = std::time::Instant::now() + timeout;
         let mut active = self.active.lock();
+        let mut waited = false;
         while !active.is_empty() {
-            let Some(remaining) = deadline.checked_duration_since(std::time::Instant::now()) else {
-                break;
+            let remaining = match deadline {
+                Some(deadline) => match self.env.now_micros() {
+                    Some(now) if now < deadline => std::time::Duration::from_micros(deadline - now),
+                    _ => break,
+                },
+                None if waited => break,
+                None => timeout,
             };
+            waited = true;
             let (next, _) = self
                 .drained
                 .wait_timeout(active, remaining)
@@ -464,5 +491,81 @@ mod tests {
         r.release(3);
         assert_eq!(r.wait_until_drained(std::time::Duration::from_secs(1)), 0);
         assert_eq!(r.waiting(), 0);
+    }
+
+    /// E15: on a target with one thread nothing can release a pin while the
+    /// wait runs, so it reports the pins at once, however long the timeout.
+    #[test]
+    fn with_one_thread_the_wait_reports_what_is_pinned_at_once() {
+        let r = SnapshotRegistry::new();
+        r.register(3);
+        r.register(3);
+        assert_eq!(
+            r.wait_until_drained_on(std::time::Duration::from_secs(3600), false),
+            2
+        );
+        assert_eq!(r.waiting(), 0, "nothing waited");
+        r.release(3);
+        r.release(3);
+        assert_eq!(
+            r.wait_until_drained_on(std::time::Duration::from_secs(3600), false),
+            0
+        );
+    }
+
+    /// E15: the timeout is measured on the env's clock, not the host's. With
+    /// the env's clock stopped the wait outlives its timeout in host time,
+    /// and moving the env's clock past the deadline ends it.
+    #[test]
+    fn the_wait_reads_time_through_the_env() {
+        let env = crate::env::MemEnv::new();
+        let r = std::sync::Arc::new(SnapshotRegistry::with_env(std::sync::Arc::new(env.clone())));
+        r.register(3);
+        let (done, waited) = std::sync::mpsc::channel();
+        let waiter = {
+            let r = std::sync::Arc::clone(&r);
+            std::thread::spawn(move || {
+                done.send(r.wait_until_drained(std::time::Duration::from_millis(5)))
+                    .unwrap();
+            })
+        };
+        assert!(
+            waited
+                .recv_timeout(std::time::Duration::from_millis(200))
+                .is_err(),
+            "the wait ended on the host's clock while the env's stood still"
+        );
+        env.advance_micros(1_000_000);
+        let remaining = waited
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .expect("the env's clock passed the deadline");
+        assert_eq!(remaining, 1);
+        waiter.join().unwrap();
+    }
+
+    /// E15: with no clock the wait is one wait of the timeout, ended early by
+    /// the last release.
+    #[test]
+    fn with_no_clock_the_wait_is_one_wait_of_the_timeout() {
+        let env = crate::env::MemEnv::new();
+        env.set_clocks(None, None);
+        let r = std::sync::Arc::new(SnapshotRegistry::with_env(std::sync::Arc::new(env)));
+        r.register(3);
+        assert_eq!(r.wait_until_drained(std::time::Duration::from_millis(5)), 1);
+
+        let releaser = {
+            let r = std::sync::Arc::clone(&r);
+            std::thread::spawn(move || {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+                let mut pause = std::time::Duration::from_micros(100);
+                while r.waiting() == 0 && std::time::Instant::now() < deadline {
+                    std::thread::sleep(pause);
+                    pause = (pause * 2).min(std::time::Duration::from_millis(10));
+                }
+                r.release(3);
+            })
+        };
+        assert_eq!(r.wait_until_drained(std::time::Duration::from_secs(60)), 0);
+        releaser.join().unwrap();
     }
 }

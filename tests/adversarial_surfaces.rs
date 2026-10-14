@@ -260,7 +260,7 @@ fn a_backup_taken_under_load_restores_whole_batches() {
     }
 
     let restore_dir = TempDir::new().unwrap();
-    engine.restore(id, restore_dir.path()).unwrap();
+    engine.restore(id, restore_dir.path(), None).unwrap();
     let restored = Db::open(restore_dir.path(), Options::default()).unwrap();
 
     let mut counts: HashMap<(usize, usize), usize> = HashMap::new();

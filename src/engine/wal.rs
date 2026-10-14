@@ -75,7 +75,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use super::checksum;
+use super::seal::{Keyring, Sealer};
 use super::wal_frame;
+use super::wal_seal;
 use crate::WriteBatchOp;
 use crate::env::{Env, WriteFile, WriteMode};
 
@@ -139,13 +141,23 @@ pub(crate) struct Wal {
     closed: bool,
     /// A small record's frame and payload, joined so they leave in one
     /// plain write; reused, and never larger than [`COALESCE_LEN`] plus
-    /// a frame.
+    /// a frame. In a sealed log every record is joined, to be encrypted in
+    /// place, and the buffer is kept only up to [`SEALED_KEEP_LEN`].
     joined: Vec<u8>,
+    /// Set when the log is sealed (`super::wal_seal`): every record's
+    /// payload is sealed under this key, the one its stamp names.
+    seal: Option<Sealer>,
+    /// Bytes of the stamp, which a rollback never truncates into.
+    stamp_len: u64,
 }
 
 /// Largest payload copied next to its frame for one plain write. Past it a
 /// vectored write costs less than the copy.
 const COALESCE_LEN: usize = 4096;
+
+/// Largest buffer a sealed log keeps between records. A larger group's
+/// buffer is released once written, so one huge group does not pin its size.
+const SEALED_KEEP_LEN: usize = 1 << 20;
 
 /// A replayed WAL entry.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -172,34 +184,60 @@ pub(crate) enum WalEntry {
 }
 
 impl Wal {
-    /// Create a new WAL file at the given path.
-    pub(crate) fn create_in(env: &Arc<dyn Env>, path: &Path) -> io::Result<Self> {
-        // Named on failure: creating a log at a path a previous log was
-        // unlinked from is the interesting case, because on Windows an
-        // unlinked file whose handle is still open keeps its name until
-        // that handle closes, and creating over it is refused.
-        let mut file = env.open_write(path, WriteMode::Truncate).map_err(|e| {
-            io::Error::new(e.kind(), format!("creating wal {}: {e}", path.display()))
-        })?;
+    /// Create a new WAL file at the given path, sealed under the current
+    /// key of `keyring` when one is given.
+    ///
+    /// A sealed log's stamp is durable before this returns, and the log
+    /// appears under its name only then (`super::wal_seal`).
+    pub(crate) fn create_in(
+        env: &Arc<dyn Env>,
+        path: &Path,
+        keyring: Option<&Keyring>,
+    ) -> io::Result<Self> {
         let nonce = fresh_nonce(env.as_ref(), path);
-        file.write_all(&wal_frame::encode_stamp(nonce))?;
+        let named = |e: io::Error| {
+            if crate::Error::is_typed(&e) {
+                return e;
+            }
+            io::Error::new(e.kind(), format!("creating wal {}: {e}", path.display()))
+        };
+        let (file, seal, stamp_len, synced) = match keyring {
+            Some(keyring) => {
+                let sealer = keyring.current().map_err(named)?;
+                let stamp = wal_seal::encode_stamp(nonce, &sealer)?;
+                let file = wal_seal::create_durably(env, path, &stamp).map_err(named)?;
+                (file, Some(sealer), stamp.len() as u64, true)
+            }
+            None => {
+                // Named on failure: creating a log at a path a previous log
+                // was unlinked from is the interesting case, because on
+                // Windows an unlinked file whose handle is still open keeps
+                // its name until that handle closes, and creating over it
+                // is refused.
+                let mut file = env.open_write(path, WriteMode::Truncate).map_err(named)?;
+                file.write_all(&wal_frame::encode_stamp(nonce))?;
+                (file, None, wal_frame::STAMP_LEN as u64, false)
+            }
+        };
         Ok(Self {
             file,
-            offset: wal_frame::STAMP_LEN as u64,
+            offset: stamp_len,
             path: path.to_path_buf(),
-            parent_synced: false,
+            parent_synced: synced,
             env: Arc::clone(env),
             nonce,
-            synced_through: 0,
+            synced_through: if synced { stamp_len } else { 0 },
             closed: false,
             joined: Vec::new(),
+            seal,
+            stamp_len,
         })
     }
 
     /// Create a WAL through the standard environment.
     #[cfg(test)]
     pub(crate) fn create(path: &Path) -> io::Result<Self> {
-        Self::create_in(&crate::env::std_env(), path)
+        Self::create_in(&crate::env::std_env(), path, None)
     }
 
     /// Append one commit group, whose operations `entries` holds, as one
@@ -231,6 +269,25 @@ impl Wal {
     }
 
     fn write_record(&mut self, kind: u8, payload: &[u8]) -> io::Result<()> {
+        if let Some(sealer) = &self.seal {
+            wal_seal::frame_record(
+                sealer,
+                kind,
+                payload,
+                self.synced_through,
+                self.nonce,
+                self.offset,
+                &mut self.joined,
+            )?;
+            let written = self.file.write_all(&self.joined);
+            let len = self.joined.len();
+            if self.joined.capacity() > SEALED_KEEP_LEN {
+                self.joined = Vec::new();
+            }
+            written?;
+            self.offset += len as u64;
+            return Ok(());
+        }
         let header =
             wal_frame::encode_header(kind, payload, self.synced_through, self.nonce, self.offset);
         if payload.len() <= COALESCE_LEN {
@@ -269,6 +326,11 @@ impl Wal {
         self.offset
     }
 
+    /// The key this log is sealed under, or `None` when it is not sealed.
+    pub(crate) fn seal_key(&self) -> Option<crate::KeyId> {
+        self.seal.as_ref().map(Sealer::id)
+    }
+
     /// Truncate back to `offset` and reposition the write cursor there.
     ///
     /// Called when a group's append or sync failed, so a partially
@@ -278,7 +340,7 @@ impl Wal {
         // The stamp is not a record and is never rolled back over: doing
         // so would leave an unidentifiable file behind.
         debug_assert!(
-            offset >= wal_frame::STAMP_LEN as u64,
+            offset >= self.stamp_len,
             "rollback must not truncate into the WAL stamp"
         );
         // The handle appends, so truncating is enough to move the write
@@ -397,6 +459,7 @@ impl Wal {
             &crate::env::std_env(),
             path,
             super::wal_replay::WalPosition::Newest,
+            None,
         )?;
         let mut entries = Vec::new();
         while let Some(entry) = iter.next_entry()? {
@@ -851,6 +914,11 @@ pub(super) fn stamp_was_written(head: &[u8]) -> bool {
     if head_check == checksum::wal_stamp(&WAL_MAGIC, format, reserved) {
         return true;
     }
+    let mut restored = head.to_vec();
+    restored[0..4].copy_from_slice(&WAL_MAGIC);
+    if wal_seal::stamp_check_holds(&restored) {
+        return true;
+    }
     if head.len() < wal_frame::STAMP_LEN {
         return false;
     }
@@ -861,6 +929,7 @@ pub(super) fn stamp_was_written(head: &[u8]) -> bool {
             &head[wal_frame::STAMP_LEN..],
             u64::from_le_bytes(nonce),
             wal_frame::STAMP_LEN as u64,
+            false,
         )
         .is_some()
 }

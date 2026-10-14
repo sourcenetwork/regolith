@@ -40,12 +40,14 @@ pub(crate) enum WalPosition {
 }
 
 use super::checksum;
+use super::seal::{Keyring, Sealer};
 use super::wal::{
     RECORD_BATCH, RECORD_DELETE, RECORD_DELETE_RANGE, RECORD_MERGE, RECORD_PUT, TailVerdict,
     WAL_STAMP_LEN, WalEntry, parse_delete_range_record, parse_delete_record, parse_merge_record,
     parse_put_record, read_exact_or_truncated,
 };
 use super::wal_frame;
+use super::wal_seal;
 use super::wal_v1::{
     classify_incomplete_record, classify_unusable_record, parse_batch_record, read_wal_header,
 };
@@ -81,8 +83,14 @@ pub(crate) struct WalReplayIter {
     /// not reallocated after that.
     payload: Vec<u8>,
     /// Where the next operation of the current format 2 group starts in
-    /// `payload`; at `payload.len()` the group is done.
+    /// `payload`; at `group_end` the group is done.
     group_at: usize,
+    /// Where the current group's operations end in `payload`: its length,
+    /// or, in a sealed log, the start of the tag.
+    group_end: usize,
+    /// Set when the log is sealed: every record's payload opens under this
+    /// key, the one the sealed stamp names.
+    seal: Option<Sealer>,
     /// Entries decoded from the current format 1 batch record, drained in
     /// order.
     pending: VecDeque<WalEntry>,
@@ -129,28 +137,65 @@ impl WalReplayIter {
     /// A log with no stamp yields nothing. The newest such log is reported
     /// as discarded whole when it holds any byte; an earlier one holding
     /// anything but zeros is damage and refuses here.
-    pub(crate) fn open(env: &Arc<dyn Env>, path: &Path, position: WalPosition) -> io::Result<Self> {
+    ///
+    /// A sealed log (`super::wal_seal`) opens only through `keyring`,
+    /// under the key its stamp names, and refuses, naming the file, when
+    /// the stamp's tag fails: a wrong key never reads as a torn tail.
+    pub(crate) fn open(
+        env: &Arc<dyn Env>,
+        path: &Path,
+        position: WalPosition,
+        keyring: Option<&Keyring>,
+    ) -> io::Result<Self> {
         let cursor = ReadFileCursor::new(env.open_read(path)?)?;
         let file_len = cursor.len();
         let mut reader = BufReader::new(cursor);
 
-        let mut stamp = [0u8; wal_frame::STAMP_LEN];
+        let mut stamp = [0u8; wal_seal::SEALED_STAMP_LEN];
         let head = read_full(&mut reader, &mut stamp[..WAL_STAMP_LEN])?;
         let named = super::wal::validate_wal_stamp(&stamp[..head])
             .map_err(|e| io::Error::new(e.kind(), format!("{}: {e}", path.display())))?;
+        let flags = u16::from_le_bytes([stamp[6], stamp[7]]);
+        let mut seal = None;
         let (framing, consumed) = match named {
             None => (Framing::Unstamped, 0),
-            Some(2) => {
+            Some(2) if flags == wal_seal::FLAG_SEALED => {
                 let rest = read_full(&mut reader, &mut stamp[WAL_STAMP_LEN..])?;
+                if WAL_STAMP_LEN + rest < wal_seal::SEALED_STAMP_LEN {
+                    // A sealed log appears under its name only once its
+                    // whole stamp is durable, so this is not a crash.
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("{}: the write-ahead log header is damaged", path.display()),
+                    ));
+                }
+                let (nonce, sealer) = wal_seal::open_stamp(&stamp, keyring, path)?;
+                seal = Some(sealer);
+                (Framing::V2 { nonce }, wal_seal::SEALED_STAMP_LEN as u64)
+            }
+            Some(2) if flags == 0 => {
+                let rest = read_full(&mut reader, &mut stamp[WAL_STAMP_LEN..wal_frame::STAMP_LEN])?;
                 if WAL_STAMP_LEN + rest < wal_frame::STAMP_LEN {
                     // A stamp torn by a crash while the log was created.
                     (Framing::Unstamped, 0)
                 } else {
-                    let nonce = wal_frame::stamp_nonce(&stamp).map_err(|e| {
+                    let mut plain = [0u8; wal_frame::STAMP_LEN];
+                    plain.copy_from_slice(&stamp[..wal_frame::STAMP_LEN]);
+                    let nonce = wal_frame::stamp_nonce(&plain).map_err(|e| {
                         io::Error::new(e.kind(), format!("{}: {e}", path.display()))
                     })?;
                     (Framing::V2 { nonce }, wal_frame::STAMP_LEN as u64)
                 }
+            }
+            Some(2) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "{}: the write-ahead log header carries flags {flags:#x}, which this \
+                         version of regolith cannot read; open it with the version that wrote it",
+                        path.display()
+                    ),
+                ));
             }
             Some(_) => (Framing::V1, WAL_STAMP_LEN as u64),
         };
@@ -162,6 +207,8 @@ impl WalReplayIter {
             consumed,
             payload: Vec::new(),
             group_at: 0,
+            group_end: 0,
+            seal,
             pending: VecDeque::new(),
             tail: None,
             position,
@@ -284,8 +331,9 @@ impl WalReplayIter {
 
     fn next_v2_entry(&mut self, nonce: u64) -> io::Result<Option<WalEntry>> {
         loop {
-            if self.group_at < self.payload.len() {
-                let (entry, len) = wal_frame::decode_entry(&self.payload[self.group_at..])?;
+            if self.group_at < self.group_end {
+                let (entry, len) =
+                    wal_frame::decode_entry(&self.payload[self.group_at..self.group_end])?;
                 self.group_at += len;
                 return Ok(Some(entry));
             }
@@ -300,9 +348,9 @@ impl WalReplayIter {
     }
 
     /// Read the format 2 record at `consumed`. `Ok(false)` when it is not
-    /// usable: the file ends inside it, a check fails, or its operations
-    /// do not parse. A group's operations are all checked here, before
-    /// any is yielded, so a group is replayed whole or not at all.
+    /// usable: the file ends inside it, a check or its tag fails, or its
+    /// operations do not parse. A group's operations are all checked here,
+    /// before any is yielded, so a group is replayed whole or not at all.
     fn read_v2_record(&mut self, nonce: u64) -> io::Result<bool> {
         let offset = self.consumed;
         let remaining = self.file_len - offset;
@@ -311,7 +359,8 @@ impl WalReplayIter {
         }
         let mut bytes = [0u8; wal_frame::HEADER_LEN];
         read_exact_or_truncated(&mut self.reader, &mut bytes, "truncated WAL record header")?;
-        let Some(header) = wal_frame::decode_header(&bytes, nonce, offset) else {
+        let Some(header) = wal_frame::decode_header(&bytes, nonce, offset, self.seal.is_some())
+        else {
             return Ok(false);
         };
         // Checked before anything is sized from the length, so a header
@@ -323,12 +372,23 @@ impl WalReplayIter {
         self.payload.clear();
         self.payload.resize(header.len as usize, 0);
         read_exact_or_truncated(&mut self.reader, &mut self.payload, "truncated WAL record")?;
-        if !header.payload_matches(&self.payload) || !wal_frame::entries_are_whole(&self.payload) {
+        let operations = match &self.seal {
+            Some(sealer) => {
+                wal_seal::open_record(sealer, &header.fields(), nonce, offset, &mut self.payload)
+            }
+            None => header
+                .payload_matches(&self.payload)
+                .then_some(0..self.payload.len()),
+        };
+        let Some(operations) =
+            operations.filter(|ops| wal_frame::entries_are_whole(&self.payload[ops.clone()]))
+        else {
             self.payload.clear();
             return Ok(false);
-        }
+        };
         self.consumed += header.record_len();
-        self.group_at = 0;
+        self.group_at = operations.start;
+        self.group_end = operations.end;
         self.closed = header.kind == wal_frame::KIND_CLOSE;
         Ok(true)
     }
@@ -339,6 +399,7 @@ impl WalReplayIter {
     fn unusable_v2_record(&mut self, nonce: u64, offset: u64) -> io::Result<Option<WalEntry>> {
         self.payload.clear();
         self.group_at = 0;
+        self.group_end = 0;
         if self.position == WalPosition::Earlier {
             return Err(self.damage_in_a_closed_file(offset));
         }
@@ -354,6 +415,7 @@ impl WalReplayIter {
                 offset + 1,
                 self.file_len,
                 offset,
+                self.seal.as_ref(),
             )?
         };
         if let Some(synced) = proof {
@@ -472,7 +534,8 @@ mod tests {
     use tempfile::TempDir;
 
     fn drain(path: &Path) -> io::Result<Vec<WalEntry>> {
-        let mut iter = WalReplayIter::open(&crate::env::std_env(), path, WalPosition::Newest)?;
+        let mut iter =
+            WalReplayIter::open(&crate::env::std_env(), path, WalPosition::Newest, None)?;
         let mut out = Vec::new();
         while let Some(entry) = iter.next_entry()? {
             out.push(entry);
@@ -580,7 +643,7 @@ mod tests {
         std::fs::write(&path, &bytes).unwrap();
 
         let mut iter =
-            WalReplayIter::open(&crate::env::std_env(), &path, WalPosition::Newest).unwrap();
+            WalReplayIter::open(&crate::env::std_env(), &path, WalPosition::Newest, None).unwrap();
         assert!(
             iter.next_entry().unwrap().is_some(),
             "first record is whole"
@@ -618,7 +681,7 @@ mod tests {
         bytes[first_end - 1] ^= 0xFF;
         std::fs::write(&path, &bytes).unwrap();
         let mut iter =
-            WalReplayIter::open(&crate::env::std_env(), &path, WalPosition::Newest).unwrap();
+            WalReplayIter::open(&crate::env::std_env(), &path, WalPosition::Newest, None).unwrap();
         let err = iter.next_entry().expect_err("checksum must not pass");
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
 
@@ -627,7 +690,7 @@ mod tests {
         bytes[last] ^= 0xFF;
         std::fs::write(&path, &bytes).unwrap();
         let mut iter =
-            WalReplayIter::open(&crate::env::std_env(), &path, WalPosition::Newest).unwrap();
+            WalReplayIter::open(&crate::env::std_env(), &path, WalPosition::Newest, None).unwrap();
         assert!(iter.next_entry().unwrap().is_some());
         assert!(iter.next_entry().unwrap().is_none());
         assert_eq!(iter.discarded_tail().unwrap().offset, first_end as u64);
@@ -644,7 +707,7 @@ mod tests {
         std::fs::write(&path, &bytes).unwrap();
 
         let mut iter =
-            WalReplayIter::open(&crate::env::std_env(), &path, WalPosition::Newest).unwrap();
+            WalReplayIter::open(&crate::env::std_env(), &path, WalPosition::Newest, None).unwrap();
         // Nothing follows the bogus length, so it reads as a torn tail.
         // The point of the test is the allocation, not the verdict.
         assert!(iter.next_entry().unwrap().is_none());
@@ -667,7 +730,7 @@ mod tests {
             wal.sync_data().unwrap();
         }
         let mut iter =
-            WalReplayIter::open(&crate::env::std_env(), &path, WalPosition::Newest).unwrap();
+            WalReplayIter::open(&crate::env::std_env(), &path, WalPosition::Newest, None).unwrap();
         let mut count = 0;
         while iter.next_entry().unwrap().is_some() {
             count += 1;

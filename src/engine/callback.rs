@@ -1,62 +1,114 @@
-//! Containing a panic in code the caller supplied while a commit runs it.
+//! Containing a panic in code the caller supplied while regolith runs it on
+//! its own account.
 //!
 //! A commit is the ordered step: the validation that precedes the write
-//! pipeline and the group the pipeline's leader writes, which may rotate and
-//! flush a memtable on the way. A panic that unwinds out of a caller's
-//! implementation there leaves the shared state of that step half done, so
-//! [`contain`] catches it, names the trait, and the step's boundary latches the
-//! database read-only. Outside a commit nothing is caught: the panic unwinds
-//! into the call that ran the code and fails only that call.
+//! pipeline and the group the pipeline's leader writes. A panic that unwinds
+//! out of a caller's implementation there leaves the shared state of that step
+//! half done, so [`contain`] catches it, names the trait, and the step's
+//! boundary latches the database read-only.
 //!
-//! Containment is a thread-local mode, [`InCommit`], because the flush that a
-//! commit's rotation runs is the same code an explicit flush runs.
+//! A background step, a flush regolith runs off any caller's call (on a
+//! worker, or as the step a write owes on a database with no worker, E9), is
+//! contained too, since there is no caller for the panic to unwind into, but
+//! it latches nothing: it fails that step alone, which reports the failure and
+//! is retried, as any failing flush is.
+//!
+//! Anywhere else nothing is caught: the panic unwinds into the call that ran
+//! the code and fails only that call.
+//!
+//! Containment is a thread-local mode, because a flush is the same code
+//! whoever runs it.
 
 use std::cell::Cell;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
 use crate::Error;
 
+/// How a panic in a caller's code is treated on this thread.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    /// Not caught: it unwinds into the call that ran the code.
+    Uncaught,
+    /// Caught inside a commit's ordered step, which latches the database.
+    Commit,
+    /// Caught inside a background step, which fails alone.
+    Background,
+}
+
 thread_local! {
-    static IN_COMMIT: Cell<bool> = const { Cell::new(false) };
+    static MODE: Cell<Mode> = const { Cell::new(Mode::Uncaught) };
 }
 
 /// The calling thread is inside a commit's ordered step until this drops.
 pub(crate) struct InCommit {
-    outer: bool,
+    outer: Mode,
 }
 
 impl InCommit {
     pub(crate) fn enter() -> Self {
         Self {
-            outer: IN_COMMIT.replace(true),
+            outer: MODE.replace(Mode::Commit),
         }
     }
 }
 
 impl Drop for InCommit {
     fn drop(&mut self) {
-        IN_COMMIT.set(self.outer);
+        MODE.set(self.outer);
+    }
+}
+
+/// The calling thread runs a background step until this drops.
+pub(crate) struct InBackground {
+    outer: Mode,
+}
+
+impl InBackground {
+    pub(crate) fn enter() -> Self {
+        Self {
+            outer: MODE.replace(Mode::Background),
+        }
+    }
+
+    /// Contain without latching until this drops, where callbacks are
+    /// contained at all: for code told of work that already completed,
+    /// which a panic cannot leave half done. Outside a commit or a
+    /// background step nothing changes, and a panic still unwinds into the
+    /// call that ran the code.
+    pub(crate) fn where_contained() -> Option<Self> {
+        (MODE.get() != Mode::Uncaught).then(Self::enter)
+    }
+}
+
+impl Drop for InBackground {
+    fn drop(&mut self) {
+        MODE.set(self.outer);
     }
 }
 
 /// Run `f`, a call into the caller's implementation of the trait `callback`.
 ///
-/// Inside a commit a panic is caught and returned as
+/// Inside a commit or a background step a panic is caught and returned as
 /// [`Error::CallbackPanicked`]; the caller of `contain` propagates it to the
-/// step's boundary. Elsewhere `f` simply runs. Catching costs nothing when
-/// nothing panics, and neither path allocates.
+/// step's boundary, and the error says whether that boundary latches the
+/// database (a commit's does, a background step's does not). Elsewhere `f`
+/// simply runs. Catching costs nothing when nothing panics, and neither path
+/// allocates.
 pub(crate) fn contain<T>(callback: &'static str, f: impl FnOnce() -> T) -> Result<T, Error> {
-    if !IN_COMMIT.get() {
+    let mode = MODE.get();
+    if mode == Mode::Uncaught {
         return Ok(f());
     }
     catch_unwind(AssertUnwindSafe(f)).map_err(|_| {
-        tracing::error!(callback, "a callback panicked while committing");
-        // Every caller propagates it to the ordered step's boundary, which
-        // latches the database.
-        Error::CallbackPanicked {
-            callback,
-            latched: true,
+        let latched = mode == Mode::Commit;
+        if latched {
+            tracing::error!(callback, "a callback panicked while committing");
+        } else {
+            tracing::error!(callback, "a callback panicked in a background flush");
         }
+        // Every caller propagates it to the step's boundary: a commit's
+        // latches the database, a background step's fails that step.
+        Error::CallbackPanicked { callback, latched }
     })
 }
 
@@ -82,6 +134,30 @@ mod tests {
     fn a_panic_outside_a_commit_unwinds() {
         let unwound = catch_unwind(|| contain("KeyClassifier", || -> u8 { panic!("boom") }));
         assert!(unwound.is_err());
+    }
+
+    #[test]
+    fn a_panic_in_a_background_step_is_caught_and_latches_nothing() {
+        let _background = InBackground::enter();
+        let caught = contain("EventListener", || -> u8 { panic!("boom") });
+        assert!(matches!(
+            caught,
+            Err(Error::CallbackPanicked {
+                callback: "EventListener",
+                latched: false
+            })
+        ));
+        {
+            let _commit = InCommit::enter();
+            assert!(matches!(
+                contain("EventListener", || -> u8 { panic!("boom") }),
+                Err(Error::CallbackPanicked { latched: true, .. })
+            ));
+        }
+        assert!(matches!(
+            contain("EventListener", || -> u8 { panic!("boom") }),
+            Err(Error::CallbackPanicked { latched: false, .. })
+        ));
     }
 
     #[test]

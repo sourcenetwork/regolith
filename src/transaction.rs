@@ -141,10 +141,11 @@ use crate::sync::internal::{Condvar, Mutex};
 use crate::column_family::{DEFAULT_CF_ID, prefix_key};
 use crate::conflict::RedactedKey;
 use crate::engine::commit::EarlyWrite;
+use crate::engine::io::scope::Scope;
 use crate::engine::{
     CommitOutcome, ConflictKey, PendingAppend, ReadRule, RegolithEngine, ValidationSet, callback,
 };
-use crate::{Access, Conflict, Db, DbSlice, Error, Options, Result};
+use crate::{Access, Conflict, Db, DbSlice, Error, Options, QueueId, ReadMode, Result};
 
 mod append;
 mod callbacks;
@@ -190,8 +191,17 @@ pub enum TransactionError {
     /// The underlying engine failed, with the same typed [`Error`] a plain
     /// read or write reports: [`Error::Closed`] for a closed database,
     /// [`Error::Busy`] for a write stall the engine cannot relieve, and so on.
+    /// Never [`Error::WouldBlock`]: that is [`TransactionError::WouldBlock`].
     #[error(transparent)]
-    Engine(#[from] Error),
+    Engine(Error),
+    /// The call returned instead of waiting: a read through a transaction
+    /// begun with [`ReadMode::CacheOnly`](crate::ReadMode::CacheOnly)
+    /// needed a block the cache does not hold. Poll the queue the wait
+    /// names, then run the call again (see [`TxnOptions::read_mode`]); a
+    /// cursor or stream carries on where it stopped. Not a reason to roll
+    /// back.
+    #[error("{0}")]
+    WouldBlock(crate::WouldBlock),
     /// A key in the transaction's validation set was written by
     /// someone else after this transaction first observed it: after
     /// the begin snapshot for an optimistic transaction, or after
@@ -227,6 +237,7 @@ impl std::fmt::Debug for TransactionError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Engine(e) => f.debug_tuple("Engine").field(e).finish(),
+            Self::WouldBlock(w) => f.debug_tuple("WouldBlock").field(w).finish(),
             Self::Conflict(c) => f.debug_tuple("Conflict").field(c).finish(),
             Self::Busy(key) => f
                 .debug_tuple("Busy")
@@ -245,12 +256,24 @@ pub type TxResult<T> = std::result::Result<T, TransactionError>;
 /// error a plain `get` gives, so a merge the operator declined is
 /// [`Error::MergeFailed`] carrying the key.
 fn read_error(err: std::io::Error, prefixed: &[u8]) -> TransactionError {
-    TransactionError::Engine(crate::map_point_read_error(err, prefixed))
+    crate::map_point_read_error(err, prefixed).into()
+}
+
+impl From<Error> for TransactionError {
+    /// The engine's error as a transaction reports it: a wait is
+    /// [`TransactionError::WouldBlock`], everything else
+    /// [`TransactionError::Engine`].
+    fn from(e: Error) -> Self {
+        match e {
+            Error::WouldBlock(would_block) => Self::WouldBlock(would_block),
+            other => Self::Engine(other),
+        }
+    }
 }
 
 impl From<std::io::Error> for TransactionError {
     fn from(e: std::io::Error) -> Self {
-        TransactionError::Engine(e.into())
+        Error::from(e).into()
     }
 }
 
@@ -342,6 +365,7 @@ impl OptimisticTransactionDb {
             self.inner.transaction_keys_inline(),
             self.policy.clone(),
             opts.early(),
+            opts.reading(),
         )
     }
 
@@ -437,6 +461,7 @@ impl TransactionDb {
             self.inner.transaction_keys_inline(),
             None,
             false,
+            opts.reading(),
         )
     }
 
@@ -739,6 +764,10 @@ pub struct Transaction {
     /// Each write is checked against newer versions as it is made
     /// ([`TxnOptions::early_validation`]). Optimistic transactions only.
     early_validation: bool,
+    /// Where this transaction's block-cache misses go, and the queue its
+    /// completions belong to ([`TxnOptions::read_mode`],
+    /// [`TxnOptions::io_queue`]).
+    reading: txn_options::Reading,
     /// Highest sequence [`Transaction::get_for_update`] has ever promoted a
     /// key to; `snapshot_seq` while nothing has been promoted past it.
     /// Lets `scan_read_seq` skip the `tracked` lookup outright for a
@@ -845,6 +874,7 @@ impl Transaction {
         keys_inline: usize,
         policy: Option<Arc<dyn KeyClassifier>>,
         early_validation: bool,
+        reading: txn_options::Reading,
     ) -> Self {
         let claim = engine
             .transaction_hooks()
@@ -864,6 +894,7 @@ impl Transaction {
             scan_runs: OnceLock::new(),
             scan_ranges: OnceLock::new(),
             early_validation,
+            reading,
             promoted_seq: AtomicU64::new(snapshot_seq),
             savepoints: Vec::new(),
             callbacks: Callbacks::default(),
@@ -876,6 +907,28 @@ impl Transaction {
             resolved: false,
             resources_released: false,
         }
+    }
+
+    /// The mode this transaction reads in ([`TxnOptions::read_mode`]).
+    pub fn read_mode(&self) -> ReadMode {
+        self.reading.mode
+    }
+
+    /// The queue this transaction's completions belong to: the one
+    /// [`TxnOptions::io_queue`] named, or else the one its
+    /// [`ReadMode::CacheOnly`] names. `None` for a transaction that blocks.
+    pub fn io_queue(&self) -> Option<QueueId> {
+        self.reading.queue.or(self.reading.mode.queue())
+    }
+
+    /// Route this thread's device misses as the transaction's mode says, for
+    /// one read call. Inside `commit` every read blocks: the commit does its
+    /// own I/O, the `before_commit` callbacks' reads included.
+    fn read_scope(&self) -> Option<Scope> {
+        if self.committing {
+            return None;
+        }
+        self.reading.mode.scope()
     }
 
     /// Read `key` from the default column family. Returns the
@@ -900,6 +953,7 @@ impl Transaction {
     /// [`Transaction::get_for_update`] when a read must participate
     /// in conflict detection on its own.
     pub fn get(&self, key: &[u8]) -> TxResult<Option<Vec<u8>>> {
+        let _scope = self.read_scope();
         let prefixed = prefix_key(DEFAULT_CF_ID, key);
         let committed = || self.read_committed(&prefixed);
         match self.read_own(&prefixed, committed)? {
@@ -917,6 +971,7 @@ impl Transaction {
     /// operands build, is copied out of the write buffer first, since the
     /// buffer cannot lend it.
     pub fn get_slice(&self, key: &[u8]) -> TxResult<Option<DbSlice>> {
+        let _scope = self.read_scope();
         let prefixed = prefix_key(DEFAULT_CF_ID, key);
         let committed = || self.read_committed(&prefixed);
         match self.read_own(&prefixed, committed)? {
@@ -1066,6 +1121,7 @@ impl Transaction {
     /// a claim, since a write of the bytes the key already holds does not
     /// conflict (see the module documentation).
     pub fn get_for_update(&self, key: &[u8]) -> TxResult<Option<Vec<u8>>> {
+        let _scope = self.read_scope();
         let prefixed = prefix_key(DEFAULT_CF_ID, key);
         let already_held = self.lock_key(&prefixed)?;
         let horizon = self.read_horizon(&prefixed, already_held);
@@ -1255,6 +1311,18 @@ impl Transaction {
     /// [`Transaction::get_for_update`] reads. A pessimistic transaction keeps
     /// its key locks for the duration of the wait.
     ///
+    /// Concurrent commits share commit groups with each other and with plain
+    /// writes: one log write and, at [`crate::DurabilityMode::Immediate`], one
+    /// fsync per group, and the commit becomes visible only once that fsync
+    /// returned. Each commit in a group is validated as if the commits ahead of
+    /// it in the group had committed one at a time before it, so it conflicts
+    /// with them exactly as it would with any earlier commit, and its outcome
+    /// is its own. A group whose log write or fsync fails fails every commit
+    /// in it with that error. Before it queues, an optimistic commit checks
+    /// itself on the calling thread against everything committed up to that
+    /// moment, so the group only checks what landed after, and a conflict
+    /// that is already certain returns without waiting for the group.
+    ///
     /// A conflict is reported to every [`crate::EventListener`] once, after
     /// the commit has released the pipeline and this transaction its key
     /// locks, and then returned as [`TransactionError::Conflict`].
@@ -1387,7 +1455,7 @@ impl Transaction {
             self.engine.commit_write_free(&checks)?
         } else {
             self.engine.commit_with_conflict_check(
-                &checks,
+                checks,
                 writes,
                 range_deletes,
                 merges,
@@ -2475,16 +2543,28 @@ mod tests {
             .statistics(Some(Arc::clone(stats)))
     }
 
-    /// Drive `plain` past the slowdown trigger with the same recipe as
-    /// `test_write_stall_slowdown_accumulates_micros`, then check that a
-    /// commit through `begin` is charged the wait only when it carries a
-    /// write.
-    fn probe_slowdown_ticker(plain: &Db, stats: &Statistics, begin: impl Fn() -> Transaction) {
+    /// Write `plain` past the slowdown trigger with the recipe of
+    /// `test_write_stall_slowdown_accumulates_micros`. The worker writes the
+    /// sealed memtables out off the commit path, and a loaded host can let
+    /// the writes outrun it, so the second half waits for L0 to reach the
+    /// trigger: those writes pay the slowdown.
+    fn cross_slowdown(plain: &Db) {
         let payload = vec![0xCDu8; 600];
-        for i in 0..128 {
+        for i in 0..64 {
             let k = format!("k{i:04}");
             plain.put(k.as_bytes(), &payload).unwrap();
         }
+        crate::tests::wait_for_l0_files(plain, 2);
+        for i in 64..128 {
+            let k = format!("k{i:04}");
+            plain.put(k.as_bytes(), &payload).unwrap();
+        }
+    }
+
+    /// Drive `plain` past the slowdown trigger, then check that a commit
+    /// through `begin` is charged the wait only when it carries a write.
+    fn probe_slowdown_ticker(plain: &Db, stats: &Statistics, begin: impl Fn() -> Transaction) {
+        cross_slowdown(plain);
         let stall = stats.get_ticker(Ticker::WriteStallMicros);
         assert!(
             stall > 0,
@@ -2554,11 +2634,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let db = OptimisticTransactionDb::open(dir.path(), slowdown_opts(&stats)).unwrap();
 
-        let payload = vec![0xCDu8; 600];
-        for i in 0..128 {
-            let k = format!("k{i:04}");
-            db.db().put(k.as_bytes(), &payload).unwrap();
-        }
+        cross_slowdown(db.db());
         let stall = stats.get_ticker(Ticker::WriteStallMicros);
         assert!(
             stall > 0,

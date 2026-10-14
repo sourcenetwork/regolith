@@ -125,6 +125,36 @@ A crash partway through leaves a valid prefix of the stream, never a
 half-applied flush. Work that must land all-or-nothing wants a single
 `WriteBatch` and has to pay the memory for it.
 
+## Reads that never block
+
+A thread that must never wait on the disk reads through a `CacheOnly` handle.
+Such a read never touches the device: when it needs a block the cache does not
+hold, it returns `Error::WouldBlock` at once and records the block on the
+thread's own I/O queue. The thread polls that queue when it has nothing else
+to run, which reads the blocks it waits on, and then runs the read again:
+
+```rust
+use regolith::{Error, IoBudget, ReadMode, WouldBlock};
+
+let mut queue = db.io_queue(); // one per thread
+let snap = db.snapshot().with_read_mode(ReadMode::CacheOnly(queue.id()));
+let value = loop {
+    match snap.get(b"key") {
+        Err(Error::WouldBlock(WouldBlock::Io(wait))) => {
+            queue.poll(IoBudget::ALL); // or `wait.await` while other tasks run
+        }
+        other => break other?,
+    }
+};
+```
+
+A block several threads miss is read once, by whichever thread's poll claims
+it first, and every waiting queue is told. A completion only ever reaches the
+queue that asked, and `IoQueue::idle_waker` wakes an idle thread when one
+arrives, never a busy one. Iterators, transaction cursors and streams pick up
+exactly where a wait stopped them. Transactions take the mode from
+`TxnOptions::read_mode`.
+
 ## Transactions
 
 Pick the isolation a unit of work actually needs. The level decides how much of the
@@ -315,6 +345,26 @@ silent.
 
 A database written by 0.1.x opens, and the open rewrites its log in format 2, which 0.1.x
 refuses to open: the upgrade is one-way.
+
+## Encryption at rest
+
+```rust,ignore
+let opts = Options::default().key_provider(Arc::new(MyKeys));
+```
+
+With a `KeyProvider` installed, every table block, log record and manifest batch is sealed
+with AES-256-GCM-SIV under the provider's current key, and its tag takes the place of the
+checksum: a random-access read still decrypts one block, and a frame whose tag fails is
+treated exactly as a failed checksum is, the torn-tail rule of the log included. Values are
+plaintext inside the engine, so merges, byte-equality checks, value-validated reads,
+content-addressed keys, appends and allocations all work unchanged.
+
+Each file names the key it was sealed under, so a rotated key keeps old data readable for
+as long as the provider still provides it. An encrypted database opened without a provider,
+or with a provider missing a key some file names, refuses to open. An unencrypted database
+opens with a provider and is sealed as compaction rewrites it; `Db::compact_range` on an
+encrypted database rewrites everything not sealed under the current key at once, which is
+how a key is retired.
 
 ## Platforms
 

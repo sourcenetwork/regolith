@@ -1,9 +1,12 @@
 //! A key merged N times in one optimistic transaction is validated with
 //! one conflict probe, not N.
 //!
-//! Each probe runs while `commit_optimistic` holds the pipeline mutex that
-//! every other writer is waiting on, so a probe per merge op instead of per
-//! distinct key multiplies commit cost by the merges in the transaction.
+//! A commit probes its keys up to the read horizon before it queues, and the
+//! commit group's leader then looks only at the memtables for what landed
+//! above it, so a probe per merge op instead of per distinct key multiplies
+//! commit cost by the merges in the transaction. A key only reaches a table
+//! when something committed after the transaction's snapshot: with nothing
+//! newer, no key can conflict and none is probed at all.
 //! A probe stops at the key's newest entry, merge operands included: a
 //! newer operand is a newer write, wherever it is stored. `Statistics::BloomFilterFullPositive`
 //! is the public-API proxy for probe count here: each probe that reaches
@@ -63,7 +66,25 @@ fn a_key_merged_many_times_is_probed_once() {
     db.db().flush().unwrap();
     stats.reset();
 
+    // Nothing committed since the snapshot: no key can have changed, and
+    // none is looked up in a table.
     let tx = db.begin(&TxnOptions::new().isolation(IsolationLevel::SnapshotIsolation));
+    for _ in 0..MERGES {
+        tx.merge(b"counter", &1i64.to_be_bytes()).unwrap();
+    }
+    tx.commit().unwrap();
+    assert_eq!(
+        stats.get_ticker(Ticker::BloomFilterFullPositive),
+        0,
+        "with nothing committed since the snapshot, no key is probed in a table"
+    );
+
+    // A write after the snapshot makes the commit look, once per key, and
+    // the flush puts the key's newest version back in a table.
+    db.db().flush().unwrap();
+    stats.reset();
+    let tx = db.begin(&TxnOptions::new().isolation(IsolationLevel::SnapshotIsolation));
+    db.db().put(b"unrelated", b"newer").unwrap();
     for _ in 0..MERGES {
         tx.merge(b"counter", &1i64.to_be_bytes()).unwrap();
     }
@@ -76,7 +97,7 @@ fn a_key_merged_many_times_is_probed_once() {
     );
     assert_eq!(
         db.db().get(b"counter").unwrap().as_deref(),
-        Some(MERGES.to_be_bytes().as_slice())
+        Some((2 * MERGES).to_be_bytes().as_slice())
     );
 }
 
@@ -101,6 +122,8 @@ fn keys_merged_in_an_interleaved_order_are_probed_once_each() {
     stats.reset();
 
     let tx = db.begin(&TxnOptions::new().isolation(IsolationLevel::SnapshotIsolation));
+    // A write after the snapshot, so the commit has to look.
+    db.db().put(b"unrelated", b"newer").unwrap();
     for i in 0..MERGES {
         tx.merge(KEYS[i % KEYS.len()], &1i64.to_be_bytes()).unwrap();
     }
