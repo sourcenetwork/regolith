@@ -693,8 +693,10 @@ Park(a) ==
   \* A run that shows writes step by step; a thread that helps, holds
   \* neither the round nor a unit (those never park: Await::Copy).
   IN /\ Copies /\ Helping(a) /\ a \notin round /\ claimant # a
-     \* It needs a record.
+     \* It needs a record...
      /\ i # 0
+     \* ...that is not its own while it waits for a sync (CopyOwn).
+     /\ ~(a \in Immediate /\ i = mine[a])
      \* The record is filled and the unit is another thread's, or the
      \* record is another's and not filled yet.
      /\ \/ filled[i] /\ writer # 0 /\ writer # a
@@ -709,6 +711,29 @@ Park(a) ==
      \* Nothing else changes.
      /\ UNCHANGED <<moreVars, fly, filled, writer, gathered, late, ringVars, decVars, ap, wr, failed, dto, tipVars,
                     epochVars, durable, pub, visible, claimVars, failVars, threadVars>>
+
+\* Thread a waits for a sync, and finds its own record in another thread's
+\* hands: it does not sleep on it, it copies it, as the round's holder
+\* does, and stays awake to claim the next round (pipeline.rs, drive with
+\* Await::Copy for a commit that waits for a sync). The copy is
+\* StealStart's: counted in, looked at again, written.
+CopyOwn(a) ==
+  \* The record it needs.
+  LET i == Need(a)
+  \* A run that shows writes step by step; a thread that helps, waits for a
+  \* sync, and holds neither the round nor a unit.
+  IN /\ Copies /\ Helping(a) /\ a \in Immediate /\ a \notin round /\ claimant # a
+     \* It needs its own record.
+     /\ i # 0 /\ i = mine[a]
+     \* The record is filled and the unit is another thread's...
+     /\ \/ filled[i] /\ writer # 0 /\ writer # a
+        \* ...or another thread is encoding it.
+        \/ ~filled[i] /\ filling[i]
+     \* It is about to write it itself.
+     /\ late' = [late EXCEPT ![a] = i]
+     \* Nothing else changes.
+     /\ UNCHANGED <<moreVars, fly, filled, writer, gathered, asleep, sleepOn, wanted, ringVars, decVars, ap, wr,
+                    failed, dto, tipVars, epochVars, durable, pub, visible, claimVars, failVars, threadVars>>
 
 \* STEP 2, A THREAD FAR FROM ITS TURN (pipeline.rs, P6). A blocking
 \* thread finds the next order being decided by another thread, and its
@@ -805,11 +830,11 @@ Timeout(a) ==
 
 \* THE FAST PATH (write_unit.rs, write_alone, WU8). An owner whose record
 \* is settled, and nobody else has in hand, finds the write unit free with
-\* no request on it and no write in flight: it encodes its record and
+\* no request on it: it encodes its record and
 \* writes it by itself, through the gate as a copy is (the count in and
 \* the look again are StealStart's), skipping the unit's claim, gather and
 \* wakes. Under contention the unit takes over. Mutant DirectAnyTime takes
-\* the fast path whatever the unit and the gate say: the guard is about
+\* the fast path whatever the unit says: the guard is about
 \* speed, and the model stays safe without it (row Green_Direct_AnyTime).
 \* Mutant DirectNoRecheck writes without the look again: see StealStart.
 DirectStart(a) ==
@@ -822,9 +847,9 @@ DirectStart(a) ==
      /\ i <= dto /\ Brings(i)
      \* ...that nobody has in hand, not in the log, not thrown out.
      /\ ~filled[i] /\ ~filling[i] /\ ~wr[i] /\ ~failed[i]
-     \* The unit is free with no request on it, and no write is in flight
-     \* (the broken version does not look).
-     /\ \/ writer = 0 /\ ~wanted /\ \A b \in Actors : fly[b] = {}
+     \* The unit is free with no request on it (the broken version does not
+     \* look).
+     /\ \/ writer = 0 /\ ~wanted
         \* (Or the broken version.)
         \/ Mutant = "DirectAnyTime"
      \* The record is encoded...
@@ -1285,6 +1310,8 @@ PipelineStep(a) ==
      \/ Gather(a) \/ Park(a)
      \* The fast path: an owner writes its record by itself.
      \/ DirectStart(a)
+     \* A thread that waits for a sync copies its record rather than sleep.
+     \/ CopyOwn(a)
      \* Step 2: a park far from the thread's turn.
      \/ TurnPark(a)
 

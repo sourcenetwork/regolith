@@ -1098,6 +1098,10 @@ instead of parking (`write_unit.rs`, `RegolithEngine::fill`; the TLA+
 path of a lone owner (`write_unit.rs`, `write_alone`, WU8; the TLA+
 `DirectStart`) is the same step taken before any wait: it encodes and
 writes its own record at once, so it needs no step this machine counts.
+A commit that waits for a sync and finds its own record in another
+thread's hands copies it at once rather than park (the TLA+ `CopyOwn`):
+its spin ends in `copying`, never in `parked`, which only shortens the
+count `a_park_is_bounded` uses.
 
 A thread far from its turn (`pipeline.rs`, P6) parks on its own slot until
 its turn nears: a finished commit tells it (NEAR), its slot lands or fails,
