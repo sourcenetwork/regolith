@@ -1038,8 +1038,16 @@ impl RegolithEngine {
             if !self.write_alone(pipe, desc) {
                 self.fill(desc);
             }
-            // A blocking call is never left waiting on a queue.
-            let _ = self.bring_written(pipe, desc, Await::Park);
+            // A blocking call is never left waiting on a queue. One that
+            // waits for a sync does not sleep on its record while another
+            // thread has it in hand: it copies it, as the round's holder
+            // does, and is awake to claim the next round (WU5).
+            let how = if desc.decision().is_some_and(|d| d.immediate) {
+                Await::Copy
+            } else {
+                Await::Park
+            };
+            let _ = self.bring_written(pipe, desc, how);
             match self.publish_upto(pipe, index, Some(desc), Await::Park) {
                 Progress::Published => {
                     // Done: wake who waits for its turn, off the decided
