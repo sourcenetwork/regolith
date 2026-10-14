@@ -611,3 +611,107 @@ pub fn calibration_a_fill_that_wakes_nobody_leaves_a_writer_asleep() {
         },
     );
 }
+
+/// What the fast path's write and a run's write of one record do once the
+/// writer holds the record's bytes: count in at the gate, look again, read
+/// the whole record, count out, mark it written. `true` when it wrote.
+fn write_through_gate(gate: &Gate, desc: &Descriptor) -> bool {
+    let Some(entry) = gate.enter(0) else {
+        return false;
+    };
+    let wrote = !desc.is(WRITTEN);
+    if wrote {
+        assert_eq!(
+            desc.record(),
+            Some(&b"record"[..]),
+            "a record went out half encoded"
+        );
+    }
+    gate.leave(entry);
+    if wrote {
+        desc.mark(WRITTEN);
+    }
+    wrote
+}
+
+/// WU8, the fast path racing a claimer: the owner finds the unit quiet and
+/// no write in flight (`WriteUnit::quiet`, `Gate::idle`), encodes its record
+/// and writes it by itself, while another thread claims the unit and writes
+/// a run of the filled records it finds. Whoever writes reads the whole
+/// record: the buffer is a tracked cell, encoded under the claim of its
+/// encoding and read only once it is filled (D4). The record ends written,
+/// once or twice, the same bytes either way.
+///
+/// Bound: 3 preemptions.
+pub fn the_fast_path_racing_a_claimer_writes_only_whole_records() {
+    explore_bounded(
+        "the_fast_path_racing_a_claimer_writes_only_whole_records",
+        Some(3),
+        8,
+        1,
+        |witness| {
+            let unit = Arc::new(WriteUnit::new(0));
+            let gate = Arc::new(Gate::new());
+            let desc = unfilled_slot();
+            let claimer = {
+                let (unit, gate, desc) = (Arc::clone(&unit), Arc::clone(&gate), Arc::clone(&desc));
+                thread::spawn(move || {
+                    let Ok(claimed) = unit.try_claim() else {
+                        return false;
+                    };
+                    // The gather: a filled, unwritten record joins the run.
+                    let wrote = desc.flags() & (FILLED | WRITTEN) == FILLED
+                        && write_through_gate(&gate, &desc);
+                    let _ = unit.release(claimed);
+                    wrote
+                })
+            };
+            // The owner: the fast path when the unit is quiet and nothing is
+            // in flight, else the unit's way, here a copy (Await::Copy).
+            let fast = unit.quiet() && gate.idle();
+            let _ = desc.fill(encode).expect("the owner's encoding");
+            let owner_wrote = write_through_gate(&gate, &desc);
+            let claimer_wrote = claimer.join().expect("the claimer");
+            if fast && claimer_wrote {
+                witness.record();
+            }
+            assert!(owner_wrote || claimer_wrote || desc.is(WRITTEN));
+            assert!(desc.is(WRITTEN), "the record was never written");
+        },
+    );
+}
+
+/// Calibration for
+/// [`the_fast_path_racing_a_claimer_writes_only_whole_records`]: a fast path
+/// that marks its record filled before it encodes it. A claimer that
+/// gathers it then reads the buffer while the owner writes it.
+pub fn calibration_a_fast_path_that_marks_its_record_filled_first_lets_a_claimer_read_it_half_encoded()
+ {
+    explore_bounded(
+        "calibration_a_fast_path_that_marks_its_record_filled_first_lets_a_claimer_read_it_half_encoded",
+        Some(3),
+        1,
+        0,
+        |_| {
+            let unit = Arc::new(WriteUnit::new(0));
+            let gate = Arc::new(Gate::new());
+            let desc = unfilled_slot();
+            let claimer = {
+                let (unit, gate, desc) = (Arc::clone(&unit), Arc::clone(&gate), Arc::clone(&desc));
+                thread::spawn(move || {
+                    if let Ok(claimed) = unit.try_claim() {
+                        if desc.flags() & (FILLED | WRITTEN) == FILLED {
+                            write_through_gate(&gate, &desc);
+                        }
+                        let _ = unit.release(claimed);
+                    }
+                })
+            };
+            // The bug: filled is set before the bytes are there.
+            let _ = desc.mark_quiet(FILLED);
+            let _ = desc.fill(encode).expect("the owner's encoding");
+            write_through_gate(&gate, &desc);
+            claimer.join().expect("the claimer");
+        },
+    );
+}

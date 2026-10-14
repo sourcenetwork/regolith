@@ -49,7 +49,8 @@
 //!   lands under a sync; a `commit_nowait` commit left on its queue is
 //!   told when the unit is let go; one thread at a time encodes a record,
 //!   the owner or a thread that needs it; and a writer parked on a record
-//!   being encoded is woken when it is filled.
+//!   being encoded is woken when it is filled; and the fast path of a lone
+//!   writer racing a claimer writes only whole records.
 //! - **A call far from its turn** (E45 step 2, `turn_wait.rs`): a blocking
 //!   call parked on its own slot is named by the pass that brings its turn
 //!   near and told by the next finished commit, and is woken when its slot
@@ -352,4 +353,15 @@ fn a_call_far_from_its_turn_is_woken_when_its_slot_lands() {
 #[should_panic(expected = "a call far from its turn slept through its landing")]
 fn a_call_that_looks_before_it_registers_sleeps_through_its_landing() {
     turn_wait::calibration_a_call_that_looks_before_it_registers_sleeps_through_its_landing();
+}
+
+#[test]
+fn the_fast_path_racing_a_claimer_writes_only_whole_records() {
+    write_unit::the_fast_path_racing_a_claimer_writes_only_whole_records();
+}
+
+#[test]
+#[should_panic]
+fn a_fast_path_that_marks_its_record_filled_first_lets_a_claimer_read_it_half_encoded() {
+    write_unit::calibration_a_fast_path_that_marks_its_record_filled_first_lets_a_claimer_read_it_half_encoded();
 }
