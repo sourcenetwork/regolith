@@ -21,6 +21,8 @@ use std::sync::Arc;
 use regolith::Error;
 use regolith::prelude::*;
 
+mod common;
+
 /// Sums big-endian i64 deltas.
 struct CounterMerge;
 
@@ -75,11 +77,13 @@ fn conflicted<T>(result: TxResult<T>) -> bool {
     matches!(result, Err(TransactionError::Conflict { .. }))
 }
 
-/// The key a failed commit named, if it failed on a conflict.
+/// The key a commit lost on, `None` when it committed. Any other failure
+/// fails the test with the error.
 fn conflict_key<T>(result: TxResult<T>) -> Option<Vec<u8>> {
     match result {
+        Ok(_) => None,
         Err(TransactionError::Conflict(conflict)) => Some(conflict.key().to_vec()),
-        _ => None,
+        Err(other) => panic!("a commit failed for a reason other than a conflict: {other}"),
     }
 }
 
@@ -573,7 +577,7 @@ fn reads_a_block_that_changes(
     if write_elsewhere {
         tx.put(b"elsewhere", b"x").unwrap();
     }
-    tx.commit().is_ok()
+    common::committed(&tx.commit())
 }
 
 #[test]
@@ -631,7 +635,7 @@ fn scans_then_writes(
     // carries the same ones.
     let newer: &[u8] = if delete { b"changed" } else { b"mine" };
     db.db().put(key, newer).unwrap();
-    tx.commit().is_ok()
+    common::committed(&tx.commit())
 }
 
 #[test]
@@ -680,7 +684,11 @@ fn a_commutative_prefix_and_a_block_in_one_commit_each_keep_their_rule() {
             tx.put(b"b/shared", b"bytes").unwrap();
         }
         first.commit().unwrap();
-        assert_eq!(second.commit().is_ok(), both_commit, "{level:?}");
+        assert_eq!(
+            common::committed(&second.commit()),
+            both_commit,
+            "{level:?}"
+        );
     }
 }
 
@@ -699,7 +707,7 @@ fn a_merge_into_a_block_is_not_validated() {
         // A replacement, not another operand: nothing but the exemption lets a
         // merge commit past a newer put.
         db.db().put(b"b/count", &5i64.to_be_bytes()).unwrap();
-        assert_eq!(tx.commit().is_ok(), commits, "{level:?}");
+        assert_eq!(common::committed(&tx.commit()), commits, "{level:?}");
         if commits {
             assert_eq!(counter(&db, b"b/count"), 6, "the operand lands on the put");
         }

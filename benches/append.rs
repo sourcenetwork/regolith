@@ -60,27 +60,20 @@ fn commit_rate(shape: Shape, threads: usize, per_thread: u64) -> f64 {
     let log: Arc<dyn LogLayout> = Arc::new(Journal);
     let mut rng = common::Rng::new(0xA11C_0001);
     let value = common::rand_value(&mut rng, VALUE_LEN);
-    let start = Instant::now();
-    std::thread::scope(|scope| {
-        for t in 0..threads as u64 {
-            let (db, log, value) = (&db, &log, &value);
-            scope.spawn(move || {
-                for i in 0..per_thread {
-                    let id = t * per_thread + i;
-                    let tx = db.begin(&TxnOptions::new());
-                    match shape {
-                        Shape::Put => tx.put(&common::key(id), value).unwrap(),
-                        Shape::Append => tx.append(log, value, None).unwrap(),
-                        Shape::AppendOnce => {
-                            tx.append(log, value, Some(&common::key(id))).unwrap();
-                        }
-                    }
-                    tx.commit().unwrap_or_else(|e| panic!("commit: {e}"));
-                }
-            });
+    let secs = common::start::on_threads(threads, threads as u64 * per_thread, |t, i| {
+        let t = t as u64;
+        let id = t * per_thread + i;
+        let tx = db.begin(&TxnOptions::new());
+        match shape {
+            Shape::Put => tx.put(&common::key(id), &value).unwrap(),
+            Shape::Append => tx.append(&log, &value, None).unwrap(),
+            Shape::AppendOnce => {
+                tx.append(&log, &value, Some(&common::key(id))).unwrap();
+            }
         }
-    });
-    let secs = start.elapsed().as_secs_f64();
+        tx.commit().unwrap_or_else(|e| panic!("commit: {e}"));
+    })
+    .as_secs_f64();
     assert!(secs > 0.0, "timed section reported a zero duration");
     (threads as u64 * per_thread) as f64 / secs
 }
@@ -110,18 +103,10 @@ fn allocate_latency(calls: usize) -> (f64, f64) {
 /// Allocations per second of `threads` callers on one counter.
 fn allocate_rate(threads: usize, per_thread: u64) -> f64 {
     let (_tmp, db) = common::open("allocate-rate", common::default_opts());
-    let start = Instant::now();
-    std::thread::scope(|scope| {
-        for _ in 0..threads {
-            let db = &db;
-            scope.spawn(move || {
-                for _ in 0..per_thread {
-                    db.allocate(b"ids", 4).unwrap();
-                }
-            });
-        }
-    });
-    let secs = start.elapsed().as_secs_f64();
+    let secs = common::start::on_threads(threads, threads as u64 * per_thread, |_, _| {
+        db.allocate(b"ids", 4).unwrap();
+    })
+    .as_secs_f64();
     assert!(secs > 0.0, "timed section reported a zero duration");
     (threads as u64 * per_thread) as f64 / secs
 }

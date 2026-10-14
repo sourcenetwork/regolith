@@ -15,6 +15,7 @@
 //! panic. The two acceptable outcomes are a loud refusal or a state
 //! equal to the state after some whole number of the writes; a state
 //! that is neither is silent corruption and is reported as such.
+#![cfg(not(target_arch = "wasm32"))]
 
 use std::fs;
 use std::path::{Path, PathBuf};

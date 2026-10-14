@@ -25,8 +25,8 @@ const VALUE_LEN: usize = 200;
 const HOT_CACHE: usize = 256 * 1024 * 1024;
 const COLD_CACHE: usize = 1024 * 1024;
 const FILL_BATCH: u64 = 1_000;
-/// Reads per thread per criterion iteration: large enough that thread spawn
-/// cost stays far below one percent of a measured iteration at every width.
+/// Reads per thread per criterion iteration. The threads are spawned before
+/// the clock starts, so this sizes an iteration, not a spawn's share of it.
 const OPS_PER_ITER: u64 = 10_000;
 const THREAD_COUNTS: [usize; 4] = [1, 2, 4, 8];
 
@@ -85,7 +85,9 @@ fn build(tag: &str, block_cache_size: usize, keys: &[Vec<u8>]) -> (common::TempD
         }
         db.write(batch).expect("fill write");
     }
-    db.compact_range(None, None).expect("fill compaction");
+    db.compact_range(None, None)
+        .wait()
+        .expect("fill compaction");
     for k in keys {
         let got = db.get(k).expect("warm read");
         assert!(got.is_some(), "key missing after fill");
@@ -113,8 +115,11 @@ fn point_read(c: &mut Criterion) {
         ("hot_cache", &hot, &hot_acc),
         ("cold_cache", &cold, &cold_acc),
     ] {
+        // Outside the closure, which criterion calls once per sample: a
+        // sequence started again in each sample would find in the cache the
+        // blocks the last sample read, and the cold cache would read warm.
+        let mut rng = common::Rng::new(0xA5A5_1234);
         group.bench_function(id, |b| {
-            let mut rng = common::Rng::new(0xA5A5_1234);
             b.iter_custom(|iters| {
                 let cpu0 = common::cpu_seconds();
                 let start = Instant::now();
@@ -146,23 +151,29 @@ fn point_read(c: &mut Criterion) {
             |b, &threads| {
                 b.iter_custom(|iters| {
                     let per_thread = iters * OPS_PER_ITER;
-                    let cpu0 = common::cpu_seconds();
-                    let start = Instant::now();
-                    thread::scope(|s| {
+                    let line = common::start::StartLine::new(threads);
+                    // The scope returns once every reader is done.
+                    let (start, cpu0) = thread::scope(|s| {
                         for t in 0..threads {
+                            let line = &line;
                             s.spawn(move || {
                                 let mut rng =
                                     common::Rng::new(0x1234_5678 ^ ((t as u64) << 40) ^ iters);
+                                line.wait();
                                 for _ in 0..per_thread {
                                     let k = &keys[(rng.next() % N_KEYS) as usize];
                                     black_box(db.get(k).expect("get"));
                                 }
                             });
                         }
+                        line.all_ready();
+                        let cpu0 = common::cpu_seconds();
+                        (line.go(), cpu0)
                     });
                     let wall = start.elapsed();
+                    let cpu = common::cpu_seconds() - cpu0;
                     let ops = per_thread * threads as u64;
-                    acc.add(ops, wall, common::cpu_seconds() - cpu0);
+                    acc.add(ops, wall, cpu);
                     wall
                 });
             },

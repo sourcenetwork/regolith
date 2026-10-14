@@ -126,6 +126,7 @@ vars == <<cached, refs, live, refbit, used, pins, wants, landed, reran>>
 
 \* The sum of the sizes of a set of blocks, one block at a time.
 RECURSIVE SumSize(_)
+\* Its definition, taking one block out of the set at a time.
 SumSize(S) ==
   \* Nothing costs nothing ...
   IF S = {} THEN 0
@@ -175,11 +176,14 @@ Miss(r, b) ==
   /\ b \notin live
   \* The reader now holds a fresh copy: memory exists, one reference.
   /\ live' = live \cup {b}
+  \* The reader holds (pins) the block.
   /\ pins' = [pins EXCEPT ![r] = @ \cup {b}]
   \* The cache's insert: reserve the bytes, publish the entry with its
   \* referenced bit clear, and take the cache's own reference.
   /\ IF Fits(Size[b])
-       THEN \* Admitted: the entry is cached ...
+       \* Admitted.
+       THEN
+            \* The entry is cached ...
             /\ cached' = cached \cup {b}
             \* ... its bytes are charged ...
             /\ used' = used + Size[b]
@@ -187,7 +191,9 @@ Miss(r, b) ==
             /\ refs' = [refs EXCEPT ![b] = 2]
             \* ... and it starts with its bit clear.
             /\ refbit' = [refbit EXCEPT ![b] = FALSE]
-       ELSE \* Refused: only the reader's reference ...
+       \* Refused.
+       ELSE
+            \* Only the reader's reference exists ...
             /\ refs' = [refs EXCEPT ![b] = 1]
             \* ... and the cache is as it was.
             /\ UNCHANGED <<cached, used, refbit>>
@@ -231,13 +237,19 @@ Drop(r, b) ==
 Hand(b, forced) ==
   \* The hand only lands on cached entries.
   /\ b \in cached
+  \* Is the entry's bit set, and the hand not forced?
   /\ IF ~forced /\ refbit[b]
-       THEN \* Second chance: clear the bit, keep the entry.
+       \* Second chance.
+       THEN
+            \* The bit is cleared,
             /\ refbit' = [refbit EXCEPT ![b] = FALSE]
+            \* and the entry stays.
             /\ UNCHANGED <<cached, refs, live, used>>
+       \* Otherwise: is the bug IgnorePins planted?
        ELSE IF Mode = "IgnorePins"
-         THEN \* The bug: drop the entry and free the block as if the cache
-              \* held the only reference: the entry goes ...
+         \* The bug: drop the entry and free the block as if the cache held the only reference.
+         THEN
+              \* The entry goes ...
               /\ cached' = cached \ {b}
               \* ... its bytes come back ...
               /\ used' = used - Size[b]
@@ -247,9 +259,11 @@ Hand(b, forced) ==
               /\ live' = live \ {b}
               \* The bit does not matter any more.
               /\ UNCHANGED refbit
+         \* Otherwise, the design: is the cache's reference the only one?
          ELSE IF refs[b] = 1
-           THEN \* Nobody else holds it: the CAS from one to zero wins, the
-                \* entry goes ...
+           \* Nobody else holds it: the compare-and-swap from one to zero wins.
+           THEN
+                \* The entry goes ...
                 /\ cached' = cached \ {b}
                 \* ... its bytes come back ...
                 /\ used' = used - Size[b]
@@ -259,7 +273,9 @@ Hand(b, forced) ==
                 /\ live' = live \ {b}
                 \* The bit does not matter any more.
                 /\ UNCHANGED refbit
-           ELSE \* Pinned: the CAS fails and the hand moves on.
+           \* Pinned: the CAS fails and the hand moves on.
+           ELSE
+                \* Nothing changes.
                 UNCHANGED <<cached, refs, live, used, refbit>>
   \* Readers and queues are not touched by the hand.
   /\ UNCHANGED <<pins, wants, landed, reran>>
@@ -294,15 +310,21 @@ Land(q, b) ==
   /\ landed' = [landed EXCEPT ![q] = @ \cup {b}]
   \* The landing's own reference, unless the bug drops it.
   /\ LET held == IF Mode = "LandingUnheld" THEN 0 ELSE 1 IN
+       \* Do the block's bytes fit in the budget?
        IF Fits(Size[b])
-         THEN \* Admitted: cached, charged ...
+         \* Admitted.
+         THEN
+              \* The entry is cached ...
               /\ cached' = cached \cup {b}
+              \* ... its bytes are charged ...
               /\ used' = used + Size[b]
               \* ... with the landing's reference and the cache's ...
               /\ refs' = [refs EXCEPT ![b] = held + 1]
               \* ... and its bit clear.
               /\ refbit' = [refbit EXCEPT ![b] = FALSE]
-         ELSE \* Refused: only the landing holds it ...
+         \* Refused.
+         ELSE
+              \* Only the landing holds it ...
               /\ refs' = [refs EXCEPT ![b] = held]
               \* ... and the cache is as it was.
               /\ UNCHANGED <<cached, used, refbit>>
@@ -323,6 +345,8 @@ Rerun(q, b) ==
   \* The owner forgets the landing, giving back its reference (none, under
   \* the bug); the last reference frees the block.
   /\ landed' = [landed EXCEPT ![q] = @ \ {b}]
+  \* How many references the landing gives back: one if the queue had a landing of b (and the bug is
+  \* not planted), else none.
   /\ LET gives == IF b \in landed[q] /\ Mode # "LandingUnheld" THEN 1 ELSE 0 IN
        \* One reference fewer when the landing held one ...
        /\ refs' = [refs EXCEPT ![b] = @ - gives]

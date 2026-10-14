@@ -32,9 +32,10 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use kovan::Atom;
+
 use crate::Access;
 use crate::engine::{ConflictKey, ReadRule};
-use crate::sync::internal::Mutex;
 
 /// One stretch of snapshot keys a scan yielded, recorded once however many
 /// keys it holds.
@@ -45,10 +46,12 @@ pub(super) struct ScanRun {
     /// The last key it yielded, published when a page ends and when the
     /// stretch closes. `None` means nothing was published, so the stretch is
     /// taken to reach the end of the keyspace in the direction it walked.
-    //
-    // vertexia: a mutex, taken once per page by the cursor and once per run
-    // by the commit; an atomically swapped key if a profile ever shows it.
-    last: Mutex<Option<Vec<u8>>>,
+    ///
+    /// The cursor that owns the stretch's [`OpenRun`] is the one writer; a
+    /// commit reads it, possibly from another thread while the cursor is
+    /// between pages. Each publication swaps a whole key in, so a reader
+    /// sees one the cursor published, never part of one, and neither waits.
+    last: Atom<Option<Vec<u8>>>,
     reverse: bool,
     /// The parts the scan used, sorted, for a stretch of `ScanCheck::Parts`.
     parts: Option<Arc<[u32]>>,
@@ -69,7 +72,7 @@ pub(super) struct OpenRun {
 impl ScanRun {
     /// The stretch's first key and, once published, its last, CF-prefixed.
     pub(super) fn bounds(&self) -> (&[u8], Option<Vec<u8>>) {
-        (&self.first, self.last.lock().clone())
+        (&self.first, self.last.load_clone())
     }
 }
 
@@ -83,7 +86,7 @@ impl OpenRun {
     ) -> (Arc<ScanRun>, Self) {
         let run = Arc::new(ScanRun {
             first: key.to_vec(),
-            last: Mutex::new(None),
+            last: Atom::new(None),
             reverse,
             parts,
         });
@@ -105,10 +108,16 @@ impl OpenRun {
 
     /// Let a commit see how far the stretch has been extended.
     pub(super) fn publish(&self) {
-        let mut published = self.run.last.lock();
-        let slot = published.get_or_insert_with(Vec::new);
-        slot.clear();
-        slot.extend_from_slice(&self.last);
+        // A page that did not extend the stretch has nothing new to say.
+        let last = self.last.as_slice();
+        if self
+            .run
+            .last
+            .peek(|published| published.as_deref() == Some(last))
+        {
+            return;
+        }
+        self.run.last.store(Some(self.last.clone()));
     }
 }
 
@@ -293,7 +302,7 @@ pub(super) fn cover(
     if runs.is_empty() {
         return;
     }
-    let lasts: Vec<Option<Vec<u8>>> = runs.iter().map(|run| run.last.lock().clone()).collect();
+    let lasts: Vec<Option<Vec<u8>>> = runs.iter().map(|run| run.last.load_clone()).collect();
     let walks = Walks::of(runs, &lasts);
     for read in reads.iter_mut() {
         if walks.covers(&read.key) {
@@ -353,7 +362,7 @@ mod tests {
     ) -> Arc<ScanRun> {
         Arc::new(ScanRun {
             first: first.to_vec(),
-            last: Mutex::new(last.map(<[u8]>::to_vec)),
+            last: Atom::new(last.map(<[u8]>::to_vec)),
             reverse,
             parts: parts.map(Arc::from),
         })
@@ -370,6 +379,46 @@ mod tests {
             found: false,
             access: Access::Read,
             rule,
+        }
+    }
+
+    /// A commit reading a stretch while its cursor extends and publishes it
+    /// on another thread: every last key read is one the cursor published,
+    /// whole, and never an earlier one than was read before.
+    #[test]
+    fn a_stretch_read_while_its_cursor_publishes_is_never_torn() {
+        // The `i`th key: `i + 1` bytes, each of them `i`.
+        let key = |i: u8| vec![i; usize::from(i) + 1];
+        let pages: u8 = if cfg!(miri) { 40 } else { 200 };
+        for _ in 0..if cfg!(miri) { 2 } else { 50 } {
+            let (run, mut open) = OpenRun::start(&key(0), false, None);
+            let done = std::sync::atomic::AtomicBool::new(false);
+            std::thread::scope(|scope| {
+                let done = &done;
+                scope.spawn(move || {
+                    for i in 1..=pages {
+                        open.extend(&key(i));
+                        open.publish();
+                    }
+                    done.store(true, std::sync::atomic::Ordering::Release);
+                });
+                let mut newest = 0u8;
+                loop {
+                    let finished = done.load(std::sync::atomic::Ordering::Acquire);
+                    let (first, last) = run.bounds();
+                    assert_eq!(first, key(0));
+                    if let Some(last) = last {
+                        let i = last[0];
+                        assert_eq!(last, key(i), "a key the cursor never published");
+                        assert!(i >= newest, "the stretch went back from {newest} to {i}");
+                        newest = i;
+                    }
+                    if finished {
+                        break;
+                    }
+                }
+                assert_eq!(newest, pages, "the last read sees the last page");
+            });
         }
     }
 

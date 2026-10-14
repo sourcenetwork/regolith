@@ -112,6 +112,28 @@ fn truncate_frees_each_dropped_value_once_and_keeps_the_rest() {
 }
 
 #[test]
+fn truncate_into_hands_back_what_it_took_and_putting_it_back_restores_the_buffer() {
+    for spill_at in [0, 2] {
+        let mut buffer = TxnBuffer::new(spill_at);
+        for (key, value) in [(1u8, 10u32), (2, 20), (1, 11), (3, 30), (2, 21)] {
+            buffer.insert(key, value);
+        }
+        let mut taken = Vec::new();
+        buffer.truncate_into(2, |entry| taken.push(entry));
+        assert_eq!(taken, [(2, 21), (3, 30), (1, 11)], "newest first");
+        assert_eq!(buffer.len(), 2);
+        assert_eq!((buffer.get(&1), buffer.get(&3)), (Some(10), None));
+        for (key, value) in taken.into_iter().rev() {
+            buffer.insert(key, value);
+        }
+        assert_eq!(buffer.len(), 5);
+        assert_eq!(chain_of(&buffer, 1), [11, 10]);
+        assert_eq!(chain_of(&buffer, 2), [21, 20]);
+        assert_eq!(chain_of(&buffer, 3), [30]);
+    }
+}
+
+#[test]
 fn truncate_then_drain_returns_only_what_is_left() {
     let mut buffer = TxnBuffer::new(1);
     for (key, value) in [(1u8, 1u32), (2, 2), (1, 3)] {

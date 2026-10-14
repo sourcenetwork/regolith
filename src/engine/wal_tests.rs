@@ -10,6 +10,7 @@ use tempfile::TempDir;
 
 use crate::engine::wal_frame::{self, HEADER_LEN, KIND_GROUP, STAMP_LEN};
 use crate::engine::wal_replay::{WalPosition, WalReplayIter};
+use crate::engine::wal_seal;
 
 // -- helpers ------------------------------------------------------
 
@@ -31,7 +32,16 @@ fn replay_at(
     path: &Path,
     position: WalPosition,
 ) -> io::Result<(Vec<WalEntry>, Option<TailVerdict>)> {
-    let mut iter = WalReplayIter::open(&crate::env::std_env(), path, position)?;
+    replay_with(path, position, None)
+}
+
+/// [`replay_at`] through `keyring`, for a sealed log.
+fn replay_with(
+    path: &Path,
+    position: WalPosition,
+    keyring: Option<&Keyring>,
+) -> io::Result<(Vec<WalEntry>, Option<TailVerdict>)> {
+    let mut iter = WalReplayIter::open(&crate::env::std_env(), path, position, keyring)?;
     let mut entries = Vec::new();
     while let Some(entry) = iter.next_entry()? {
         entries.push(entry);
@@ -59,21 +69,40 @@ fn seq(entry: &WalEntry) -> u64 {
     }
 }
 
-/// The nonce in a format 2 log's stamp.
+/// Whether a format 2 log's stamp says its records are sealed.
+fn is_sealed(bytes: &[u8]) -> bool {
+    u16::from_le_bytes([bytes[6], bytes[7]]) == wal_seal::FLAG_SEALED
+}
+
+/// Bytes of a format 2 log's stamp, sealed or not.
+fn stamp_len_of(bytes: &[u8]) -> usize {
+    if is_sealed(bytes) {
+        wal_seal::SEALED_STAMP_LEN
+    } else {
+        STAMP_LEN
+    }
+}
+
+/// The nonce in a format 2 log's stamp, checked when the stamp is not
+/// sealed (a sealed stamp's checks take its key).
 fn nonce_of(bytes: &[u8]) -> u64 {
+    if is_sealed(bytes) {
+        return u64::from_le_bytes(bytes[12..20].try_into().unwrap());
+    }
     wal_frame::stamp_nonce(bytes[..STAMP_LEN].try_into().unwrap()).unwrap()
 }
 
 /// Every record's offset in an undamaged format 2 log, and the end.
 fn record_offsets(bytes: &[u8]) -> Vec<u64> {
     let nonce = nonce_of(bytes);
-    let mut offsets = vec![STAMP_LEN as u64];
+    let sealed = is_sealed(bytes);
+    let mut offsets = vec![stamp_len_of(bytes) as u64];
     loop {
         let at = *offsets.last().unwrap();
         if at as usize == bytes.len() {
             return offsets;
         }
-        let header = wal_frame::decode_header(&bytes[at as usize..], nonce, at)
+        let header = wal_frame::decode_header(&bytes[at as usize..], nonce, at, sealed)
             .unwrap_or_else(|| panic!("no record at {at}"));
         offsets.push(at + header.record_len());
     }
@@ -416,7 +445,7 @@ fn every_record_carries_the_offset_the_last_completed_sync_covered() {
     let claims: Vec<u64> = offsets[..4]
         .iter()
         .map(|&at| {
-            wal_frame::decode_header(&bytes[at as usize..], nonce, at)
+            wal_frame::decode_header(&bytes[at as usize..], nonce, at, false)
                 .unwrap()
                 .synced_through
         })
@@ -653,3 +682,6 @@ fn an_unstamped_earlier_log_yields_nothing_unless_its_stamp_was_written() {
 
 #[path = "wal_rule_tests.rs"]
 mod rule;
+
+#[path = "wal_seal_tests.rs"]
+mod sealed;

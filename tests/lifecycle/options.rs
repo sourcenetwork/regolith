@@ -28,7 +28,7 @@ fn seeded_dir(n: usize, base: &Options) -> TempDir {
     let dir = TempDir::new().unwrap();
     let db = Db::open(dir.path(), base.clone()).unwrap();
     write_range(&db, 0, n);
-    db.compact_range(None, None).unwrap();
+    db.compact_range(None, None).wait().unwrap();
     db.close().unwrap();
     drop(db);
     dir
@@ -51,7 +51,7 @@ fn assert_option_change_preserves_data(label: &str, from: Options, to: Options) 
     assert_range_present(&db, 0, SEEDED, &stage("after the change"));
     write_range(&db, SEEDED, ALL);
     assert_range_present(&db, 0, ALL, &stage("files from both option sets"));
-    db.compact_range(None, None).unwrap();
+    db.compact_range(None, None).wait().unwrap();
     assert_range_present(&db, 0, ALL, &stage("after compacting the mix"));
     db.close().unwrap();
     drop(db);
@@ -187,13 +187,17 @@ fn reopening_that_toggles_the_partitioned_index_reads_both_layouts() {
         assert_range_present(&db, 0, 400, label);
 
         write_range(&db, 400, 1200);
+        // The worker writes sealed memtables out off the commit path, so a
+        // table may still be under way here: a file with no footer yet. An
+        // explicit flush returns once every table is whole and installed.
+        db.flush().unwrap();
         let versions = sst_format_versions(dir.path());
         assert!(
             versions.len() > 1 && versions.contains(&new_version),
             "{label}: expected both footer versions on disk after the toggle, found {versions:?}"
         );
         assert_range_present(&db, 0, 1200, &stage("mixed index layouts"));
-        db.compact_range(None, None).unwrap();
+        db.compact_range(None, None).wait().unwrap();
         assert_range_present(&db, 0, 1200, &stage("after compacting the mix"));
         db.close().unwrap();
         drop(db);

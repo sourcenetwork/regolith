@@ -7,12 +7,12 @@ use std::time::{Duration, Instant};
 
 use regolith::{DurabilityMode, Options};
 
-use crate::cli::{Config, Fault, WorkerRole};
+use crate::cli::{Config, Fault, Shape, WorkerRole};
 use crate::faults::{WalMark, tear_wal_write, truncate_wal_tail};
 use crate::history::{
     Op, OpKind, Recorder, close_dangling_invokes, read_worker_records, stream_record, write_history,
 };
-use crate::model::{Outcome, Rng, TxDb, TxnPlan, ValueSource, run_txn};
+use crate::model::{Outcome, Rng, TxDb, TxnPlan, ValueSource, run_txn, side_keys_agree};
 
 /// Process id space reserved per child so a killed process is never
 /// reused, which Jepsen requires after an indeterminate operation.
@@ -35,9 +35,11 @@ pub fn run(cfg: &Config) -> Result<usize, String> {
     let values = ValueSource::new(cfg.value_base);
 
     {
-        let db = TxDb::open(&cfg.dir, cfg.isolation, options(false)).map_err(|e| e.to_string())?;
+        let db = TxDb::open(&cfg.dir, cfg.isolation, cfg.shape, options(false))
+            .map_err(|e| e.to_string())?;
         concurrent_phase(&db, cfg, &recorder, &values);
         read_back(&db, cfg, &recorder, cfg.threads);
+        side_keys(&db, cfg)?;
         db.db().close().map_err(|e| e.to_string())?;
     }
 
@@ -54,9 +56,10 @@ pub fn run(cfg: &Config) -> Result<usize, String> {
         // A database that will not reopen is itself the result. Stop
         // here rather than inventing read-back records for reads that
         // never ran, and report which fault it died on.
-        match TxDb::open(&cfg.dir, cfg.isolation, options(false)) {
+        match TxDb::open(&cfg.dir, cfg.isolation, cfg.shape, options(false)) {
             Ok(db) => {
                 read_back(&db, cfg, &recorder, cfg.threads + 1 + child);
+                side_keys(&db, cfg)?;
                 db.db().close().map_err(|e| e.to_string())?;
             }
             Err(err) => {
@@ -86,8 +89,14 @@ fn concurrent_phase(db: &TxDb, cfg: &Config, recorder: &Recorder, values: &Value
             scope.spawn(move || {
                 let mut rng = Rng::new(cfg.seed ^ process.wrapping_mul(0x9E37_79B9_7F4A_7C15));
                 for _ in 0..cfg.txns {
-                    let plan =
-                        TxnPlan::generate(cfg.model, cfg.isolation, cfg.keys, &mut rng, values);
+                    let plan = TxnPlan::generate(
+                        cfg.model,
+                        cfg.isolation,
+                        cfg.shape,
+                        cfg.keys,
+                        &mut rng,
+                        values,
+                    );
                     let mut emit = |op: Op| recorder.push(op);
                     record_txn(db, cfg, &plan, recorder, process, false, &mut emit);
                 }
@@ -96,10 +105,20 @@ fn concurrent_phase(db: &TxDb, cfg: &Config, recorder: &Recorder, values: &Value
     });
 }
 
+/// In the `classified` shape, check that the keys every transaction wrote
+/// beside its operations agree with each other: a head and a journal entry
+/// per commit, and no hole in the journal.
+fn side_keys(db: &TxDb, cfg: &Config) -> Result<(), String> {
+    match cfg.shape {
+        Shape::Classified => side_keys_agree(db.db()),
+        _ => Ok(()),
+    }
+}
+
 /// Read every key back on a single process. This is what lets a checker
 /// see the final state of each list or register.
 fn read_back(db: &TxDb, cfg: &Config, recorder: &Recorder, process: u64) {
-    let plan = TxnPlan::read_all(cfg.keys);
+    let plan = TxnPlan::read_all(cfg.keys, cfg.shape);
     let mut emit = |op: Op| recorder.push(op);
     record_txn(db, cfg, &plan, recorder, process, false, &mut emit);
 }
@@ -125,7 +144,7 @@ fn record_txn(
         recorder.now(),
         plan.invoke_value(),
     ));
-    let (kind, value) = match run_txn(db, cfg.model, plan) {
+    let (kind, value) = match run_txn(db, cfg.model, cfg.shape, plan) {
         Outcome::Committed(observed) => (OpKind::Ok, observed),
         Outcome::Aborted => (OpKind::Fail, plan.invoke_value()),
         Outcome::Unknown => (OpKind::Info, plan.invoke_value()),
@@ -229,6 +248,8 @@ fn spawn_worker(
         .arg(cfg.model.as_str())
         .arg("--isolation")
         .arg(cfg.isolation.as_str())
+        .arg("--shape")
+        .arg(cfg.shape.as_str())
         .arg("--keys")
         .arg(cfg.keys.to_string())
         .arg("--txns")
@@ -283,7 +304,8 @@ pub fn run_worker(cfg: &Config) -> Result<(), String> {
     let mut sink = std::fs::File::create(&cfg.worker_out)
         .map_err(|e| format!("create worker history: {}", e))?;
 
-    let db = TxDb::open(&cfg.dir, cfg.isolation, options(true)).map_err(|e| e.to_string())?;
+    let db =
+        TxDb::open(&cfg.dir, cfg.isolation, cfg.shape, options(true)).map_err(|e| e.to_string())?;
 
     if role == WorkerRole::Doomed {
         let mark = WalMark::capture(&cfg.dir)
@@ -298,7 +320,14 @@ pub fn run_worker(cfg: &Config) -> Result<(), String> {
         WorkerRole::Doomed => cfg.txns,
     };
     for _ in 0..budget {
-        let plan = TxnPlan::generate(cfg.model, cfg.isolation, cfg.keys, &mut rng, &values);
+        let plan = TxnPlan::generate(
+            cfg.model,
+            cfg.isolation,
+            cfg.shape,
+            cfg.keys,
+            &mut rng,
+            &values,
+        );
         let mut emit = |op: Op| {
             let _ = stream_record(&mut sink, &op);
         };

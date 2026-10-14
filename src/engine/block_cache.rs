@@ -482,6 +482,13 @@ impl BlockCache {
         }
     }
 
+    /// A close that failed: reads through queues make units again.
+    pub(crate) fn reopen_io(&self) {
+        if let Some(io) = self.io.get() {
+            io.reopen();
+        }
+    }
+
     /// Attach an optional statistics sink. Called once at engine
     /// open after the cache has been constructed; subsequent
     /// `get` / `insert` calls will update the provided tickers.
@@ -625,6 +632,7 @@ impl BlockCache {
             }
             let sweep = state.ring.high_water().min(SWEEP);
             if sweep == 0 || steps > 2 * sweep {
+                self.refused_held();
                 return false;
             }
             self.hand_step(shard, state, steps >= sweep);
@@ -649,6 +657,8 @@ impl BlockCache {
             }
             self.evict_unpinned(shard, state);
             if !bounded_add(&self.total_used, size, self.capacity) {
+                // What the emptied shard still holds is held by readers.
+                self.refused_held();
                 return false;
             }
         } else {
@@ -658,6 +668,14 @@ impl BlockCache {
         // past the total.
         shard.used.fetch_add(size, Ordering::AcqRel);
         true
+    }
+
+    /// Count an insert refused because what the hand could evict was held
+    /// (plan D58): the read goes on with its block uncached.
+    fn refused_held(&self) {
+        if let Some(s) = self.stats.as_deref() {
+            s.add(Ticker::BlockCacheAddRefusedHeld, 1);
+        }
     }
 
     /// Reserve `size` against the cache-wide budget, then the shard's.

@@ -1,9 +1,8 @@
 use super::*;
 use crate::env::{
-    Capabilities, DirEntry, FileLock, FileMeta, JoinHandle, MemEnv, ReadFile, WriteFile,
+    Capabilities, FileLock, FileMeta, JoinHandle, MemEnv, ReadDir, ReadFile, WriteFile,
 };
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
 
 fn legacy_manifest() -> Vec<u8> {
     // Spell out the original format so the fixture cannot change with
@@ -34,7 +33,7 @@ fn fixture() -> (Arc<dyn Env>, PathBuf, PathBuf) {
 }
 
 fn open(env: &Arc<dyn Env>, db_dir: &Path, sst_dir: &Path) -> VersionSet {
-    VersionSet::open_with_policy(env, db_dir, sst_dir, MetadataPolicy::Pinned).unwrap()
+    VersionSet::open_with_policy(env, db_dir, sst_dir, MetadataPolicy::Pinned, None).unwrap()
 }
 
 fn assert_version(vs: &VersionSet, next_file_id: u64, last_seq: u64, min_wal_id: u64) {
@@ -226,7 +225,7 @@ impl Env for RewriteFailureEnv {
         self.inner.create_dir_all(path)
     }
 
-    fn read_dir(&self, path: &Path) -> io::Result<Vec<DirEntry>> {
+    fn read_dir(&self, path: &Path) -> io::Result<ReadDir<'_>> {
         self.inner.read_dir(path)
     }
 
@@ -234,6 +233,9 @@ impl Env for RewriteFailureEnv {
         self.inner.open_read(path)
     }
 
+    fn open_log(&self, path: &Path, mode: WriteMode) -> io::Result<Box<dyn crate::env::LogFile>> {
+        self.inner.open_log(path, mode)
+    }
     fn open_write(&self, path: &Path, mode: WriteMode) -> io::Result<Box<dyn WriteFile>> {
         if matches!(mode, WriteMode::Append) && self.fail_append_open.swap(false, Ordering::SeqCst)
         {
@@ -287,10 +289,6 @@ impl Env for RewriteFailureEnv {
         body: Box<dyn FnOnce() + Send + 'static>,
     ) -> io::Result<Box<dyn JoinHandle>> {
         self.inner.spawn(name, body)
-    }
-
-    fn sleep(&self, dur: Duration) {
-        self.inner.sleep(dur)
     }
 }
 

@@ -85,7 +85,8 @@ fn a_checkpoint_drain_racing_a_rotation_never_loses_an_acknowledged_write() {
                 while i < KEYS_PER_WRITER
                     || (i < MAX_KEYS_PER_WRITER && raced.load(Ordering::Relaxed) < RACED_DRAINS)
                 {
-                    db.put(&key_of(w, i), &value_of(w, i)).expect("put");
+                    regolith::through_stalls(|| db.put(&key_of(w, i), &value_of(w, i)))
+                        .expect("put");
                     writes.fetch_add(1, Ordering::Relaxed);
                     i += 1;
                     if i > KEYS_PER_WRITER {
@@ -114,7 +115,7 @@ fn a_checkpoint_drain_racing_a_rotation_never_loses_an_acknowledged_write() {
                 // A checkpoint can legitimately refuse while the
                 // engine is busy; the race is in the drain it ran
                 // before refusing, so a refusal is not a failure here.
-                if db.checkpoint(&into).is_ok() {
+                if db.checkpoint(&into).wait().is_ok() {
                     drains.fetch_add(1, Ordering::Relaxed);
                     // It raced the writers only if a write was acknowledged
                     // while it ran.

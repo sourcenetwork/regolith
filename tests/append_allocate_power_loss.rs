@@ -24,8 +24,6 @@
 mod common;
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs::OpenOptions;
-use std::io::Write;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -84,14 +82,13 @@ fn open(path: &Path, durability: DurabilityMode) -> OptimisticTransactionDb {
     .unwrap()
 }
 
-/// One unbuffered write per acknowledgement, so a kill a microsecond later
-/// cannot lose the record of what the caller was told.
-fn acker(spec: &ChildSpec) -> std::fs::File {
-    OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&spec.ack_path)
-        .unwrap()
+/// Run `attempt`, a transaction built and committed. A write stall does not
+/// end its commit, which waits the stall out, so the attempt is made once;
+/// any failure fails the child.
+fn commit_through_stalls(attempt: impl FnOnce() -> TxResult<CommitReceipt>) {
+    if let Err(other) = attempt() {
+        panic!("child: commit: {other}");
+    }
 }
 
 fn append_child(spec: &ChildSpec) {
@@ -100,19 +97,21 @@ fn append_child(spec: &ChildSpec) {
     let handles: Vec<_> = (0..THREADS)
         .map(|t| {
             let (db, log) = (Arc::clone(&db), Arc::clone(&log));
-            let mut acks = acker(spec);
+            let mut acks = fault::Acks::open(&spec.ack_path);
             let commits = spec.ops;
             std::thread::spawn(move || {
                 for i in 0..commits {
-                    let tx = db.begin(&TxnOptions::new());
-                    tx.append(
-                        &log,
-                        format!("t{t}-{i}").as_bytes(),
-                        Some(format!("once/{t}-{i}").as_bytes()),
-                    )
-                    .unwrap();
-                    tx.commit().expect("child: commit");
-                    acks.write_all(format!("{t} {i}\n").as_bytes()).unwrap();
+                    commit_through_stalls(|| {
+                        let tx = db.begin(&TxnOptions::new());
+                        tx.append(
+                            &log,
+                            format!("t{t}-{i}").as_bytes(),
+                            Some(format!("once/{t}-{i}").as_bytes()),
+                        )
+                        .unwrap();
+                        tx.commit()
+                    });
+                    acks.ack([t as u64, i as u64]);
                 }
             })
         })
@@ -127,23 +126,28 @@ fn allocate_child(spec: &ChildSpec) {
     let handles: Vec<_> = (0..THREADS)
         .map(|t| {
             let db = Arc::clone(&db);
-            let mut acks = acker(spec);
+            let mut acks = fault::Acks::open(&spec.ack_path);
             let rounds = spec.ops;
             std::thread::spawn(move || {
                 for round in 0..rounds {
                     let range = db.allocate(b"ids", 3).unwrap();
-                    let tx = db.begin(&TxnOptions::new());
-                    for v in range.clone() {
-                        tx.put(format!("use/{v:020}/{t}").as_bytes(), b"").unwrap();
-                    }
                     // Every fifth round aborts after allocating: a gap.
                     if round % 5 == 4 {
+                        let tx = db.begin(&TxnOptions::new());
+                        for v in range.clone() {
+                            tx.put(format!("use/{v:020}/{t}").as_bytes(), b"").unwrap();
+                        }
                         tx.rollback();
                         continue;
                     }
-                    tx.commit().expect("child: commit");
-                    let line: String = range.map(|v| format!("{v}\n")).collect();
-                    acks.write_all(line.as_bytes()).unwrap();
+                    commit_through_stalls(|| {
+                        let tx = db.begin(&TxnOptions::new());
+                        for v in range.clone() {
+                            tx.put(format!("use/{v:020}/{t}").as_bytes(), b"").unwrap();
+                        }
+                        tx.commit()
+                    });
+                    acks.ack_all(range.map(|v| [v]));
                 }
             })
         })
@@ -228,10 +232,8 @@ fn check_recovered_log(out: &ChildOutcome, durability: DurabilityMode) {
 
     // Immediate: an acknowledged commit survives any cut.
     if durability == DurabilityMode::Immediate {
-        let acked = std::fs::read_to_string(&out.spec.ack_path).unwrap_or_default();
-        for line in acked.lines() {
-            let (t, i) = line.split_once(' ').unwrap();
-            let key = (t.parse::<usize>().unwrap(), i.parse::<usize>().unwrap());
+        for [t, i] in out.acks.of() {
+            let key = (t as usize, i as usize);
             assert!(seen.contains(&key), "acknowledged commit {key:?} was lost");
         }
     }
@@ -255,6 +257,20 @@ fn check_recovered_log(out: &ChildOutcome, durability: DurabilityMode) {
 
 const TEARS: [TearMode; 2] = [TearMode::Truncate, TearMode::TornSector];
 
+/// Commits per writer for the cuts at the nth log write. Concurrent commits
+/// share a group's one write, and a group holds at most one commit of each
+/// of the `THREADS` writers, so this many commits per writer make at least
+/// this many log writes: enough for every cut below to fire.
+const APPEND_COMMITS: usize = 100;
+
+/// Rounds per writer for the cuts at the nth log write. A round makes a
+/// reservation's record and, four rounds in five, a commit's; a run of the
+/// write unit holds at most those two of each of the `THREADS` writers (a
+/// reservation returns before its record is written, a commit only once its
+/// own is), so this many rounds make at least 120 log writes: enough for the
+/// last cut below to fire.
+const ALLOCATE_ROUNDS: usize = 140;
+
 #[test]
 fn a_power_cut_leaves_a_gap_free_prefix_of_the_appends_at_immediate_durability() {
     for nth in [4, 17, 40, 90] {
@@ -264,7 +280,7 @@ fn a_power_cut_leaves_a_gap_free_prefix_of_the_appends_at_immediate_durability()
                 DurabilityMode::Immediate,
                 Trigger::wal_write(nth),
                 tear,
-                40,
+                APPEND_COMMITS,
             );
             check_recovered_log(&out, DurabilityMode::Immediate);
         }
@@ -280,7 +296,7 @@ fn a_power_cut_leaves_a_gap_free_prefix_of_the_appends_at_eventual_durability() 
                 DurabilityMode::Eventual,
                 Trigger::wal_write(nth),
                 tear,
-                40,
+                APPEND_COMMITS,
             );
             check_recovered_log(&out, DurabilityMode::Eventual);
         }
@@ -323,9 +339,7 @@ fn check_recovered_counter(out: &ChildOutcome, durability: DurabilityMode) {
         next.start
     );
     if durability == DurabilityMode::Immediate {
-        let acked = std::fs::read_to_string(&out.spec.ack_path).unwrap_or_default();
-        for line in acked.lines() {
-            let v: u64 = line.parse().unwrap();
+        for [v] in out.acks.of() {
             assert!(values.contains(&v), "acknowledged use of {v} was lost");
         }
     }
@@ -340,7 +354,7 @@ fn a_power_cut_never_returns_a_value_a_surviving_commit_used_at_immediate_durabi
                 DurabilityMode::Immediate,
                 Trigger::wal_write(nth),
                 tear,
-                30,
+                ALLOCATE_ROUNDS,
             );
             check_recovered_counter(&out, DurabilityMode::Immediate);
         }
@@ -356,7 +370,7 @@ fn a_power_cut_never_returns_a_value_a_surviving_commit_used_at_eventual_durabil
                 DurabilityMode::Eventual,
                 Trigger::wal_write(nth),
                 tear,
-                30,
+                ALLOCATE_ROUNDS,
             );
             check_recovered_counter(&out, DurabilityMode::Eventual);
         }

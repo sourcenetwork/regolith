@@ -214,8 +214,12 @@ Build(p) ==
 Swap(p) ==
   \* Only a publisher holding a built view swaps.
   /\ pstate[p] = "built"
+  \* Does the swap go in? Yes when the cell still holds the view this one was built from; the bug
+  \* PlainStore always says yes.
   /\ IF Mode = "PlainStore" \/ published = pbase[p]
-       THEN \* The swap goes in: the cell holds a new view ...
+       \* The swap goes in.
+       THEN
+            \* The cell holds a new view ...
             /\ published' = made + 1
             \* ... which takes the next number.
             /\ made' = made + 1
@@ -229,7 +233,9 @@ Swap(p) ==
             /\ freed' = IF Mode = "FreeEarly" THEN freed \cup {published} ELSE freed
             \* Record what it was built from, what it is, what it replaced.
             /\ chain' = Append(chain, <<pbase[p], made + 1, published>>)
-       ELSE \* The CAS failed: someone else published first. Nothing moves.
+       \* The CAS failed: someone else published first.
+       ELSE
+            \* Nothing moves.
             UNCHANGED <<published, made, retired, freed, waitFor, chain>>
   \* Either way the attempt is over; a failed one will be built again.
   /\ pstate' = [pstate EXCEPT ![p] = "idle"]

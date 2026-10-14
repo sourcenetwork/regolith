@@ -2,10 +2,8 @@
 //! writes against a single `Db` handle.
 //!
 //! Scenarios ported from `db_test.cc` multi-threaded tests and
-//! from the black-box core of RocksDB's `db_stress`. Long-running
-//! soak variants run in the gate too, sized so that `cargo test`
-//! stays fast for PRs; CI runs them nightly via
-//! `cargo test -- --ignored`.
+//! from the black-box core of RocksDB's `db_stress`. The long-running
+//! soak runs in the gate too, sized so that `cargo test` stays fast.
 
 // Native-only. wasm-pack builds every test target for wasm32, and these use
 // threads, the filesystem or proptest, none of which exist there. The browser
@@ -41,7 +39,7 @@ fn parallel_writers_produce_durable_writes() {
         handles.push(thread::spawn(move || {
             for i in 0..writes_per_writer {
                 let key = format!("t{}_k{:05}", t, i);
-                db.put(key.as_bytes(), key.as_bytes()).unwrap();
+                regolith::through_stalls(|| db.put(key.as_bytes(), key.as_bytes())).unwrap();
             }
         }));
     }
@@ -66,7 +64,7 @@ fn concurrent_readers_during_flush_see_consistent_values() {
     // thread forces a flush.
     let dir = TempDir::new().unwrap();
     let db = Arc::new(open(&dir));
-    db.put(b"pinned", b"stable").unwrap();
+    regolith::through_stalls(|| db.put(b"pinned", b"stable")).unwrap();
 
     let stop = Arc::new(AtomicBool::new(false));
     let reader_handles: Vec<_> = (0..3)
@@ -102,14 +100,14 @@ fn snapshot_held_by_reader_outlives_writer_compaction() {
     // writer's updates plus a compaction.
     let dir = TempDir::new().unwrap();
     let db = Arc::new(open(&dir));
-    db.put(b"k", b"v0").unwrap();
+    regolith::through_stalls(|| db.put(b"k", b"v0")).unwrap();
     let snap = db.snapshot();
 
     let db_writer = Arc::clone(&db);
     let writer = thread::spawn(move || {
         for i in 1..=100 {
             let v = format!("v{i}");
-            db_writer.put(b"k", v.as_bytes()).unwrap();
+            regolith::through_stalls(|| db_writer.put(b"k", v.as_bytes())).unwrap();
         }
         force_compaction(&db_writer);
     });
@@ -150,7 +148,7 @@ fn concurrent_batch_writers_are_atomic() {
                 batch.put(format!("t{}_{}_a", t, i).as_bytes(), b"1");
                 batch.put(format!("t{}_{}_b", t, i).as_bytes(), b"2");
                 batch.put(format!("t{}_{}_c", t, i).as_bytes(), b"3");
-                db.write(batch).unwrap();
+                regolith::through_stalls(|| db.write(batch.clone())).unwrap();
             }
         }));
     }
@@ -204,7 +202,7 @@ fn snapshot_never_observes_a_torn_batch() {
                 for k in 0..batch_width {
                     batch.put(format!("b{i}_{k}").as_bytes(), b"v");
                 }
-                db.write(batch).unwrap();
+                regolith::through_stalls(|| db.write(batch.clone())).unwrap();
             }
         })
     };
@@ -278,7 +276,7 @@ fn reads_during_compaction_return_correct_values() {
     assert!(!err_flag.load(Ordering::Relaxed));
 }
 
-// ── long soak, gated behind --ignored ──────────────────────────
+// ── long soak ──────────────────────────────────────────────────
 
 #[test]
 fn writer_compactor_contention_soak() {
@@ -302,10 +300,10 @@ fn writer_compactor_contention_soak() {
                 let key = format!("k_{:06}", seed % 1024);
                 match seed % 3 {
                     0 => {
-                        db.put(key.as_bytes(), b"v").unwrap();
+                        regolith::through_stalls(|| db.put(key.as_bytes(), b"v")).unwrap();
                     }
                     1 => {
-                        db.delete(key.as_bytes()).unwrap();
+                        regolith::through_stalls(|| db.delete(key.as_bytes())).unwrap();
                     }
                     _ => {
                         let _ = db.get(key.as_bytes()).unwrap();

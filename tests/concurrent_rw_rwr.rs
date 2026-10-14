@@ -11,8 +11,9 @@
 //! Every wait has a deadline, and a helper ends when the last thread that can
 //! ask it for anything is gone.
 //!
-//! Scenarios 1 to 4 and 7 run on both transaction flavours; 5 and 6 need the
-//! optimistic one. Every scenario runs on two storage shapes: the default,
+//! Scenarios 1 to 4, 7, 9 and 11 run on both transaction flavours, and 10 runs
+//! its forced half on both; 5, 6 and 8 need the optimistic one. Every scenario
+//! runs on two storage shapes: the default,
 //! where only the active memtable is ever probed, and a small write buffer
 //! with flushes in the worker loops, where the conflict probes walk SSTables
 //! too. A scenario claims a probe reached a table only after counting block
@@ -52,6 +53,26 @@
 //!    commits, and then the reader commits: only `Serializable` validates a
 //!    scan, but a row the reader scanned and then writes is validated at
 //!    every level.
+//! 8. Content-addressed keys (`DefraLevel`, optimistic). Eight transactions
+//!    create one block, each reading whether it is stored before putting it:
+//!    with a classifier all commit at `DefraLevel`, anywhere else one does.
+//!    A block that was read and found is refused only by a write that takes
+//!    it away, a put of one is never validated, and a delete of one is
+//!    validated like any delete.
+//! 9. Appends. Eight transactions append to one log, with a once key they
+//!    share, and none is refused at any level: positions are dense from 1,
+//!    follow the commits' receipts, and the once key took one entry. A
+//!    commit refused over another key appends nothing, and a transaction
+//!    that reads the head and then the entries finds every one while appends
+//!    commit around it.
+//! 10. Projected reads (`DefraLevel`, optimistic). Eight transactions read a
+//!     part of one document and increment that part: the first on each part
+//!     commits, where at any other level the first of all does. A read by
+//!     parts is refused by a forced write only when it changes a named part.
+//! 11. Write-free transactions. A commit that wrote nothing validates no
+//!     plain read at `DefraLevel` on the optimistic flavour and is placed at
+//!     its snapshot; a read through `get_for_update` is still checked, and
+//!     every other level validates what it always does.
 
 // Native-only. wasm-pack builds every test target for wasm32, and these use
 // threads and the filesystem. The browser suite lives in tests/wasm_opfs*.rs.
@@ -73,14 +94,25 @@ use tempfile::TempDir;
 /// The scenarios that need a database of their own shape live in their own
 /// files. The `#[path]` attributes are what keep `tests/concurrent_rw_rwr/`
 /// from being picked up as further test targets.
+#[path = "concurrent_rw_rwr/appends.rs"]
+mod appends;
 #[path = "concurrent_rw_rwr/blind_merge.rs"]
 mod blind_merge;
 #[path = "concurrent_rw_rwr/commutative_prefix.rs"]
 mod commutative_prefix;
+#[path = "concurrent_rw_rwr/content_addressed.rs"]
+mod content_addressed;
+/// The merge operator over values of three parts the projected reads use.
+#[path = "common/parted.rs"]
+mod parted;
+#[path = "concurrent_rw_rwr/projected_reads.rs"]
+mod projected_reads;
 #[path = "concurrent_rw_rwr/scan_commit.rs"]
 mod scan_commit;
 #[path = "concurrent_rw_rwr/support.rs"]
 mod support;
+#[path = "concurrent_rw_rwr/write_free.rs"]
+mod write_free;
 
 use support::{Rendezvous, STORAGES, Storage, table_lookups};
 
@@ -372,7 +404,7 @@ fn snapshot_sum(db: &impl Flavour, level: IsolationLevel, storage: Storage) {
             "{level:?}: the forced transfer never reached a table"
         );
         db.raw().flush().unwrap();
-        db.raw().compact_range(None, None).unwrap();
+        db.raw().compact_range(None, None).wait().unwrap();
     }
     let rest: u64 = (1..ACCOUNTS)
         .map(|i| decode(auditor.get(&account(i)).unwrap()))

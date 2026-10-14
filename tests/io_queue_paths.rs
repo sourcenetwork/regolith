@@ -7,7 +7,7 @@
 //! different read onto the device: data blocks, cached indexes and filters,
 //! partitioned index leaves, files reopened under `max_open_files`, and a
 //! disabled block cache, where only what landed for the queue carries the
-//! read.
+//! read. Each layout runs plain and encrypted at rest.
 #![cfg(not(target_arch = "wasm32"))]
 
 mod common;
@@ -15,6 +15,7 @@ mod common;
 use std::sync::Arc;
 
 use common::device_env::{Device, DeviceEnv};
+use common::keys::Keys;
 use common::parted::{self, Parted};
 use regolith::{
     Db, Error, IoBudget, IoQueue, IsolationLevel, OptimisticTransactionDb, Options, ReadMode,
@@ -36,7 +37,7 @@ const MOST_WAITS: usize = 10_000;
 type Walked = Vec<(Vec<u8>, Vec<u8>)>;
 
 #[derive(Clone, Copy, Debug)]
-enum Layout {
+enum Shape {
     /// Pinned indexes and filters: only data blocks are read.
     Pinned,
     /// Flat indexes and filters through the block cache.
@@ -49,46 +50,83 @@ enum Layout {
     NoCache,
 }
 
-const LAYOUTS: [Layout; 5] = [
-    Layout::Pinned,
-    Layout::CachedMeta,
-    Layout::Partitioned,
-    Layout::FewFiles,
-    Layout::NoCache,
+/// A table layout, plain or encrypted at rest. On a sealed table the read a
+/// queue runs opens each block (decrypts and verifies it) before it lands in
+/// the block cache or for the queue, so every path below must answer on an
+/// encrypted database exactly as it does on a plain one.
+#[derive(Clone, Copy, Debug)]
+struct Layout {
+    shape: Shape,
+    sealed: bool,
+}
+
+impl Layout {
+    const fn plain(shape: Shape) -> Self {
+        Self {
+            shape,
+            sealed: false,
+        }
+    }
+
+    const fn sealed(shape: Shape) -> Self {
+        Self {
+            shape,
+            sealed: true,
+        }
+    }
+}
+
+const LAYOUTS: [Layout; 10] = [
+    Layout::plain(Shape::Pinned),
+    Layout::plain(Shape::CachedMeta),
+    Layout::plain(Shape::Partitioned),
+    Layout::plain(Shape::FewFiles),
+    Layout::plain(Shape::NoCache),
+    Layout::sealed(Shape::Pinned),
+    Layout::sealed(Shape::CachedMeta),
+    Layout::sealed(Shape::Partitioned),
+    Layout::sealed(Shape::FewFiles),
+    Layout::sealed(Shape::NoCache),
 ];
 
-fn options(layout: Layout, env: Arc<DeviceEnv>) -> Options {
-    let base = Options::default()
-        .env(env)
-        .block_size(256)
-        .metadata_block_size(256)
-        .merge_operator(Some(Arc::new(Parted)));
-    match layout {
-        Layout::Pinned => base,
-        Layout::CachedMeta => base.cache_index_and_filter_blocks(true),
-        Layout::Partitioned => base
+/// `base` laid out as `layout` says.
+fn laid_out(base: Options, layout: Layout) -> Options {
+    let base = match layout.shape {
+        Shape::Pinned => base,
+        Shape::CachedMeta => base.cache_index_and_filter_blocks(true),
+        Shape::Partitioned => base
             .partitioned_index(true)
             .cache_index_and_filter_blocks(true),
-        Layout::FewFiles => base.max_open_files(1),
-        Layout::NoCache => base.block_cache_size(0),
+        Shape::FewFiles => base.max_open_files(1),
+        Shape::NoCache => base.block_cache_size(0),
+    };
+    if layout.sealed {
+        base.key_provider(Keys::new(&[1]))
+    } else {
+        base
     }
+}
+
+fn options(layout: Layout, env: Arc<DeviceEnv>) -> Options {
+    laid_out(
+        Options::default()
+            .env(env)
+            .block_size(256)
+            .metadata_block_size(256)
+            .merge_operator(Some(Arc::new(Parted))),
+        layout,
+    )
 }
 
 /// [`options`] with no merge operator.
 fn options_without_merges(layout: Layout, env: Arc<DeviceEnv>) -> Options {
-    let base = Options::default()
-        .env(env)
-        .block_size(256)
-        .metadata_block_size(256);
-    match layout {
-        Layout::Pinned => base,
-        Layout::CachedMeta => base.cache_index_and_filter_blocks(true),
-        Layout::Partitioned => base
-            .partitioned_index(true)
-            .cache_index_and_filter_blocks(true),
-        Layout::FewFiles => base.max_open_files(1),
-        Layout::NoCache => base.block_cache_size(0),
-    }
+    laid_out(
+        Options::default()
+            .env(env)
+            .block_size(256)
+            .metadata_block_size(256),
+        layout,
+    )
 }
 
 fn key(i: usize) -> Vec<u8> {
@@ -687,7 +725,7 @@ fn a_pessimistic_cursor_waits_on_a_key_read_past_its_snapshot() {
 
 #[test]
 fn a_blocking_handle_reads_the_device_as_before() {
-    let (_dir, db, device) = cold(Layout::Pinned);
+    let (_dir, db, device) = cold(Layout::plain(Shape::Pinned));
     let db = db.db();
     let before = device.reads();
     assert!(db.snapshot().get(&key(103)).unwrap().is_some());
@@ -706,7 +744,7 @@ fn a_blocking_handle_reads_the_device_as_before() {
 
 #[test]
 fn reads_inside_commit_read_the_device_and_prepare_can_wait() {
-    let (_dir, db, device) = cold(Layout::Pinned);
+    let (_dir, db, device) = cold(Layout::plain(Shape::Pinned));
     let mut queue = db.db().io_queue();
     let opts = TxnOptions::new().read_mode(ReadMode::CacheOnly(queue.id()));
 
@@ -745,7 +783,7 @@ fn reads_inside_commit_read_the_device_and_prepare_can_wait() {
 
 #[test]
 fn a_read_naming_a_dropped_queue_fails_loud() {
-    let (_dir, db, _device) = cold(Layout::Pinned);
+    let (_dir, db, _device) = cold(Layout::plain(Shape::Pinned));
     let db = db.db();
     let queue = db.io_queue();
     let snapshot = db
@@ -760,8 +798,8 @@ fn a_read_naming_a_dropped_queue_fails_loud() {
 
 #[test]
 fn a_read_naming_another_databases_queue_fails_loud() {
-    let (_dir, db, _device) = cold(Layout::Pinned);
-    let (_other_dir, other, _) = cold(Layout::Pinned);
+    let (_dir, db, _device) = cold(Layout::plain(Shape::Pinned));
+    let (_other_dir, other, _) = cold(Layout::plain(Shape::Pinned));
     let foreign = other.db().io_queue();
     let snapshot = db
         .db()

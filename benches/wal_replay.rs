@@ -20,6 +20,8 @@
 //! Environment: `REPLAY_MIB` (default 64), `TAIL_MIB` (default 16),
 //! `REPS` (default 7).
 
+mod common;
+
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -52,18 +54,6 @@ fn wal_files(db: &Path) -> Vec<PathBuf> {
     wals
 }
 
-fn copy_db(from: &Path, to: &Path) {
-    for sub in ["wal", "sst"] {
-        fs::create_dir_all(to.join(sub)).expect("mkdir");
-        for e in fs::read_dir(from.join(sub)).expect("read_dir").flatten() {
-            fs::copy(e.path(), to.join(sub).join(e.file_name())).expect("copy");
-        }
-    }
-    for file in ["MANIFEST", "LOCK"] {
-        fs::copy(from.join(file), to.join(file)).expect("copy");
-    }
-}
-
 /// Build a database whose newest log holds about `mib` MiB, and copy it
 /// to `out`. Returns how many puts it holds.
 fn build(mib: u64, scratch: &Path, out: &Path) -> u64 {
@@ -88,7 +78,7 @@ fn build(mib: u64, scratch: &Path, out: &Path) -> u64 {
     }
     // The state a crash leaves: no close, so no flush and no final record.
     std::mem::forget(db);
-    copy_db(&src, out);
+    common::copy_db(&src, out);
     n
 }
 
@@ -160,7 +150,7 @@ fn main() {
         ("garbage_tail", garbage(tail, 0x5EED)),
     ] {
         let dir = scratch.path().join(label);
-        copy_db(&healthy, &dir);
+        common::copy_db(&healthy, &dir);
         let wal = wal_files(&dir).pop().expect("one log");
         let mut all = fs::read(&wal).expect("read");
         all.extend_from_slice(&bytes);

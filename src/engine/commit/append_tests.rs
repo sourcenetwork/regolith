@@ -8,6 +8,7 @@ use std::collections::BTreeMap;
 use tempfile::TempDir;
 
 use super::super::{EngineOptions, ValidationSet, wal::fault};
+use super::append::AppendOrder;
 use super::*;
 use crate::column_family::{DEFAULT_CF_ID, prefix_key};
 use crate::{Access, LogLayout, WriteBatchOp};
@@ -118,15 +119,9 @@ fn member(
     order.number(engine, &engine.view.load(), appends, ops)
 }
 
-fn finished(order: AppendOrder) -> Vec<WriteBatchOp> {
-    let mut ops = Vec::new();
-    order.finish(&mut ops);
-    ops
-}
-
 fn commit(
     engine: &RegolithEngine,
-    checks: &ValidationSet,
+    checks: ValidationSet,
     appends: Vec<PendingAppend>,
     durability: DurabilityMode,
 ) -> io::Result<CommitOutcome> {
@@ -165,7 +160,6 @@ fn positions_run_on_from_the_head_in_the_view_and_the_head_key_is_written_once()
         &mut ops,
     )
     .unwrap();
-    ops.extend(finished(order));
 
     assert_eq!(
         puts(&ops),
@@ -184,7 +178,6 @@ fn an_empty_log_starts_at_one() {
     let mut order = AppendOrder::default();
     let mut ops = Vec::new();
     member(&engine, &mut order, vec![entry(&log, b"x", None)], &mut ops).unwrap();
-    ops.extend(finished(order));
     assert_eq!(
         puts(&ops),
         [
@@ -195,7 +188,8 @@ fn an_empty_log_starts_at_one() {
 }
 
 /// RED ViewOnlyHead: a member that read the head from the view alone would
-/// take the position its predecessor already took.
+/// take the position its predecessor already took. Each member writes the
+/// head it leaves in its own record.
 #[test]
 fn a_later_member_of_a_group_counts_from_the_head_an_earlier_member_left() {
     let (_dir, engine) = open();
@@ -221,19 +215,60 @@ fn a_later_member_of_a_group_counts_from_the_head_an_earlier_member_left() {
 
     assert_eq!(
         puts(&first),
-        [("j/00000000000000000001".to_owned(), b"a".to_vec())]
+        [
+            ("j/00000000000000000001".to_owned(), b"a".to_vec()),
+            ("j-head".to_owned(), position(1)),
+        ]
     );
     assert_eq!(
         puts(&second),
         [
             ("j/00000000000000000002".to_owned(), b"b".to_vec()),
             ("j/00000000000000000003".to_owned(), b"c".to_vec()),
-        ]
+            ("j-head".to_owned(), position(3)),
+        ],
+        "the head key holds the last position the member assigned"
     );
+}
+
+/// A member that fails part way through its appends gives back every
+/// position and once key it took, so the member after it numbers as if it
+/// had never been there and the log has no hole.
+#[test]
+fn a_member_that_fails_gives_back_what_it_took() {
+    let (_dir, engine) = open();
+    let log = Flat::named("j");
+    let overrun: Arc<dyn LogLayout> = Arc::new(Overrun);
+    let mut order = AppendOrder::default();
+    let err = member(
+        &engine,
+        &mut order,
+        vec![
+            entry(&log, b"a", Some(b"o")),
+            entry(&log, b"b", None),
+            entry(&overrun, b"too long", None),
+        ],
+        &mut Vec::new(),
+    )
+    .unwrap_err();
+    assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+
+    let mut ops = Vec::new();
+    member(
+        &engine,
+        &mut order,
+        vec![entry(&log, b"c", Some(b"o"))],
+        &mut ops,
+    )
+    .unwrap();
     assert_eq!(
-        puts(&finished(order)),
-        [("j-head".to_owned(), position(3))],
-        "the head key holds the last position any member assigned"
+        puts(&ops),
+        [
+            ("j/00000000000000000001".to_owned(), b"c".to_vec()),
+            ("o".to_owned(), position(1)),
+            ("j-head".to_owned(), position(1)),
+        ],
+        "the failed member's positions and once key were given back"
     );
 }
 
@@ -264,11 +299,15 @@ fn a_once_key_an_earlier_member_set_is_seen_by_a_later_one() {
         [
             ("j/00000000000000000001".to_owned(), b"a".to_vec()),
             ("o".to_owned(), position(1)),
+            ("j-head".to_owned(), position(1)),
         ]
     );
     assert_eq!(
         puts(&second),
-        [("j/00000000000000000002".to_owned(), b"c".to_vec())],
+        [
+            ("j/00000000000000000002".to_owned(), b"c".to_vec()),
+            ("j-head".to_owned(), position(2)),
+        ],
         "the shared once key appends nothing; the append beside it takes the next position"
     );
 }
@@ -294,6 +333,7 @@ fn one_once_key_appended_twice_in_one_member_yields_one_entry() {
         [
             ("j/00000000000000000001".to_owned(), b"first".to_vec()),
             ("o".to_owned(), position(1)),
+            ("j-head".to_owned(), position(1)),
         ]
     );
 }
@@ -314,7 +354,6 @@ fn a_once_key_the_view_holds_appends_nothing_and_leaves_the_head_alone() {
         &mut ops,
     )
     .unwrap();
-    ops.extend(finished(order));
 
     assert!(
         ops.is_empty(),
@@ -326,8 +365,9 @@ fn a_once_key_the_view_holds_appends_nothing_and_leaves_the_head_alone() {
 fn an_order_that_assigned_nothing_writes_no_head() {
     let (_dir, engine) = open();
     let mut order = AppendOrder::default();
-    member(&engine, &mut order, Vec::new(), &mut Vec::new()).unwrap();
-    assert!(finished(order).is_empty());
+    let mut ops = Vec::new();
+    member(&engine, &mut order, Vec::new(), &mut ops).unwrap();
+    assert!(ops.is_empty());
 }
 
 #[test]
@@ -348,7 +388,6 @@ fn logs_are_numbered_apart_and_each_head_is_written_once() {
         &mut ops,
     )
     .unwrap();
-    ops.extend(finished(order));
     assert_eq!(
         puts(&ops),
         [
@@ -371,7 +410,6 @@ fn a_new_order_reads_the_view_again() {
         let mut order = AppendOrder::default();
         let mut ops = Vec::new();
         member(&engine, &mut order, vec![entry(&log, b"x", None)], &mut ops).unwrap();
-        ops.extend(finished(order));
         assert_eq!(
             puts(&ops)[0].0,
             "j/00000000000000000001",
@@ -429,7 +467,7 @@ fn an_entry_key_longer_than_the_layout_declared_fails_the_commit_and_applies_not
     let log: Arc<dyn LogLayout> = Arc::new(Overrun);
     let err = commit(
         &engine,
-        &no_checks(&engine),
+        no_checks(&engine),
         vec![entry(&log, b"x", None)],
         DurabilityMode::Eventual,
     )
@@ -462,7 +500,7 @@ fn a_commit_that_fails_validation_takes_no_position() {
 
     let lost = commit(
         &engine,
-        &stale,
+        stale,
         vec![entry(&log, b"lost", None)],
         DurabilityMode::Eventual,
     )
@@ -472,7 +510,7 @@ fn a_commit_that_fails_validation_takes_no_position() {
 
     let won = commit(
         &engine,
-        &no_checks(&engine),
+        no_checks(&engine),
         vec![entry(&log, b"won", None)],
         DurabilityMode::Eventual,
     )
@@ -494,7 +532,7 @@ fn a_group_that_fails_after_assignment_leaves_no_trace_and_the_next_group_reassi
     let log = Flat::named("j");
     let ok = commit(
         &engine,
-        &no_checks(&engine),
+        no_checks(&engine),
         vec![entry(&log, b"one", None)],
         DurabilityMode::Immediate,
     )
@@ -504,7 +542,7 @@ fn a_group_that_fails_after_assignment_leaves_no_trace_and_the_next_group_reassi
     fault::arm_sync_failure(dir.path());
     let failed = commit(
         &engine,
-        &no_checks(&engine),
+        no_checks(&engine),
         vec![entry(&log, b"lost-a", None), entry(&log, b"lost-b", None)],
         DurabilityMode::Immediate,
     );
@@ -516,7 +554,7 @@ fn a_group_that_fails_after_assignment_leaves_no_trace_and_the_next_group_reassi
 
     let next = commit(
         &engine,
-        &no_checks(&engine),
+        no_checks(&engine),
         vec![entry(&log, b"two", None)],
         DurabilityMode::Immediate,
     )
@@ -536,7 +574,7 @@ fn a_commit_of_appends_alone_publishes_its_writes_at_one_sequence() {
     let before = engine.snapshot_seq();
     let outcome = commit(
         &engine,
-        &no_checks(&engine),
+        no_checks(&engine),
         vec![entry(&log, b"a", Some(b"o")), entry(&log, b"b", None)],
         DurabilityMode::Eventual,
     )
@@ -554,7 +592,7 @@ fn a_commit_without_an_append_takes_no_head_read_and_no_extra_write() {
     point_ops.insert(key_of(b"k"), Some(b"v".to_vec()));
     let outcome = engine
         .commit_optimistic(
-            &no_checks(&engine),
+            no_checks(&engine),
             point_ops,
             Vec::new(),
             Vec::new(),
@@ -579,7 +617,7 @@ fn appends_beyond_the_value_limit_are_refused_before_the_pipeline() {
     let log = Flat::named("j");
     let err = commit(
         &engine,
-        &no_checks(&engine),
+        no_checks(&engine),
         vec![entry(&log, &[0u8; 9], None)],
         DurabilityMode::Eventual,
     )
@@ -603,7 +641,7 @@ fn a_layout_whose_keys_may_pass_the_key_limit_is_refused_before_the_pipeline() {
     let log = Flat::named("j");
     let err = commit(
         &engine,
-        &no_checks(&engine),
+        no_checks(&engine),
         vec![entry(&log, b"x", None)],
         DurabilityMode::Eventual,
     )

@@ -6,9 +6,8 @@
 //! of these assert that the fault actually fired, not merely that nothing
 //! blew up.
 //!
-//! Runtime: the default set finishes in a few seconds. The two
-//! tests are called out individually below; run them with
-//! `just test-fault-slow`.
+//! Runtime: the whole file finishes in a few seconds. Run it on its own
+//! with `just test-fault`.
 
 //! # Linux only
 //!
@@ -23,8 +22,14 @@
 
 mod common;
 
+#[path = "fault_smoke/cut_ack.rs"]
+mod cut_ack;
+#[path = "fault_smoke/cut_record.rs"]
+mod cut_record;
 #[path = "fault_smoke/open_variadic.rs"]
 mod open_variadic;
+#[path = "fault_smoke/rename_pairs.rs"]
+mod rename_pairs;
 
 use std::path::Path;
 use std::time::Duration;
@@ -331,7 +336,7 @@ fn immediate_durability_survives_a_power_cut() {
 
     let recovered = reopen(&db);
     let report = fault::assert_valid_prefix(&recovered, &out.history);
-    fault::assert_acked_survived(&report, &out.acked);
+    fault::assert_acked_survived(&report, &out.acked());
     assert_eq!(
         report.k,
         out.history.len(),
@@ -554,7 +559,7 @@ fn a_clean_shutdown_loses_nothing() {
         "clean shutdown must keep every write: {}",
         report.summary(),
     );
-    fault::assert_acked_survived(&report, &out.acked);
+    fault::assert_acked_survived(&report, &out.acked());
 }
 
 /// Proves the byte-level mutators do exactly what their names say, on
@@ -592,7 +597,9 @@ fn the_locators_find_the_wal_manifest_and_sstable() {
     {
         let d = Db::open(&db, Options::default().write_buffer_size(4 * 1024)).unwrap();
         for i in 0..2000u32 {
-            d.put(format!("k{i:06}").as_bytes(), &[b'v'; 64]).unwrap();
+            // A write a stall stops waits for it to clear: on a busy host
+            // the compaction worker falls behind two thousand small flushes.
+            regolith::through_stalls(|| d.put(format!("k{i:06}").as_bytes(), &[b'v'; 64])).unwrap();
         }
         d.close().unwrap();
     }
@@ -663,7 +670,7 @@ fn a_crash_inside_one_write_batch_applies_all_of_it_or_none() {
                     r.k,
                     boundaries,
                 );
-                fault::assert_acked_survived(&r, &out.acked);
+                fault::assert_acked_survived(&r, &out.acked());
             }
             fault::Recovery::RefusedToOpen(e) => {
                 assert_eq!(

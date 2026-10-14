@@ -23,6 +23,9 @@
 //!   number, not only at the end of the run.
 //! * Optionally, files created but never made durable by an `fsync` of
 //!   their parent directory ([`PowerLossOptions::drop_unsynced_creates`]).
+//! * Renames before the cut: the file keeps its bytes and what was synced
+//!   of them under its new name, which counts as created at the rename for
+//!   the option above.
 //!
 //! # What is NOT modelled, stated so nobody assumes otherwise
 //!
@@ -34,6 +37,9 @@
 //!   `write` call. A partial write is torn at [`PowerLossOptions::
 //!   sector_bytes`] granularity, not at arbitrary byte granularity.
 //! * Barriers and disk-cache behaviour of a specific device.
+//! * A rename after the cut point. The file under its new name is cut back
+//!   like any file first touched after the cut, and its old name is not
+//!   restored, for the same reason an unlink is not undone.
 
 use std::collections::HashMap;
 use std::fs::OpenOptions;
@@ -276,11 +282,18 @@ fn resolve_cut(journal: &Journal, cut: CutPoint) -> u64 {
 fn replay(journal: &Journal, cut_seq: u64) -> (HashMap<PathBuf, FileState>, usize) {
     let mut files: HashMap<PathBuf, FileState> = HashMap::new();
     let mut replayed = 0usize;
+    // The source of each thread's rename whose `RenameTo` record is still to
+    // come, and whether this run had opened it. The shim writes a rename's two
+    // records one after the other on the thread that renamed, but another
+    // thread's records can come between them (`A.from, B.from, A.to, B.to`),
+    // so a pair is matched by its thread id, never by what came last.
+    let mut renaming: HashMap<i64, (PathBuf, bool)> = HashMap::new();
 
     for r in journal.records.iter() {
         if r.path.as_os_str().is_empty() || !r.succeeded() {
             continue;
         }
+        let seen_before = files.contains_key(&r.path);
         if let Some(st) = files.get_mut(&r.path) {
             st.first_seq = st.first_seq.min(r.seq);
         } else {
@@ -359,7 +372,28 @@ fn replay(journal: &Journal, cut_seq: u64) -> (HashMap<PathBuf, FileState>, usiz
             OpKind::Unlink => {
                 files.remove(&r.path);
             }
-            OpKind::RenameFrom | OpKind::RenameTo => {}
+            OpKind::RenameFrom => {
+                renaming.insert(r.tid, (r.path.clone(), seen_before));
+            }
+            // A rename carries the file's bytes, and what was synced of
+            // them, to its new name, which names nothing else afterwards.
+            // Left unmodelled, the new name kept the empty state the loop
+            // gives a path it has not seen, and the reconstruction cut a
+            // file written to a staging name, synced and renamed, the way
+            // `atomic_write` makes every backup's metadata, down to nothing.
+            // A file this run never opened is left as the loop found it:
+            // the journal does not say how long it was.
+            OpKind::RenameTo => {
+                if let Some((from, true)) = renaming.remove(&r.tid)
+                    && let Some(mut moved) = files.remove(&from)
+                {
+                    // The new name appears now: only a sync of its
+                    // directory after this makes it durable.
+                    moved.created_at = Some(r.seq);
+                    moved.dir_synced_after_create = false;
+                    files.insert(r.path.clone(), moved);
+                }
+            }
         }
     }
     (files, replayed)

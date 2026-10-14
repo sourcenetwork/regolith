@@ -70,6 +70,8 @@ use super::internal_key::{
 use super::lookup_key::LookupKey;
 use super::manifest::Version;
 use super::memtable::MemTable;
+use super::merge_call::apply_merge;
+use super::prefix_call::PrefixProbe;
 use super::range_tombstone::{RangeTombstone, RangeTombstoneSet};
 use super::sstable::{LiveSst, SsTableBlockCursor, SsTableReader};
 use crate::DbSlice;
@@ -135,24 +137,26 @@ impl LevelIter {
         }
     }
 
-    /// Like [`seek`], but additionally consults the underlying
-    /// SSTable's prefix bloom filter (when present) and leaves the
-    /// level iterator empty if the file cannot contain any key with
-    /// the given prefix. Memtable levels always perform a normal seek.
-    fn seek_with_prefix_skip(&mut self, target: &[u8], prefix: &[u8]) -> io::Result<()> {
+    /// Like [`seek`], but additionally consults the prefix bloom filter
+    /// (when present) of each SSTable the seek would read, and leaves the
+    /// level iterator empty if no table of it can contain a key with the
+    /// prefix `probe` is for. A table ruled out this way is counted as a
+    /// useful bloom check. Memtable levels always perform a normal seek.
+    fn seek_with_prefix_skip(&mut self, target: &[u8], probe: &PrefixProbe) -> io::Result<()> {
         match self {
             Self::Memtable(it) => {
                 it.seek(target);
                 Ok(())
             }
             Self::SsTable(it) => {
-                if !it.reader.may_have_prefix(prefix, &it.cache)? {
+                if !it.reader.may_have_prefix(probe, &it.cache)? {
+                    it.cache.record_bloom_useful();
                     it.valid = false;
                     return Ok(());
                 }
                 it.seek(target)
             }
-            Self::LevelConcat(it) => it.seek(target),
+            Self::LevelConcat(it) => it.seek_with_prefix_skip(target, probe),
         }
     }
 
@@ -868,14 +872,44 @@ impl LevelConcatIter {
     }
 
     fn seek(&mut self, target: &[u8]) -> io::Result<()> {
-        if self.files.is_empty() {
-            self.current = None;
-            return Ok(());
-        }
         let uk = user_key_of(target);
         let idx = self
             .files
             .partition_point(|f| f.meta.largest_key.as_slice() < uk);
+        self.seek_from(idx, target)
+    }
+
+    /// [`seek`](Self::seek) for a prefix seek, whose `target` is the
+    /// smallest key of the prefix: a table whose prefix bloom rules the
+    /// prefix out is passed over unread, and counted as a useful bloom
+    /// check.
+    ///
+    /// The walk is bounded by the tables the prefix can be in. A level's
+    /// tables are in key order, so it ends at the first one that can hold
+    /// the prefix, and at the first one that starts past it, after which no
+    /// table holds it and the level is left empty.
+    fn seek_with_prefix_skip(&mut self, target: &[u8], probe: &PrefixProbe) -> io::Result<()> {
+        let prefix = user_key_of(target);
+        let mut idx = self
+            .files
+            .partition_point(|f| f.meta.largest_key.as_slice() < prefix);
+        while let Some(file) = self.files.get(idx) {
+            let smallest = file.meta.smallest_key.as_slice();
+            if smallest > prefix && !smallest.starts_with(prefix) {
+                idx = self.files.len();
+            } else if file.reader.may_have_prefix(probe, &self.cache)? {
+                break;
+            } else {
+                self.cache.record_bloom_useful();
+                idx += 1;
+            }
+        }
+        self.seek_from(idx, target)
+    }
+
+    /// Position at the first entry at or after `target` in the tables from
+    /// `idx` on.
+    fn seek_from(&mut self, idx: usize, target: &[u8]) -> io::Result<()> {
         if idx >= self.files.len() {
             self.current = None;
             return Ok(());
@@ -1032,9 +1066,9 @@ impl MergingIter {
         Ok(())
     }
 
-    fn seek_with_prefix_skip(&mut self, target: &[u8], prefix: &[u8]) -> io::Result<()> {
+    fn seek_with_prefix_skip(&mut self, target: &[u8], probe: &PrefixProbe) -> io::Result<()> {
         for lvl in &mut self.levels {
-            lvl.seek_with_prefix_skip(target, prefix)?;
+            lvl.seek_with_prefix_skip(target, probe)?;
         }
         self.pick_smallest();
         Ok(())
@@ -1184,8 +1218,8 @@ pub(crate) struct RegolithIterator {
     /// Prefix extractor captured at construction. Used by
     /// [`RegolithIterator::seek_prefix`] to derive the bloom probe for
     /// the caller's query prefix. If the extractor cannot produce a
-    /// prefix from the query itself, the iterator falls back to a
-    /// plain upper-bound scan without bloom skipping.
+    /// prefix from the query itself, the scan is a plain upper-bound
+    /// scan that rules no table out.
     prefix_extractor: Option<Arc<dyn PrefixExtractor>>,
     /// Optional merge operator. When `Some`, the iterator collapses
     /// merge chains encountered during materialization into a
@@ -1654,18 +1688,14 @@ impl RegolithIterator {
         // derive the same kind of bloom key from the query prefix that
         // was indexed for table keys. This lets a fixed-length
         // extractor skip whole files for longer prefixes that share
-        // the indexed stem.
-        let bloom_probe = self
-            .prefix_extractor
-            .as_ref()
-            .and_then(|ex| ex.extract_query(prefix).map(|p| p.to_vec()));
-
+        // the indexed stem. Each table is asked in the form its own
+        // prefix bloom was built in.
         let search_key = LookupKey::from_prefixed(prefix, u64::MAX);
-        let res = if let Some(probe) = bloom_probe.as_deref() {
-            self.inner
-                .seek_with_prefix_skip(search_key.internal(), probe)
-        } else {
-            self.inner.seek(search_key.internal())
+        let res = match self.prefix_extractor.as_deref() {
+            Some(extractor) => self
+                .inner
+                .seek_with_prefix_skip(search_key.internal(), &PrefixProbe::new(extractor, prefix)),
+            None => self.inner.seek(search_key.internal()),
         };
         if let Err(e) = res {
             self.error = Some(e);
@@ -2068,13 +2098,7 @@ impl RegolithIterator {
             .rev()
             .map(|v| v.as_slice())
             .collect();
-        match merge_op.full_merge(user_key, base.as_deref(), &operand_refs) {
-            Some(v) => Ok(Some(v)),
-            None => Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("merge operator {} failed", merge_op.name()),
-            )),
-        }
+        apply_merge(merge_op.as_ref(), user_key, base.as_deref(), &operand_refs).map(Some)
     }
 
     /// Walk the merging iterator **backward** until we find a user key
@@ -2151,16 +2175,13 @@ impl RegolithIterator {
             };
             let operand_refs: Vec<&[u8]> = operand_slice.iter().map(|e| e.2.as_slice()).collect();
             let base_bytes = base.as_ref().map(DbSlice::as_slice);
-            match merge_op.full_merge(&group, base_bytes, &operand_refs) {
-                Some(v) => {
+            match apply_merge(merge_op.as_ref(), &group, base_bytes, &operand_refs) {
+                Ok(v) => {
                     self.reverse_curr = Some((group, DbSlice::from_vec(v)));
                     return;
                 }
-                None => {
-                    self.error = Some(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!("merge operator {} failed", merge_op.name()),
-                    ));
+                Err(declined) => {
+                    self.error = Some(declined);
                     self.reverse_curr = None;
                     return;
                 }

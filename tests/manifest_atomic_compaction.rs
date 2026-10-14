@@ -7,10 +7,9 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
 use regolith::env::{
-    Capabilities, DirEntry, Env, FileLock, FileMeta, JoinHandle, MemEnv, ReadFile, WriteFile,
+    Capabilities, Env, FileLock, FileMeta, JoinHandle, MemEnv, ReadDir, ReadFile, WriteFile,
     WriteMode,
 };
 use regolith::{CompactionStyle, Db, DurabilityMode, Options, UniversalCompactionOptions};
@@ -28,6 +27,7 @@ struct CrashImage {
 
 fn collect_files(env: &MemEnv, dir: &Path, files: &mut Vec<(PathBuf, Vec<u8>)>) {
     for entry in env.read_dir(dir).unwrap() {
+        let entry = entry.unwrap();
         if entry.is_dir {
             collect_files(env, &entry.path, files);
         } else {
@@ -96,7 +96,7 @@ impl Env for CaptureEnv {
         self.inner.create_dir_all(path)
     }
 
-    fn read_dir(&self, path: &Path) -> io::Result<Vec<DirEntry>> {
+    fn read_dir(&self, path: &Path) -> io::Result<ReadDir<'_>> {
         self.inner.read_dir(path)
     }
 
@@ -104,6 +104,13 @@ impl Env for CaptureEnv {
         self.inner.open_read(path)
     }
 
+    fn open_log(
+        &self,
+        path: &Path,
+        mode: WriteMode,
+    ) -> io::Result<Box<dyn regolith::env::LogFile>> {
+        self.inner.open_log(path, mode)
+    }
     fn open_write(&self, path: &Path, mode: WriteMode) -> io::Result<Box<dyn WriteFile>> {
         let inner = self.inner.open_write(path, mode)?;
         if path.file_name().is_some_and(|name| name == "MANIFEST") {
@@ -164,10 +171,6 @@ impl Env for CaptureEnv {
     ) -> io::Result<Box<dyn JoinHandle>> {
         self.inner.spawn(name, body)
     }
-
-    fn sleep(&self, dur: Duration) {
-        self.inner.sleep(dur);
-    }
 }
 
 fn options(env: Arc<dyn Env>, style: CompactionStyle) -> Options {
@@ -194,7 +197,7 @@ fn capture_compaction(style: CompactionStyle, expected: &[(Vec<u8>, Vec<u8>)]) -
         let db = Db::open(DB_PATH, options(env.clone(), style)).unwrap();
         for entries in expected.chunks(KEYS_PER_FILE) {
             for (key, value) in entries {
-                db.put(key, value).unwrap();
+                regolith::through_stalls(|| db.put(key, value)).unwrap();
             }
             db.flush().unwrap();
         }
@@ -208,7 +211,7 @@ fn capture_compaction(style: CompactionStyle, expected: &[(Vec<u8>, Vec<u8>)]) -
 
     let db = Db::open(DB_PATH, options(env.clone(), style)).unwrap();
     env.armed.store(true, Ordering::SeqCst);
-    assert!(db.compact_range(None, None).is_err());
+    assert!(db.compact_range(None, None).wait().is_err());
     let image = env.captured.lock().unwrap().take().unwrap();
     assert!(!image.append.is_empty());
     assert_eq!(
@@ -310,7 +313,7 @@ fn check_recovery(
     );
 
     // Recovery must trim the incomplete batch before later metadata appends.
-    db.put(b"after-recovery", b"survives").unwrap();
+    regolith::through_stalls(|| db.put(b"after-recovery", b"survives")).unwrap();
     db.flush().unwrap();
     db.close().unwrap();
     drop(db);

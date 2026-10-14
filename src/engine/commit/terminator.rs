@@ -2,8 +2,8 @@
 //! merge under `IsolationLevel::DefraLevel`.
 //!
 //! Operands commute, so a newer operand never invalidates a blind merge, but
-//! a newer put, delete or covering range delete does. The walk runs under
-//! the pipeline mutex, so it stops at the key's first entry at or below the
+//! a newer put, delete or covering range delete does. The walk runs while
+//! a slot is decided, so it stops at the key's first entry at or below the
 //! transaction's snapshot: what it reads is bounded by the writes that landed
 //! since, not by the key's history, and it copies nothing.
 
@@ -203,7 +203,7 @@ mod tests {
                         continue;
                     }
                     Op::Compact => {
-                        db.compact_range(None, None).unwrap();
+                        db.compact_range(None, None).wait().unwrap();
                         continue;
                     }
                 }
