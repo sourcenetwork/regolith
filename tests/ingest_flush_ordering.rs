@@ -22,10 +22,10 @@ use std::thread::JoinHandle as StdJoinHandle;
 use std::time::{Duration, Instant};
 
 use regolith::env::{
-    Capabilities, DirEntry, Env, FileLock, FileMeta, JoinHandle, ReadFile, StdEnv, WriteFile,
+    Capabilities, Env, FileLock, FileMeta, JoinHandle, ReadDir, ReadFile, StdEnv, WriteFile,
     WriteMode,
 };
-use regolith::{Db, IngestOptions, Options, Priority, RateLimiter, SstFileWriter, WriteBatch};
+use regolith::{Db, IngestOptions, Options, SstFileWriter, WriteBatch};
 use tempfile::TempDir;
 
 /// How long a test lets the fixed engine prove the losing side of the
@@ -79,88 +79,31 @@ fn frozen_bytes(db: &Db) -> u64 {
     all - active
 }
 
+/// The bytes still frozen once the background has had time to write every
+/// frozen memtable out: a rotation seals on the commit path and the
+/// compaction worker flushes (E9). Waits with a deadline and a bounded
+/// backoff, so a fast machine returns at once and a loaded one still does.
+fn frozen_bytes_once_flushed(db: &Db) -> u64 {
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let mut pause = Duration::from_millis(1);
+    loop {
+        let frozen = frozen_bytes(db);
+        if frozen == 0 || Instant::now() >= deadline {
+            return frozen;
+        }
+        std::thread::sleep(pause);
+        pause = (pause * 2).min(Duration::from_millis(50));
+    }
+}
+
 /// Writes eight 1 KiB values under `prefix`. With a 4 KiB write buffer
 /// that fills the active memtable and rotates it at least once, whatever
 /// it already held.
 fn write_past_one_rotation(db: &Db, prefix: &str) -> regolith::Result<()> {
     for i in 0..8 {
-        db.put(format!("{prefix}{i}").as_bytes(), &[0u8; 1024])?;
+        regolith::through_stalls(|| db.put(format!("{prefix}{i}").as_bytes(), &[0u8; 1024]))?;
     }
     Ok(())
-}
-
-/// Pauses the first `Priority::Low` [`RateLimiter::request`] after
-/// [`arm`](Self::arm), until [`release`](Self::release) is called.
-/// The flush path is the only caller reachable in the test that arms it
-/// (compaction is the other): `Options::default()` sets
-/// `l0_compaction_trigger` to 4 and that test holds at most two L0
-/// files, so no compaction runs and none requests the limiter. So
-/// arming this before a `db.flush()` catches the flush after its table
-/// is written and before its manifest apply.
-struct PauseFirstLowRequest {
-    // (armed, paused, released)
-    state: Mutex<(bool, bool, bool)>,
-    cv: Condvar,
-}
-
-impl PauseFirstLowRequest {
-    fn new() -> Arc<Self> {
-        Arc::new(Self {
-            state: Mutex::new((false, false, false)),
-            cv: Condvar::new(),
-        })
-    }
-
-    fn arm(&self) {
-        self.state.lock().unwrap().0 = true;
-    }
-
-    /// Blocks until the armed request has paused. Panics with a plain
-    /// message if `deadline` passes first: an honest failure, never a
-    /// hang, if the engine never reaches the paused call.
-    fn wait_paused(&self, deadline: Duration) {
-        let state = self.state.lock().unwrap();
-        let (_state, result) = self
-            .cv
-            .wait_timeout_while(state, deadline, |s| !s.1)
-            .unwrap();
-        if result.timed_out() {
-            panic!("flush never reached its rate-limited write within {deadline:?}");
-        }
-    }
-
-    fn release(&self) {
-        self.state.lock().unwrap().2 = true;
-        self.cv.notify_all();
-    }
-}
-
-impl RateLimiter for PauseFirstLowRequest {
-    fn request(&self, _bytes: u64, pri: Priority) {
-        if pri == Priority::High {
-            return;
-        }
-        let mut state = self.state.lock().unwrap();
-        if !state.0 {
-            return;
-        }
-        state.0 = false;
-        state.1 = true;
-        self.cv.notify_all();
-        while !state.2 {
-            state = self.cv.wait(state).unwrap();
-        }
-    }
-
-    fn set_bytes_per_second(&self, _bytes_per_second: u64) {}
-
-    fn get_bytes_per_second(&self) -> u64 {
-        u64::MAX
-    }
-
-    fn get_total_bytes_through(&self, _pri: Priority) -> u64 {
-        0
-    }
 }
 
 /// Wraps [`StdEnv`] and counts the calls to `open_write` whose parent
@@ -218,6 +161,13 @@ impl NthSstOpen {
 }
 
 impl Env for NthSstOpen {
+    fn open_log(
+        &self,
+        path: &Path,
+        mode: WriteMode,
+    ) -> io::Result<Box<dyn regolith::env::LogFile>> {
+        self.inner.open_log(path, mode)
+    }
     fn open_write(&self, path: &Path, mode: WriteMode) -> io::Result<Box<dyn WriteFile>> {
         if path.parent() == Some(self.sst_dir.as_path()) {
             let n = self.count.fetch_add(1, Ordering::AcqRel) + 1;
@@ -238,7 +188,7 @@ impl Env for NthSstOpen {
     fn create_dir_all(&self, p: &Path) -> io::Result<()> {
         self.inner.create_dir_all(p)
     }
-    fn read_dir(&self, p: &Path) -> io::Result<Vec<DirEntry>> {
+    fn read_dir(&self, p: &Path) -> io::Result<ReadDir<'_>> {
         self.inner.read_dir(p)
     }
     fn open_read(&self, p: &Path) -> io::Result<Box<dyn ReadFile>> {
@@ -278,9 +228,6 @@ impl Env for NthSstOpen {
     ) -> io::Result<Box<dyn JoinHandle>> {
         self.inner.spawn(name, f)
     }
-    fn sleep(&self, d: Duration) {
-        self.inner.sleep(d)
-    }
 }
 
 /// Build a one-entry external SSTable ready for `ingest_external_files`.
@@ -299,28 +246,30 @@ fn build_ingest_file(dir: &Path, opts: &Options, key: &[u8], value: &[u8]) -> Pa
 fn an_ingest_waits_for_a_flush_of_a_memtable_sealed_before_it() {
     let dir = TempDir::new().unwrap();
     let staging = TempDir::new().unwrap();
-    let limiter = PauseFirstLowRequest::new();
-    let opts = Options::default().rate_limiter(Some(limiter.clone()));
+    // The flush's table is the first SST the database opens: it pauses
+    // there, sealed and not installed.
+    let env = NthSstOpen::new(dir.path(), 1, 0);
+    let opts = Options::default().env(env.clone());
     let db = Arc::new(Db::open(dir.path(), opts.clone()).unwrap());
 
-    db.put(b"k", b"old").unwrap();
-    limiter.arm();
+    regolith::through_stalls(|| db.put(b"k", b"old")).unwrap();
 
     let a = {
         let db = Arc::clone(&db);
         std::thread::spawn(move || db.flush())
     };
-    limiter.wait_paused(Duration::from_secs(60));
+    env.wait_paused(Duration::from_secs(60));
 
-    let ingest_path = build_ingest_file(staging.path(), &opts, b"k", b"new");
+    let ingest_path = build_ingest_file(staging.path(), &Options::default(), b"k", b"new");
     let b = {
         let db = Arc::clone(&db);
         std::thread::spawn(move || {
             db.ingest_external_files(&[ingest_path], IngestOptions::default())
+                .wait()
         })
     };
 
-    release_when_finished_or_after(&b, RELEASE_DEADLINE, || limiter.release());
+    release_when_finished_or_after(&b, RELEASE_DEADLINE, || env.release());
     a.join().unwrap().unwrap();
     b.join().unwrap().unwrap();
 
@@ -333,16 +282,14 @@ fn an_ingest_waits_for_a_flush_of_a_memtable_sealed_before_it() {
     let before = db.latest_sequence();
     drop(db);
 
-    let reopen_limiter = PauseFirstLowRequest::new();
-    let reopen_opts = opts.rate_limiter(Some(reopen_limiter));
-    let db = Db::open(dir.path(), reopen_opts).unwrap();
+    let db = Db::open(dir.path(), Options::default()).unwrap();
 
     // Before the fix, `last_seq` was lowered to the flush's sealed
     // sequence and the flushed WAL had already been removed, so the
     // reopened counter restarted below the ingested sequence.
     let mut batch = WriteBatch::new();
     batch.put(b"z", b"v");
-    let seq = db.write_sequenced(batch).unwrap();
+    let seq = regolith::through_stalls(|| db.write_sequenced(batch.clone())).unwrap();
     assert!(
         seq > before,
         "reopened sequence {seq} did not exceed {before}"
@@ -368,7 +315,7 @@ fn a_write_issued_during_an_ingest_lands_above_the_ingested_file() {
     let opts = Options::default().env(env.clone());
     let db = Arc::new(Db::open(dir.path(), opts.clone()).unwrap());
 
-    db.put(b"k", b"old").unwrap();
+    regolith::through_stalls(|| db.put(b"k", b"old")).unwrap();
 
     let ingest_path = build_ingest_file(staging.path(), &opts, b"k", b"new");
     let b = {
@@ -381,7 +328,7 @@ fn a_write_issued_during_an_ingest_lands_above_the_ingested_file() {
 
     let put = {
         let db = Arc::clone(&db);
-        std::thread::spawn(move || db.put(b"k", b"v2"))
+        std::thread::spawn(move || regolith::through_stalls(|| db.put(b"k", b"v2")))
     };
     let a = {
         let db = Arc::clone(&db);
@@ -389,7 +336,7 @@ fn a_write_issued_during_an_ingest_lands_above_the_ingested_file() {
     };
 
     env.release();
-    b.join().unwrap().unwrap();
+    b.join().unwrap().wait().unwrap();
     put.join().unwrap().unwrap();
     a.join().unwrap().unwrap();
 
@@ -409,7 +356,7 @@ fn a_write_issued_during_an_ingest_lands_above_the_ingested_file() {
     // higher one, so the reopened counter restarted below `before`.
     let mut batch = WriteBatch::new();
     batch.put(b"z", b"v");
-    let seq = db.write_sequenced(batch).unwrap();
+    let seq = regolith::through_stalls(|| db.write_sequenced(batch.clone())).unwrap();
     assert!(
         seq > before,
         "reopened sequence {seq} did not exceed {before}"
@@ -425,21 +372,26 @@ fn a_write_issued_during_an_ingest_lands_above_the_ingested_file() {
 /// own file, or the older value, still in the frozen list, answers the
 /// read.
 ///
-/// Deterministic: it runs on one thread. `Db::open` opens no SST, so
-/// the first SST open is M1's flush, which fails. The ingest copies its
-/// file (the second open), then retries that flush (the third) before it
-/// allocates: M1 lands at L0, the ingest overlaps it and lands above it,
-/// and the read returns "new". Without the flush the ingest lands at the
-/// deepest level while M1 stays frozen, and the read returns "old" from
-/// the frozen list.
+/// Deterministic: it runs on one thread, on a database with no worker.
+/// (With one, the worker's first round, the one that runs the disk check
+/// of the open, may reach the sealed memtable before this thread's flush
+/// does and take the injected failure in its place, and the flush here
+/// then goes through.) `Db::open` opens no SST, so the first SST open is
+/// M1's flush, which fails. The ingest copies its file (the second open),
+/// then retries that flush (the third) before it allocates: M1 lands at
+/// L0, the ingest overlaps it and lands above it, and the read returns
+/// "new". Without the flush the ingest lands at the deepest level while M1
+/// stays frozen, and the read returns "old" from the frozen list.
 #[test]
 fn an_ingest_drains_a_memtable_left_frozen_by_a_failed_flush() {
     let dir = TempDir::new().unwrap();
     let staging = TempDir::new().unwrap();
-    let opts = Options::default().env(NthSstOpen::new(dir.path(), 0, 1));
+    let opts = Options::default()
+        .max_background_compactions(0)
+        .env(NthSstOpen::new(dir.path(), 0, 1));
     let db = Db::open(dir.path(), opts.clone()).unwrap();
 
-    db.put(b"k", b"old").unwrap();
+    regolith::through_stalls(|| db.put(b"k", b"old")).unwrap();
     assert!(
         db.flush().is_err(),
         "the injected table open failure must fail the flush"
@@ -447,6 +399,7 @@ fn an_ingest_drains_a_memtable_left_frozen_by_a_failed_flush() {
 
     let ingest_path = build_ingest_file(staging.path(), &opts, b"k", b"new");
     db.ingest_external_files(&[ingest_path], IngestOptions::default())
+        .wait()
         .unwrap();
 
     // Without the drain, the ingest lands at the deepest level (the
@@ -464,7 +417,7 @@ fn an_ingest_drains_a_memtable_left_frozen_by_a_failed_flush() {
     // restart below `before`.
     let mut batch = WriteBatch::new();
     batch.put(b"z", b"v");
-    let seq = db.write_sequenced(batch).unwrap();
+    let seq = regolith::through_stalls(|| db.write_sequenced(batch.clone())).unwrap();
     assert!(
         seq > before,
         "reopened sequence {seq} did not exceed {before}"
@@ -473,10 +426,11 @@ fn an_ingest_drains_a_memtable_left_frozen_by_a_failed_flush() {
 }
 
 /// A write that fills the memtable while an ingest copies its file is not
-/// held back by the copy: it commits, rotates and flushes while the copy is
-/// paused. The ingest draws its sequence afterwards, so its version of the
-/// key is the newer one, and the memtable holding the write is flushed
-/// before the ingested file installs, so nothing is left frozen.
+/// held back by the copy: it commits and rotates while the copy is paused.
+/// The ingest draws its sequence afterwards, so its version of the key is
+/// the newer one, and the memtable holding the write, sealed by the
+/// rotation and written out off the commit path, is flushed before the
+/// ingested file installs, so nothing is left frozen.
 #[test]
 fn a_write_that_fills_the_memtable_during_an_ingest_copy_commits_below_it() {
     let dir = TempDir::new().unwrap();
@@ -489,7 +443,7 @@ fn a_write_that_fills_the_memtable_during_an_ingest_copy_commits_below_it() {
         .write_buffer_size(4 * 1024);
     let db = Arc::new(Db::open(dir.path(), opts.clone()).unwrap());
 
-    db.put(b"k", b"old").unwrap();
+    regolith::through_stalls(|| db.put(b"k", b"old")).unwrap();
     db.flush().unwrap();
 
     let ingest_path = build_ingest_file(staging.path(), &opts, b"k", b"new");
@@ -506,13 +460,13 @@ fn a_write_that_fills_the_memtable_during_an_ingest_copy_commits_below_it() {
     let writer = {
         let db = Arc::clone(&db);
         std::thread::spawn(move || {
-            db.put(b"k", b"v2")?;
+            regolith::through_stalls(|| db.put(b"k", b"v2"))?;
             write_past_one_rotation(&db, "f")
         })
     };
     let committed_during_copy = wait_finished(&writer, Duration::from_secs(60));
     env.release();
-    ingest.join().unwrap().unwrap();
+    ingest.join().unwrap().wait().unwrap();
     writer.join().unwrap().unwrap();
     assert!(
         committed_during_copy,
@@ -520,7 +474,7 @@ fn a_write_that_fills_the_memtable_during_an_ingest_copy_commits_below_it() {
     );
 
     assert_eq!(
-        frozen_bytes(&db),
+        frozen_bytes_once_flushed(&db),
         0,
         "a rotation during an ingest left its memtable unflushed"
     );
@@ -532,7 +486,7 @@ fn a_write_that_fills_the_memtable_during_an_ingest_copy_commits_below_it() {
     let db = Db::open(dir.path(), opts.env(NthSstOpen::new(dir.path(), 0, 0))).unwrap();
     let mut batch = WriteBatch::new();
     batch.put(b"z", b"v");
-    let seq = db.write_sequenced(batch).unwrap();
+    let seq = regolith::through_stalls(|| db.write_sequenced(batch.clone())).unwrap();
     assert!(
         seq > before,
         "reopened sequence {seq} did not exceed {before}"
@@ -542,8 +496,8 @@ fn a_write_that_fills_the_memtable_during_an_ingest_copy_commits_below_it() {
 }
 
 /// An ingest that fails copying its file holds nothing the writes
-/// issued while it ran wait for: they land, a rotation among them flushes
-/// its memtable as usual, and nothing is stranded in memory.
+/// issued while it ran wait for: they land, the memtable a rotation among
+/// them seals is flushed as usual, and nothing is stranded in memory.
 #[test]
 fn writes_issued_during_an_ingest_that_fails_commit_once_it_gives_up() {
     let dir = TempDir::new().unwrap();
@@ -567,7 +521,7 @@ fn writes_issued_during_an_ingest_that_fails_commit_once_it_gives_up() {
     let writer = {
         let db = Arc::clone(&db);
         std::thread::spawn(move || {
-            db.put(b"k", b"v2")?;
+            regolith::through_stalls(|| db.put(b"k", b"v2"))?;
             write_past_one_rotation(&db, "f")
         })
     };
@@ -575,13 +529,13 @@ fn writes_issued_during_an_ingest_that_fails_commit_once_it_gives_up() {
     let ingested = ingest.join().unwrap();
     writer.join().unwrap().unwrap();
 
-    let err = ingested.unwrap_err();
+    let err = ingested.wait().unwrap_err();
     assert!(
         err.to_string().contains("injected table open failure"),
         "unexpected ingest error: {err}"
     );
     assert_eq!(
-        frozen_bytes(&db),
+        frozen_bytes_once_flushed(&db),
         0,
         "a rotation during a failed ingest left its memtable unflushed"
     );

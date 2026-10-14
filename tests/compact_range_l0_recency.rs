@@ -30,7 +30,7 @@ fn a_bounded_compact_range_does_not_put_an_old_version_above_a_new_one() {
 
     // Only the newer table, k16..k72, intersects the range. The older one
     // holds k16 alone, outside it.
-    db.compact_range(Some(b"k18"), Some(b"k35")).unwrap();
+    db.compact_range(Some(b"k18"), Some(b"k35")).wait().unwrap();
 
     assert_eq!(db.get(b"k16").unwrap().as_deref(), Some(&b"new"[..]));
     assert_eq!(db.get(b"k72").unwrap().as_deref(), Some(&b"x"[..]));
@@ -54,7 +54,7 @@ fn an_older_table_that_overlaps_only_through_another_older_one_moves_too() {
     db.put(b"k60", b"p").unwrap();
     db.flush().unwrap();
 
-    db.compact_range(Some(b"k58"), Some(b"k70")).unwrap();
+    db.compact_range(Some(b"k58"), Some(b"k70")).wait().unwrap();
 
     assert_eq!(db.get(b"k55").unwrap().as_deref(), Some(&b"new"[..]));
     assert_eq!(db.get(b"k40").unwrap().as_deref(), Some(&b"middle"[..]));
@@ -74,7 +74,7 @@ fn a_table_that_starts_where_the_picked_range_ends_moves_too() {
     db.put(b"k30", b"new").unwrap();
     db.flush().unwrap();
 
-    db.compact_range(Some(b"k10"), Some(b"k20")).unwrap();
+    db.compact_range(Some(b"k10"), Some(b"k20")).wait().unwrap();
 
     assert_eq!(db.get(b"k30").unwrap().as_deref(), Some(&b"new"[..]));
 }
@@ -93,7 +93,10 @@ fn a_transaction_that_read_a_key_still_conflicts_after_a_bounded_compact_range()
     db.db().put(b"k72", b"x").unwrap();
     db.db().put(b"k16", b"new").unwrap();
     db.db().flush().unwrap();
-    db.db().compact_range(Some(b"k18"), Some(b"k35")).unwrap();
+    db.db()
+        .compact_range(Some(b"k18"), Some(b"k35"))
+        .wait()
+        .unwrap();
 
     tx.put(b"k16", b"mine").unwrap();
     assert!(

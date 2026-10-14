@@ -5,6 +5,7 @@
 //! hold the metadata, so every lookup has to re-read and re-decode it,
 //! and check that reads still return the same answers as the pinned
 //! configuration - including range scans, iterators and misses.
+#![cfg(not(target_arch = "wasm32"))]
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -40,9 +41,9 @@ fn seeded(partitioned: bool) -> TempDir {
     let dir = TempDir::new().unwrap();
     let db = Db::open(dir.path(), base(partitioned)).unwrap();
     for i in 0..KEYS {
-        db.put(&key_for(i), &value_for(i)).unwrap();
+        regolith::through_stalls(|| db.put(&key_for(i), &value_for(i))).unwrap();
     }
-    db.compact_range(None, None).unwrap();
+    db.compact_range(None, None).wait().unwrap();
     db.close().unwrap();
     dir
 }

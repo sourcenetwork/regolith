@@ -10,11 +10,13 @@
 //!
 //! # Why interposition works here
 //!
-//! regolith performs every data read and write through `std::fs`, which on
+//! regolith performs every write through `std::fs`, which on
 //! `*-linux-gnu` calls the glibc `write`/`pwrite64`/`writev`/`fsync`/
-//! `fdatasync`/`open64`/`openat` symbols through the PLT. It uses `rustix`
-//! (raw syscalls, NOT interposable) only for `flock` and `fadvise`, which
-//! move no file data. There is no `mmap` write path.
+//! `fdatasync`/`open64`/`openat` symbols through the PLT, and through the
+//! glibc `pwritev` for a run of log records. It uses `rustix`
+//! (raw syscalls, NOT interposable) only for `flock`, `fadvise` and the
+//! positional reads of its tables (`pread`), none of which writes file data.
+//! There is no `mmap` write path.
 //!
 //! # Journal format
 //!
@@ -38,6 +40,17 @@
 //! even though threads append concurrently. `tid` is the kernel thread id,
 //! which is what lets a reconstruction tell a foreground write from a
 //! background flush or compaction write.
+//!
+//! Every record is [`RECORD`] bytes: the path is followed by NUL, which no
+//! path holds, up to the line end. The length divides a page, so in a file
+//! that holds nothing but whole records no record lies across two pages.
+//! That is what keeps a record whole when the process is killed. The kernel
+//! copies a write a page at a time and gives up between two pages once the
+//! kill is pending, so a record across a page boundary could be left cut at
+//! the boundary by a thread that was inside its write when another thread
+//! killed the process; and since the kill reaches the threads one after the
+//! other, a thread it had not reached yet could still append a whole record
+//! behind the cut one.
 //!
 //! # Environment
 //!
@@ -82,6 +95,9 @@ const SEEK_END: c_int = 2;
 const SIGKILL: c_int = 9;
 
 const MAX_FD: usize = 4096;
+/// The length of every journal record, line end included. It divides a
+/// page; see the journal format above.
+const RECORD: usize = 512;
 const TAG_UNTRACKED: u8 = 0;
 const TAG_TRACKED: u8 = 1;
 const TAG_DIE_MATCH: u8 = 2;
@@ -102,6 +118,7 @@ extern "C" {
 type WriteFn = unsafe extern "C" fn(c_int, *const c_void, usize) -> isize;
 type PwriteFn = unsafe extern "C" fn(c_int, *const c_void, usize, i64) -> isize;
 type WritevFn = unsafe extern "C" fn(c_int, *const c_void, c_int) -> isize;
+type PwritevFn = unsafe extern "C" fn(c_int, *const c_void, c_int, i64) -> isize;
 type SyncFn = unsafe extern "C" fn(c_int) -> c_int;
 type OpenFn = unsafe extern "C" fn(*const c_char, c_int, ...) -> c_int;
 type OpenatFn = unsafe extern "C" fn(c_int, *const c_char, c_int, ...) -> c_int;
@@ -242,14 +259,14 @@ unsafe fn journal_fd() -> c_int {
 }
 
 struct Rec {
-    buf: [u8; 512],
+    buf: [u8; RECORD],
     len: usize,
 }
 
 impl Rec {
     fn new() -> Rec {
         Rec {
-            buf: [0u8; 512],
+            buf: [0u8; RECORD],
             len: 0,
         }
     }
@@ -290,7 +307,8 @@ impl Rec {
 }
 
 /// Emit one journal record. Records are `O_APPEND` single-write appends so
-/// a concurrent thread cannot interleave a partial line.
+/// a concurrent thread cannot interleave a partial line, and each is
+/// [`RECORD`] bytes so a kill cannot cut one.
 unsafe fn emit(kind: u8, fd: c_int, a: i64, b: i64, ret: i64, path: &[u8]) {
     let jfd = journal_fd();
     if jfd < 0 {
@@ -318,7 +336,9 @@ unsafe fn emit(kind: u8, fd: c_int, a: i64, b: i64, ret: i64, path: &[u8]) {
         path
     };
     r.raw(p);
-    r.raw(b"\n");
+    // The buffer is NUL from here to its last byte, the line end.
+    r.buf[RECORD - 1] = b'\n';
+    r.len = RECORD;
     let w = real!(w, WriteFn, "write");
     let mut off = 0usize;
     while off < r.len {
@@ -347,6 +367,18 @@ fn contains(hay: &[u8], needle: &str) -> bool {
         return true;
     }
     hay.windows(n.len()).any(|w| w == n)
+}
+
+/// Whether `path` is tracked: under the database directory, or that
+/// directory itself. The root carries a trailing separator to keep the
+/// harness's own files beside the directory out; the directory is matched
+/// whole so that its own sync, which makes the names of the files directly
+/// in it durable, is recorded too.
+fn tracked(path: &[u8], root: &str) -> bool {
+    contains(path, root) || {
+        let dir = root.trim_end_matches('/');
+        !dir.is_empty() && (path == dir.as_bytes() || path.strip_suffix(b"/") == Some(dir.as_bytes()))
+    }
 }
 
 fn tag_of(fd: c_int) -> u8 {
@@ -378,7 +410,7 @@ unsafe fn maybe_die(kind: u8, tag: u8) {
 }
 
 unsafe fn after_open(fd: c_int, path: &[u8], flags: c_int) {
-    if fd < 0 || !contains(path, &config().root) {
+    if fd < 0 || !tracked(path, &config().root) {
         if fd >= 0 {
             set_tag(fd, TAG_UNTRACKED);
         }
@@ -450,6 +482,48 @@ pub unsafe extern "C" fn pwrite64(fd: c_int, buf: *const c_void, count: usize, o
 #[no_mangle]
 pub unsafe extern "C" fn pwrite(fd: c_int, buf: *const c_void, count: usize, off: i64) -> isize {
     pwrite64(fd, buf, count, off)
+}
+
+/// One `struct iovec`: what `pwritev` and `writev` take a list of.
+#[repr(C)]
+struct IoVec {
+    base: *const c_void,
+    len: usize,
+}
+
+/// The bytes the `count` buffers at `iov` hold together: what one vectored
+/// write asks to write.
+unsafe fn iov_len(iov: *const c_void, count: c_int) -> usize {
+    let iov = iov.cast::<IoVec>();
+    (0..count.max(0) as usize).map(|i| (*iov.add(i)).len).sum()
+}
+
+/// A positional vectored write: the log's write unit puts a run of records
+/// at one offset with one of these (`commit::write_unit`), journaled as one
+/// write of the bytes its buffers hold together.
+#[no_mangle]
+pub unsafe extern "C" fn pwritev64(fd: c_int, iov: *const c_void, iovcnt: c_int, off: i64) -> isize {
+    let real = real!(pv, PwritevFn, "pwritev64");
+    let g = Guard::enter();
+    let tag = tag_of(fd);
+    if !g.active() || tag == TAG_UNTRACKED {
+        return real(fd, iov, iovcnt, off);
+    }
+    if config().die_before {
+        maybe_die(DIE_WRITE, tag);
+    }
+    let count = iov_len(iov, iovcnt);
+    let ret = real(fd, iov, iovcnt, off);
+    emit(b'W', fd, off, count as i64, ret as i64, b"");
+    if !config().die_before {
+        maybe_die(DIE_WRITE, tag);
+    }
+    ret
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn pwritev(fd: c_int, iov: *const c_void, iovcnt: c_int, off: i64) -> isize {
+    pwritev64(fd, iov, iovcnt, off)
 }
 
 #[no_mangle]

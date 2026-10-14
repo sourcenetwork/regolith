@@ -1,22 +1,27 @@
 //! Numbering a commit's appends in the ordered step.
 //!
 //! A transaction's `append` calls queue as [`PendingAppend`]s and are not
-//! read or validated for. The ordered step, which holds the pipeline mutex
-//! and has already validated the commit's reads, gives each one the log's
-//! next position and turns it into plain puts of the same atomic commit, so
-//! the WAL carries final bytes. These rules follow `CommitOrderedAppend.tla`
+//! read or validated for. Deciding the commit's slot, in ring order and once
+//! the commit's reads are validated, gives each one the log's next position
+//! and turns it into plain puts of the same atomic commit, so the WAL
+//! carries final bytes. These rules follow `CommitOrderedAppend.tla`
 //! and `Append.lean`:
 //!
 //! - Positions are assigned after validation, never before: a commit that
 //!   fails validation reaches [`AppendOrder::number`] with nothing, so it
 //!   takes no position.
 //! - The head and the once keys come from the view plus the appends already
-//!   numbered by this [`AppendOrder`], never from the view alone. One
-//!   [`AppendOrder`] spans a commit group, so a later member counts from the
-//!   head an earlier member left and sees the once keys it set.
-//! - Nothing outlives the group: no cached head, no remembered once key. A
-//!   group that fails drops its [`AppendOrder`] and the next group reads the
-//!   view again, so a failure leaves no hole.
+//!   numbered by this [`AppendOrder`], never from the view alone. The view
+//!   holds every commit decided before this one: a slot is applied to the
+//!   memtable before the next is decided (`pipeline.rs`, P2), so a later
+//!   commit counts from the head an earlier one left and sees the once keys
+//!   it set. One [`AppendOrder`] spans one commit's own appends.
+//! - Nothing outlives the commit: no cached head, no remembered once key. A
+//!   commit a failure discards is taken out of the memtable with what it
+//!   numbered, and the next reads the view again, so a failure leaves no
+//!   hole. A commit that fails while it is numbered gives back what it
+//!   took, so the commits after it leave no hole either.
+//! - Each commit writes the head of every log it moved in its own record.
 //!
 //! A commit that carries no append never reaches this module.
 
@@ -25,6 +30,7 @@ use std::io;
 use std::sync::Arc;
 
 use super::super::callback;
+use super::super::memtable::MemTable;
 use super::super::wal::{RecordLen, check_write_len};
 use super::super::{ReadView, RegolithEngine};
 use crate::column_family::{DEFAULT_CF_ID, prefix_key};
@@ -54,38 +60,77 @@ fn layout<T>(f: impl FnOnce() -> T) -> io::Result<T> {
 struct LogHead {
     /// The log's head key, column-family prefixed.
     key: Vec<u8>,
-    /// The newest position the view or an earlier member left.
+    /// The newest position the view or an earlier member left: where the
+    /// member being numbered starts.
+    settled: u64,
+    /// The newest position the member being numbered took; `settled` until it
+    /// takes one.
     position: u64,
-    /// A member of this group assigned a position, so the head key is
-    /// written. A log nobody appended to is left alone.
-    moved: bool,
 }
 
-/// The running state of the ordered step across one commit group's appends.
+/// The running state of numbering one commit's appends.
 ///
-/// Create one per group, number every member against it in group order, and
-/// drop it with the group.
+/// Create one per commit, number the commit against it when its slot is
+/// decided, and drop it with the decision.
 #[derive(Default)]
 pub(crate) struct AppendOrder {
     logs: Vec<LogHead>,
     /// Once keys, prefixed, that hold a position: set by an earlier append
     /// of this group, or found holding one in the view.
     taken: HashSet<Vec<u8>>,
+    /// The once keys the member being numbered set, given back if it fails.
+    member_taken: Vec<Vec<u8>>,
     /// Scratch for the caller's `entry_key`.
     key: Vec<u8>,
 }
 
 impl AppendOrder {
-    /// Numbers `appends`, in order, against `view` and the appends this
-    /// order already numbered, and pushes the puts that write them onto
-    /// `ops`: for each numbered append its entry and its once key, then, for
-    /// each log that moved, its head key once.
+    /// Numbers one member's `appends`, in order, against `view` and the
+    /// appends this order already numbered, and pushes the puts that write
+    /// them onto `ops`: for each numbered append its entry and its once key,
+    /// then, for each log the member moved, its head key once, holding the
+    /// last position the member took. Each member writes the heads it moved
+    /// in its own record, so a crash that keeps an earlier member of the
+    /// group and loses a later one leaves the head where the kept member set
+    /// it (`CommitOrderedAppend.tla`: each assignment writes `head_key = p`
+    /// in the member's own atomic commit).
     ///
     /// An append whose once key already holds a position, in the view or
-    /// through an earlier append, writes nothing. On error `ops` may hold
-    /// puts of appends numbered before it, and the caller drops the whole
-    /// commit.
+    /// through an earlier append, writes nothing. On error the member takes
+    /// nothing: every position and once key it took is given back, so a later
+    /// member numbers as if it had never been there. `ops` may then hold puts
+    /// of appends numbered before the error, and the caller drops the member.
     pub(crate) fn number(
+        &mut self,
+        engine: &RegolithEngine,
+        view: &ReadView,
+        appends: Vec<PendingAppend>,
+        ops: &mut Vec<WriteBatchOp>,
+    ) -> io::Result<()> {
+        let numbered = self.number_appends(engine, view, appends, ops);
+        if numbered.is_ok() {
+            for head in &mut self.logs {
+                if head.position != head.settled {
+                    ops.push(WriteBatchOp::Put {
+                        key: head.key.clone(),
+                        value: head.position.to_be_bytes().to_vec(),
+                    });
+                    head.settled = head.position;
+                }
+            }
+            self.member_taken.clear();
+        } else {
+            for head in &mut self.logs {
+                head.position = head.settled;
+            }
+            for once in self.member_taken.drain(..) {
+                self.taken.remove(&once);
+            }
+        }
+        numbered
+    }
+
+    fn number_appends(
         &mut self,
         engine: &RegolithEngine,
         view: &ReadView,
@@ -131,32 +176,15 @@ impl AppendOrder {
             });
             if let Some(once) = once_key {
                 self.taken.insert(once.clone());
+                self.member_taken.push(once.clone());
                 ops.push(WriteBatchOp::Put {
                     key: once,
                     value: position.to_be_bytes().to_vec(),
                 });
             }
-            let head = &mut self.logs[at];
-            head.position = position;
-            head.moved = true;
+            self.logs[at].position = position;
         }
         Ok(())
-    }
-
-    /// Pushes the put of each moved log's head key onto `ops`, once per log,
-    /// holding the last position this order assigned in it. Call it after the
-    /// group's last [`AppendOrder::number`]; a group that assigned nothing
-    /// pushes nothing.
-    pub(crate) fn finish(self, ops: &mut Vec<WriteBatchOp>) {
-        ops.extend(
-            self.logs
-                .into_iter()
-                .filter(|head| head.moved)
-                .map(|head| WriteBatchOp::Put {
-                    key: head.key,
-                    value: head.position.to_be_bytes().to_vec(),
-                }),
-        );
     }
 
     /// Whether `once` (prefixed) already holds a position: through an earlier
@@ -195,8 +223,8 @@ impl AppendOrder {
         let position = engine.read_u64_in_view(&key, view)?.unwrap_or(0);
         self.logs.push(LogHead {
             key,
+            settled: position,
             position,
-            moved: false,
         });
         Ok(self.logs.len() - 1)
     }
@@ -211,13 +239,22 @@ impl RegolithEngine {
     /// declared maximum and each log counts its head put once. The ordered
     /// step re-checks the keys it builds; the bound only makes this answer
     /// early.
+    ///
+    /// Returns the bounds the commit pipeline admits the commit by: the
+    /// framed bytes of its record with the appends numbered, and the memtable
+    /// bytes the appends' puts can add.
     pub(super) fn validate_append_sizes(
         &self,
         ops: &[WriteBatchOp],
         appends: &[PendingAppend],
-    ) -> io::Result<()> {
+    ) -> io::Result<(usize, usize)> {
         let mut record = RecordLen::default();
         ops.iter().for_each(|op| record.op(op));
+        let mut cost = 0usize;
+        let mut put = |record: &mut RecordLen, key_len: usize, value_len: usize| {
+            record.put_sized(key_len, value_len);
+            cost = cost.saturating_add(MemTable::max_entry_size(key_len, value_len));
+        };
         let mut heads: Vec<&[u8]> = Vec::new();
         for append in appends {
             let log = &*append.log;
@@ -225,18 +262,23 @@ impl RegolithEngine {
             self.validate_user_key_len(head.len())?;
             self.validate_user_key_len(max_entry_key)?;
             self.validate_value_size(&append.entry)?;
-            record.put_sized(CF_PREFIX_LEN + max_entry_key, append.entry.len());
+            put(
+                &mut record,
+                CF_PREFIX_LEN + max_entry_key,
+                append.entry.len(),
+            );
             if let Some(once) = &append.once_key {
                 self.validate_user_key_len(once.len())?;
-                record.put_sized(CF_PREFIX_LEN + once.len(), size_of::<u64>());
+                put(&mut record, CF_PREFIX_LEN + once.len(), size_of::<u64>());
             }
             // vertexia: linear scan over the distinct logs of one commit;
             // a set if a commit ever spans thousands of logs.
             if !heads.contains(&head) {
                 heads.push(head);
-                record.put_sized(CF_PREFIX_LEN + head.len(), size_of::<u64>());
+                put(&mut record, CF_PREFIX_LEN + head.len(), size_of::<u64>());
             }
         }
-        check_write_len(record.framed())
+        check_write_len(record.framed())?;
+        Ok((record.framed(), cost))
     }
 }

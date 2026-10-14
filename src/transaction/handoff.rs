@@ -16,7 +16,10 @@
 
 use std::mem;
 use std::ptr;
-use std::sync::atomic::{AtomicPtr, Ordering};
+
+// Loom's under `--cfg loom`, so the models of `super::first_four` see the
+// overflow's head too.
+use crate::sync::internal::{AtomicPtr, Ordering};
 
 struct Node<T> {
     value: T,
@@ -113,7 +116,7 @@ impl<T> Drop for Taken<T> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(loom)))]
 mod tests {
     use super::*;
     use proptest::prelude::*;

@@ -114,7 +114,7 @@ async fn the_full_lifecycle_survives_a_remount() {
         drop(cursor);
 
         db.flush().expect("flush");
-        db.compact_range(None, None).expect("compact");
+        db.compact_range(None, None).wait().expect("compact");
         while db.compact_step().expect("compact step") == CompactionOutcome::DidWork {}
         db.close().expect("close");
     }
@@ -283,8 +283,7 @@ async fn directories_list_their_entries_after_a_remount() {
     let mut names: Vec<String> = env
         .read_dir(Path::new(&dir))
         .expect("read_dir")
-        .iter()
-        .map(|entry| entry.file_name())
+        .map(|entry| entry.expect("walk").file_name())
         .collect();
     names.sort();
     assert_eq!(names, vec!["000000.sst", "000001.sst", "000002.sst"]);
@@ -508,7 +507,7 @@ async fn the_wasm_profile_survives_a_full_lifecycle_in_a_browser() {
                 .expect("put");
         }
         db.flush().expect("flush");
-        db.compact_range(None, None).expect("compact");
+        db.compact_range(None, None).wait().expect("compact");
         while db.compact_step().expect("compact step") == CompactionOutcome::DidWork {}
 
         for i in (0..2000u32).step_by(97) {

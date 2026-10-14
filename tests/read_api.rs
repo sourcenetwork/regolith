@@ -1,5 +1,6 @@
 //! Public-API coverage for the reads that answer without handing back
 //! a copy: `has`, `get_size`, and the iterator's `value_slice`.
+#![cfg(not(target_arch = "wasm32"))]
 
 use proptest::prelude::*;
 use regolith::{Db, MergeOperator, Options, WriteBatch};
@@ -38,9 +39,9 @@ fn has_and_get_size_agree_with_get_across_every_source() {
     // Enough keys to spill past the 4 KiB write buffer, so the reads
     // below hit the memtable, frozen memtables and SSTables alike.
     fill_sequential(&db, 500);
-    db.put(b"in_memtable", b"fresh").unwrap();
-    db.put(b"empty_value", b"").unwrap();
-    db.delete(b"key_000010").unwrap();
+    regolith::through_stalls(|| db.put(b"in_memtable", b"fresh")).unwrap();
+    regolith::through_stalls(|| db.put(b"empty_value", b"")).unwrap();
+    regolith::through_stalls(|| db.delete(b"key_000010")).unwrap();
 
     for i in 0..500 {
         let key = format!("key_{i:06}");
@@ -65,7 +66,7 @@ fn has_and_get_size_agree_with_get_across_every_source() {
 fn an_empty_value_is_present_with_length_zero() {
     let dir = TempDir::new().unwrap();
     let db = open(&dir);
-    db.put(b"empty", b"").unwrap();
+    regolith::through_stalls(|| db.put(b"empty", b"")).unwrap();
 
     assert!(db.has(b"empty").unwrap(), "an empty value still exists");
     assert_eq!(db.get_size(b"empty").unwrap(), Some(0));
@@ -81,10 +82,10 @@ fn an_empty_value_is_present_with_length_zero() {
 fn has_respects_range_tombstones() {
     let dir = TempDir::new().unwrap();
     let db = open(&dir);
-    db.put(b"aa", b"1").unwrap();
-    db.put(b"ab", b"2").unwrap();
-    db.put(b"zz", b"3").unwrap();
-    db.delete_range(b"aa", b"b").unwrap();
+    regolith::through_stalls(|| db.put(b"aa", b"1")).unwrap();
+    regolith::through_stalls(|| db.put(b"ab", b"2")).unwrap();
+    regolith::through_stalls(|| db.put(b"zz", b"3")).unwrap();
+    regolith::through_stalls(|| db.delete_range(b"aa", b"b")).unwrap();
 
     assert!(!db.has(b"aa").unwrap());
     assert!(!db.has(b"ab").unwrap());
@@ -100,10 +101,10 @@ fn has_respects_range_tombstones() {
 fn has_respects_snapshot_visibility() {
     let dir = TempDir::new().unwrap();
     let db = open(&dir);
-    db.put(b"before", b"v").unwrap();
+    regolith::through_stalls(|| db.put(b"before", b"v")).unwrap();
     let snap = db.snapshot();
-    db.put(b"after", b"v").unwrap();
-    db.delete(b"before").unwrap();
+    regolith::through_stalls(|| db.put(b"after", b"v")).unwrap();
+    regolith::through_stalls(|| db.delete(b"before")).unwrap();
 
     assert!(snap.has(b"before").unwrap(), "still live at the snapshot");
     assert_eq!(snap.get_size(b"before").unwrap(), Some(1));
@@ -120,8 +121,8 @@ fn has_and_get_size_are_scoped_to_a_column_family() {
     let db = Db::open(dir.path(), Options::default()).unwrap();
     let cf = db.create_column_family("other").unwrap();
 
-    db.put(b"shared", b"default").unwrap();
-    db.put_cf(&cf, b"cf_only", b"cf-value").unwrap();
+    regolith::through_stalls(|| db.put(b"shared", b"default")).unwrap();
+    regolith::through_stalls(|| db.put_cf(&cf, b"cf_only", b"cf-value")).unwrap();
 
     assert!(db.has(b"shared").unwrap());
     assert!(!db.has(b"cf_only").unwrap(), "CF key is not in the default");
@@ -144,9 +145,9 @@ fn has_with_a_merge_operator_reports_the_collapsed_chain() {
     let opts = Options::default().merge_operator(Some(std::sync::Arc::new(Concat)));
     let db = Db::open(dir.path(), opts).unwrap();
 
-    db.put(b"k", b"base").unwrap();
-    db.merge(b"k", b"+one").unwrap();
-    db.merge(b"k", b"+two").unwrap();
+    regolith::through_stalls(|| db.put(b"k", b"base")).unwrap();
+    regolith::through_stalls(|| db.merge(b"k", b"+one")).unwrap();
+    regolith::through_stalls(|| db.merge(b"k", b"+two")).unwrap();
 
     let merged = db.get(b"k").unwrap().expect("merged value");
     assert_eq!(merged, b"base+one+two");
@@ -194,8 +195,8 @@ fn iterator_value_slice_covers_memtable_reverse_and_merge_sources() {
     let mut batch = WriteBatch::new();
     batch.put(b"a", b"alpha");
     batch.put(b"b", b"beta");
-    db.write(batch).unwrap();
-    db.merge(b"c", b"gamma").unwrap();
+    regolith::through_stalls(|| db.write(batch.clone())).unwrap();
+    regolith::through_stalls(|| db.merge(b"c", b"gamma")).unwrap();
 
     // Forward over the memtable.
     let mut it = db.iter();
@@ -241,8 +242,8 @@ fn cf_and_owned_iterators_expose_value_slice() {
     let dir = TempDir::new().unwrap();
     let db = Db::open(dir.path(), Options::default()).unwrap();
     let cf = db.create_column_family("cf").unwrap();
-    db.put_cf(&cf, b"k", b"cf-value").unwrap();
-    db.put(b"k", b"default-value").unwrap();
+    regolith::through_stalls(|| db.put_cf(&cf, b"k", b"cf-value")).unwrap();
+    regolith::through_stalls(|| db.put(b"k", b"default-value")).unwrap();
 
     let mut it = db.iter_cf(&cf);
     it.seek_to_first();
@@ -275,8 +276,8 @@ proptest! {
         for (key_byte, value) in &ops {
             let key = [*key_byte];
             match value {
-                Some(v) => db.put(&key, v).unwrap(),
-                None => db.delete(&key).unwrap(),
+                Some(v) => regolith::through_stalls(|| db.put(&key, v)).unwrap(),
+                None => regolith::through_stalls(|| db.delete(&key)).unwrap(),
             }
         }
         if compact {
@@ -299,18 +300,18 @@ fn waiting_for_snapshots_counts_iterator_pins_not_just_snapshot_handles() {
     let dir = TempDir::new().expect("tempdir");
     let db = Db::open(dir.path(), Options::default()).expect("open");
     for i in 0..32u32 {
-        db.put(format!("k{i:04}").as_bytes(), b"v").expect("put");
+        regolith::through_stalls(|| db.put(format!("k{i:04}").as_bytes(), b"v")).expect("put");
     }
 
     assert_eq!(
-        db.wait_for_snapshots(Duration::from_secs(5)),
+        db.wait_for_snapshots().wait(Duration::from_secs(5)),
         0,
         "a database with no readers must not wait at all",
     );
 
     let snapshot = db.snapshot();
     assert_eq!(
-        db.wait_for_snapshots(Duration::from_millis(50)),
+        db.wait_for_snapshots().wait(Duration::from_millis(50)),
         1,
         "a live snapshot must be counted",
     );
@@ -319,18 +320,146 @@ fn waiting_for_snapshots_counts_iterator_pins_not_just_snapshot_handles() {
     // handle is not enough.
     let iter = snapshot.into_owned_iter();
     assert_eq!(
-        db.wait_for_snapshots(Duration::from_millis(50)),
+        db.wait_for_snapshots().wait(Duration::from_millis(50)),
         1,
         "an iterator outliving its snapshot handle must keep the pin",
     );
 
     drop(iter);
     assert_eq!(
-        db.wait_for_snapshots(Duration::from_secs(5)),
+        db.wait_for_snapshots().wait(Duration::from_secs(5)),
         0,
         "every pin was released, so the wait must return immediately",
     );
     db.close().expect("close");
+}
+
+/// Asking about the snapshots never waits: the call returns with the pins
+/// live now while this very thread still holds one, which a call that waited
+/// for the release could never do. The handle it returns reports the count
+/// again each time it is asked.
+#[test]
+fn asking_about_snapshots_returns_at_once_with_what_is_pinned() {
+    let db = Db::open("snapshots-status", Options::memory()).expect("open");
+    let status = db.wait_for_snapshots();
+    assert_eq!(status.pinned(), 0);
+    assert!(status.is_ready());
+
+    let snapshot = db.snapshot();
+    let iter = snapshot.owned_iter();
+    let held = db.wait_for_snapshots();
+    assert_eq!(held.pinned(), 2, "the handle and its iterator each pin");
+    assert!(!held.is_ready());
+    assert_eq!(status.pinned(), 2, "a handle reports what is pinned now");
+
+    drop(snapshot);
+    assert_eq!(held.pinned(), 1);
+    assert!(!held.is_ready());
+    drop(iter);
+    assert_eq!(held.pinned(), 0);
+    assert!(held.is_ready());
+}
+
+/// Counts the times it is woken.
+#[derive(Default)]
+struct Wakes(std::sync::atomic::AtomicUsize);
+
+impl std::task::Wake for Wakes {
+    fn wake(self: Arc<Self>) {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// Polled as a future, the wait is pending while a snapshot is pinned and
+/// wakes its task when the last pin is released, with nothing blocking and
+/// no timer: the release itself wakes it.
+#[test]
+fn the_wait_is_a_future_that_the_last_release_wakes() {
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::sync::atomic::Ordering;
+    use std::task::{Context, Poll, Waker};
+
+    let db = Db::open("snapshots-future", Options::memory()).expect("open");
+    let wakes = Arc::new(Wakes::default());
+    let waker = Waker::from(Arc::clone(&wakes));
+    let mut cx = Context::from_waker(&waker);
+
+    // Nothing pinned: ready at the first poll.
+    let mut idle = db.wait_for_snapshots();
+    assert_eq!(Pin::new(&mut idle).poll(&mut cx), Poll::Ready(()));
+
+    let first = db.snapshot();
+    let second = db.snapshot();
+    let mut wait = db.wait_for_snapshots();
+    assert_eq!(Pin::new(&mut wait).poll(&mut cx), Poll::Pending);
+    assert_eq!(wakes.0.load(Ordering::SeqCst), 0);
+
+    // One pin left: whether or not the release woke the task, the wait is
+    // still pending when polled.
+    drop(first);
+    assert_eq!(Pin::new(&mut wait).poll(&mut cx), Poll::Pending);
+    let before = wakes.0.load(Ordering::SeqCst);
+
+    drop(second);
+    assert!(
+        wakes.0.load(Ordering::SeqCst) > before,
+        "the release of the last pin must wake the waiting task"
+    );
+    assert_eq!(Pin::new(&mut wait).poll(&mut cx), Poll::Ready(()));
+
+    // Ready said nothing was pinned then. A wait polled again starts over.
+    let third = db.snapshot();
+    assert_eq!(Pin::new(&mut wait).poll(&mut cx), Poll::Pending);
+    drop(third);
+    assert_eq!(Pin::new(&mut wait).poll(&mut cx), Poll::Ready(()));
+}
+
+/// A task that awaits the wait on one thread is resumed by a release on
+/// another, in whichever order the two happen.
+#[test]
+fn a_release_on_another_thread_resumes_the_awaiting_task() {
+    let db = Db::open("snapshots-await", Options::memory()).expect("open");
+    for _ in 0..200 {
+        let snapshot = db.snapshot();
+        std::thread::scope(|scope| {
+            let waiter = scope.spawn(|| {
+                let mut queue = db.io_queue();
+                queue.block_on(db.wait_for_snapshots());
+            });
+            drop(snapshot);
+            waiter.join().expect("the awaiting task finished");
+        });
+        assert_eq!(db.wait_for_snapshots().pinned(), 0);
+    }
+}
+
+/// A wait dropped while pending leaves nothing behind: later releases and
+/// later waits behave as if it had never been polled.
+#[test]
+fn a_wait_dropped_while_pending_is_withdrawn() {
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::sync::atomic::Ordering;
+    use std::task::{Context, Poll, Waker};
+
+    let db = Db::open("snapshots-dropped-wait", Options::memory()).expect("open");
+    let wakes = Arc::new(Wakes::default());
+    let waker = Waker::from(Arc::clone(&wakes));
+    let mut cx = Context::from_waker(&waker);
+
+    let snapshot = db.snapshot();
+    let mut abandoned = db.wait_for_snapshots();
+    assert_eq!(Pin::new(&mut abandoned).poll(&mut cx), Poll::Pending);
+    drop(abandoned);
+    drop(snapshot);
+    assert_eq!(
+        wakes.0.load(Ordering::SeqCst),
+        0,
+        "a withdrawn wait is not woken"
+    );
+    let mut fresh = db.wait_for_snapshots();
+    assert_eq!(Pin::new(&mut fresh).poll(&mut cx), Poll::Ready(()));
 }
 
 /// The wait must return as soon as the last reader finishes rather than
@@ -339,7 +468,7 @@ fn waiting_for_snapshots_counts_iterator_pins_not_just_snapshot_handles() {
 fn waiting_for_snapshots_returns_as_soon_as_the_last_reader_finishes() {
     let dir = TempDir::new().expect("tempdir");
     let db = Arc::new(Db::open(dir.path(), Options::default()).expect("open"));
-    db.put(b"k", b"v").expect("put");
+    regolith::through_stalls(|| db.put(b"k", b"v")).expect("put");
 
     let snapshot = db.snapshot();
     let holder = {
@@ -353,7 +482,7 @@ fn waiting_for_snapshots_returns_as_soon_as_the_last_reader_finishes() {
     };
 
     let started = std::time::Instant::now();
-    let outstanding = db.wait_for_snapshots(Duration::from_secs(30));
+    let outstanding = db.wait_for_snapshots().wait(Duration::from_secs(30));
     let waited = started.elapsed();
     holder.join().expect("holder");
 

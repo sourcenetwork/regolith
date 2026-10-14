@@ -120,7 +120,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let scanned = db.scan_page(Some(&key(0)), None, 512)?.entries.len();
     report.record("after a 512-row page scan");
 
-    db.compact_range(None, None)?;
+    db.compact_range(None, None).wait()?;
     report.record("after compact_range");
 
     db.close()?;

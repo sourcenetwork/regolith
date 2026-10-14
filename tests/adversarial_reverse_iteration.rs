@@ -16,6 +16,7 @@
 //! forward walk visits in exactly the mirrored order, and
 //! `seek_for_prev` on every key and on every key extended by one byte
 //! lands where a sorted set says it should.
+#![cfg(not(target_arch = "wasm32"))]
 
 use regolith::{Db, Options};
 use tempfile::TempDir;
@@ -72,10 +73,10 @@ fn check(label: &str, keys: &[Vec<u8>]) {
         let dir = TempDir::new().expect("tempdir");
         let db = Db::open(dir.path(), opts()).expect("open");
         for k in &sorted {
-            db.put(k, b"v").expect("put");
+            regolith::through_stalls(|| db.put(k, b"v")).expect("put");
         }
         if compact {
-            db.compact_range(None, None).expect("compact_range");
+            db.compact_range(None, None).wait().expect("compact_range");
         }
         let ctx = format!("{label} [{stage}]");
 
@@ -143,7 +144,7 @@ fn check(label: &str, keys: &[Vec<u8>]) {
         .create_column_family("attack")
         .expect("create_column_family");
     for k in &sorted {
-        db.put_cf(&cf, k, b"v").expect("put_cf");
+        regolith::through_stalls(|| db.put_cf(&cf, k, b"v")).expect("put_cf");
     }
     // A neighbour CF holding keys that sort after this one's upper
     // bound, so a probe that overshoots would pick one of them up.
@@ -151,9 +152,9 @@ fn check(label: &str, keys: &[Vec<u8>]) {
         .create_column_family("zzz_neighbour")
         .expect("create_column_family");
     for k in &sorted {
-        db.put_cf(&other, k, b"other").expect("put_cf");
+        regolith::through_stalls(|| db.put_cf(&other, k, b"other")).expect("put_cf");
     }
-    db.compact_range(None, None).expect("compact_range");
+    db.compact_range(None, None).wait().expect("compact_range");
 
     let mut it = db.iter_cf(&cf);
     it.seek_to_last();

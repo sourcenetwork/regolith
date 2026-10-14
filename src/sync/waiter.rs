@@ -49,6 +49,7 @@ use core::task::{Poll, Waker};
 
 use super::internal::{AtomicPtr, AtomicUsize, Ordering, UnsafeCell};
 use super::queue::WaitQueue;
+use super::spin::pause;
 
 const PHASE: usize = 0b11;
 const WAITING: usize = 0;
@@ -271,6 +272,42 @@ impl Waiter {
         }
     }
 
+    /// Readies the node for its future to spin on, inside a poll: a grant
+    /// or nudge that comes while it spins must only set its mark, never
+    /// claim the waker. So an armed waker is disarmed; it stays in its slot
+    /// for [`park`](Self::park) to arm again, which reads the marks in the
+    /// same compare-and-swap. False when the node is granted or nudged
+    /// already, so there is nothing to wait for. In the common case, a
+    /// future woken by the claim of its waker, nothing is armed and this is
+    /// one load.
+    fn begin_spin(&self) -> bool {
+        let mut state = self.state.load(Ordering::Acquire);
+        loop {
+            if state & PHASE == GRANTED || state & NUDGED != 0 {
+                return false;
+            }
+            if state & ARMED == 0 {
+                return true;
+            }
+            match self.state.compare_exchange_weak(
+                state,
+                state & !ARMED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return true,
+                Err(actual) => state = actual,
+            }
+        }
+    }
+
+    /// Whether a grant or nudge has reached the node: what a spin waits
+    /// for. A plain load; the look that follows the spin synchronizes.
+    fn marked(&self) -> bool {
+        let state = self.state.load(Ordering::Relaxed);
+        state & PHASE == GRANTED || state & NUDGED != 0
+    }
+
     /// Marks a waiting node as owed a handoff. False when it already left
     /// the waiting phase.
     fn owe(&self) -> bool {
@@ -346,7 +383,10 @@ impl Waiter {
 
     /// Takes the waker a claim set aside, then gives the slot back. If a
     /// grant or nudge marked a waker armed meanwhile, claims that one too
-    /// and reports [`Taken::Again`]. The caller holds the taking bit.
+    /// and reports [`Taken::Again`]. The caller holds the taking bit. After
+    /// [`Taken::Done`] the caller has let go of the node: unless it held
+    /// the last reference, it must not touch the node again, since the
+    /// party holding the last one may free or reuse it at once.
     fn take_claimed(&self) -> (Option<Waker>, Taken) {
         let mut state = self.state.load(Ordering::Acquire);
         // SAFETY: the taking bit makes the taken slot this caller's.
@@ -379,6 +419,96 @@ impl Waiter {
             // SAFETY: forwarded from the caller.
             drop(slot.with_mut(|slot| unsafe { (*slot).take() }));
         }
+    }
+
+    /// Under loom, freeing the node counts as a write to every word of it.
+    /// loom then checks that each earlier access, by any party, happened
+    /// before the free, so a party that touches the node after letting go
+    /// of its reference fails the model instead of reading freed memory
+    /// unseen.
+    #[cfg(loom)]
+    fn retire(&mut self) {
+        self.state.with_mut(|_| ());
+        self.next.with_mut(|_| ());
+        self.wake_next.with_mut(|_| ());
+        self.payload.with_mut(|_| ());
+    }
+}
+
+/// Loom-only instruments of the spin on the waiter's node (E48): what the
+/// models in `loom_model.rs` count to show they reach each branch of the
+/// spin, and the one guard their calibration takes away. Loom runs a model's
+/// threads as coroutines on the test's own thread, so these are per test.
+#[cfg(loom)]
+pub(super) mod spin_probe {
+    use core::cell::Cell;
+    use std::thread::LocalKey;
+
+    std::thread_local! {
+        /// Spins on a node that began.
+        pub(in super::super) static SPINS: Cell<usize> = const { Cell::new(0) };
+        /// Spins that saw a mark land on the unarmed node.
+        pub(in super::super) static MARKED_WHILE_SPINNING: Cell<usize> = const { Cell::new(0) };
+        /// Spins that ran out, after which only the look found a mark.
+        pub(in super::super) static MARKED_AFTER_LAST_READ: Cell<usize> = const { Cell::new(0) };
+        /// The calibration's switch: a spin that runs out arms the waker
+        /// without the look's reading of the marks.
+        pub(in super::super) static SKIP_LOOK: Cell<bool> = const { Cell::new(false) };
+    }
+
+    /// Adds one to `counter`.
+    pub(in super::super) fn count(counter: &'static LocalKey<Cell<usize>>) {
+        counter.with(|c| c.set(c.get() + 1));
+    }
+
+    /// Reads and resets the three counts, in the order above.
+    pub(in super::super) fn take() -> [usize; 3] {
+        [&SPINS, &MARKED_WHILE_SPINNING, &MARKED_AFTER_LAST_READ].map(|c| c.with(|c| c.replace(0)))
+    }
+}
+
+#[cfg(loom)]
+impl Waiter {
+    /// The calibration's broken end of a spin: registers `waker` and arms it
+    /// without reading the marks, which is what `park` does in one swap
+    /// with the reading. A node that carries an unread mark at the arming
+    /// swap now sleeps beside it: no release will wake it, since the one
+    /// that marked it found it unarmed and the nudge marker stays up. The
+    /// model stops there rather than park for good, which loom would report
+    /// as a deadlock and abort the test binary with.
+    fn arm_without_look(&self, waker: &Waker) -> Park {
+        let mut state = self.state.load(Ordering::Acquire);
+        let target = loop {
+            let current = if state & TAKING != 0 {
+                !state & TAKEN != 0
+            } else {
+                state & CURRENT != 0
+            };
+            let next =
+                (state & !(ARMED | CURRENT)) | REGISTERING | if current { CURRENT } else { 0 };
+            match self.state.compare_exchange_weak(
+                state,
+                next,
+                Ordering::Acquire,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => break next,
+                Err(actual) => state = actual,
+            }
+        };
+        // SAFETY: as in `park`: the registering bit makes the slot this
+        // future's.
+        self.slot(target, CURRENT).with_mut(|slot| unsafe {
+            if !(*slot).as_ref().is_some_and(|w| w.will_wake(waker)) {
+                *slot = Some(waker.clone());
+            }
+        });
+        let before = self.state.fetch_xor(REGISTERING | ARMED, Ordering::AcqRel);
+        assert!(
+            before & NUDGED == 0 && before & PHASE != GRANTED,
+            "the waiter armed and slept beside an unread mark"
+        );
+        Park::Pending
     }
 }
 
@@ -463,6 +593,9 @@ impl Pool {
             Ok(()) => return,
             Err(Pooled(node)) => node,
         };
+        // SAFETY: as above, the caller owns the node outright.
+        #[cfg(loom)]
+        unsafe { &mut *node.as_ptr() }.retire();
         // SAFETY: every node is a leaked `Box` and this one is unreferenced.
         drop(unsafe { Box::from_raw(node.as_ptr()) });
     }
@@ -581,12 +714,18 @@ impl<'a> WakeList<'a> {
         let node = NonNull::new(self.head)?;
         // SAFETY: this list holds the node's wake reference.
         let waiter = unsafe { node.as_ref() };
+        // The link is read while this list still holds the node. The take
+        // below may let go of the last reference but one, and the party
+        // holding that one may then free or reuse the node at once. Nobody
+        // else writes the link meanwhile: the taking bit keeps every other
+        // wake list from claiming the node until the take lets it go.
+        let next = waiter.wake_next.load(Ordering::Relaxed);
         let (waker, taken) = waiter.take_claimed();
         match taken {
             // The node stays at the front for the waker just claimed.
             Taken::Again => {}
             Taken::Done(last) => {
-                self.head = waiter.wake_next.load(Ordering::Relaxed);
+                self.head = next;
                 if self.head.is_null() {
                     self.tail = ptr::null_mut();
                 }
@@ -658,6 +797,7 @@ impl Wait {
         Self { node: None }
     }
 
+    #[inline]
     pub(super) fn is_queued(&self) -> bool {
         self.node.is_some()
     }
@@ -693,6 +833,50 @@ impl Wait {
             Seen::Nudged => Park::Nudged,
             Seen::Pending => Park::Pending,
         }
+    }
+
+    /// After a lost retry: spins on the node for up to the queue's
+    /// budget, then looks at it as [`park`](Self::park) with `waker` does.
+    /// A grant or nudge that comes during the spin finds the node unarmed,
+    /// so it only sets its mark, and the spin sees the mark; if the spin
+    /// runs out, the look arms the waker and reads the marks in one
+    /// compare-and-swap, so a mark set as the spin gave up is not lost.
+    pub(super) fn spin_park(&mut self, queue: &WaitQueue, waker: &Waker) -> Park {
+        if let Some(node) = self.node {
+            let rounds = queue.spin.rounds();
+            // SAFETY: this future holds its reference until it clears `node`.
+            let waiter = unsafe { node.as_ref() };
+            if rounds > 0 && waiter.begin_spin() {
+                #[cfg(loom)]
+                spin_probe::count(&spin_probe::SPINS);
+                if (0..rounds).any(|_| {
+                    pause();
+                    waiter.marked()
+                }) {
+                    // A grant or nudge landed on the node while it was
+                    // unarmed, and the spin saw it.
+                    #[cfg(loom)]
+                    spin_probe::count(&spin_probe::MARKED_WHILE_SPINNING);
+                    queue.spin.won(rounds);
+                } else {
+                    queue.spin.ran_out(rounds);
+                    #[cfg(loom)]
+                    {
+                        if spin_probe::SKIP_LOOK.with(core::cell::Cell::get) {
+                            return waiter.arm_without_look(waker);
+                        }
+                        let park = self.park(queue, Some(waker));
+                        if !matches!(park, Park::Pending) {
+                            // A mark landed after the spin's last read: only
+                            // the look's swap saw it.
+                            spin_probe::count(&spin_probe::MARKED_AFTER_LAST_READ);
+                        }
+                        return park;
+                    }
+                }
+            }
+        }
+        self.park(queue, Some(waker))
     }
 
     /// For a primitive that only grants: ready once granted.
@@ -748,3 +932,103 @@ impl Wait {
 unsafe impl Send for Wait {}
 // SAFETY: `&Wait` exposes nothing.
 unsafe impl Sync for Wait {}
+
+#[cfg(all(test, not(loom)))]
+mod tests {
+    use super::super::test_support::Polled;
+    use super::*;
+
+    /// A queue with one waiter armed, as after a poll that returned
+    /// `Pending`, and the waker that counts its wakes.
+    fn armed() -> (WaitQueue, Wait, Polled<core::future::Pending<()>>) {
+        let queue = WaitQueue::new(0);
+        let counter = Polled::new(core::future::pending::<()>());
+        let mut wait = Wait::new();
+        wait.enqueue(&queue, 1, &counter.waker());
+        assert!(matches!(wait.park(&queue, None), Park::Pending));
+        (queue, wait, counter)
+    }
+
+    fn node(wait: &Wait) -> NonNull<Waiter> {
+        wait.node.expect("queued")
+    }
+
+    /// B, the spin on the waiter's own node. A nudge that finds the waiter
+    /// spinning (disarmed by `begin_spin`) sets the mark and calls no
+    /// waker; the look that ends the spin finds the mark.
+    #[test]
+    fn a_nudge_that_finds_its_waiter_spinning_marks_it_and_wakes_nobody() {
+        let (queue, mut wait, counter) = armed();
+        // SAFETY: the future holds its reference for the whole test.
+        let waiter = unsafe { node(&wait).as_ref() };
+        assert!(waiter.begin_spin(), "nothing marked yet: the waiter spins");
+        let mut woken = WakeList::new(&queue);
+        assert!(woken.nudge(node(&wait)), "a nudge is on its way");
+        drop(woken);
+        assert_eq!(
+            counter.wakes(),
+            0,
+            "a spinning waiter's waker is not called"
+        );
+        assert!(waiter.marked(), "the spin sees the mark");
+        assert!(matches!(
+            wait.park(&queue, Some(&counter.waker())),
+            Park::Nudged
+        ));
+        assert!(matches!(wait.cancel(&queue), Cancel::Withdrawn(false)));
+    }
+
+    /// The same nudge to an armed waiter claims its waker and calls it: what
+    /// `begin_spin` saves a spinning waiter.
+    #[test]
+    fn a_nudge_that_finds_its_waiter_armed_calls_its_waker() {
+        let (queue, mut wait, counter) = armed();
+        let mut woken = WakeList::new(&queue);
+        assert!(woken.nudge(node(&wait)));
+        drop(woken);
+        assert_eq!(counter.wakes(), 1, "an armed waiter is woken");
+        assert!(matches!(
+            wait.park(&queue, Some(&counter.waker())),
+            Park::Nudged
+        ));
+        assert!(matches!(wait.cancel(&queue), Cancel::Withdrawn(false)));
+    }
+
+    /// A mark set just as the spin gives up is not lost: the look that arms
+    /// the waker again reads the marks in the same compare-and-swap, so the
+    /// waiter retries instead of sleeping beside it.
+    #[test]
+    fn a_nudge_as_the_spin_gives_up_is_seen_by_the_look() {
+        let (queue, mut wait, counter) = armed();
+        // SAFETY: as above.
+        let waiter = unsafe { node(&wait).as_ref() };
+        assert!(waiter.begin_spin());
+        assert!(!waiter.marked(), "the spin runs out with nothing marked");
+        let mut woken = WakeList::new(&queue);
+        assert!(woken.nudge(node(&wait)), "the nudge lands as it gives up");
+        drop(woken);
+        assert_eq!(counter.wakes(), 0);
+        assert!(
+            matches!(wait.park(&queue, Some(&counter.waker())), Park::Nudged),
+            "the look found the nudge; the waiter does not sleep beside it"
+        );
+        assert!(matches!(wait.cancel(&queue), Cancel::Withdrawn(false)));
+    }
+
+    /// A node marked before the spin begins needs no spin: `begin_spin`
+    /// says so and leaves the mark for the look.
+    #[test]
+    fn a_marked_node_does_not_spin() {
+        let (queue, mut wait, counter) = armed();
+        let mut woken = WakeList::new(&queue);
+        assert!(woken.nudge(node(&wait)));
+        drop(woken);
+        // SAFETY: as above.
+        assert!(!unsafe { node(&wait).as_ref() }.begin_spin());
+        assert!(matches!(
+            wait.park(&queue, Some(&counter.waker())),
+            Park::Nudged
+        ));
+        assert!(matches!(wait.cancel(&queue), Cancel::Withdrawn(false)));
+    }
+}
