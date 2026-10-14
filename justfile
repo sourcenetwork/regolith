@@ -307,17 +307,70 @@ chaos instances="4" rounds="2" versions="120" min_rounds="20":
 # RED one that does not break exactly its invariant, fails the recipe: the RED
 # rows are what make the GREEN ones mean anything, and a RED row that fails
 # for some other reason shows nothing.
+# The storage-engine models follow, each backed by a Lean proof in
+# `proofs/lean` that holds for every size where TLC checks a few:
+# `LsmOrder.tla` (E1, compact_range picks a closed L0 input set),
+# `BatchRead.tla` (E6, one view per batch read), `IngestPublication.tla`
+# (E8, the visible sequence never passes a pending slot) and
+# `WalRotation.tla` (E2, a rotation syncs the sealed log first).
+# Each row prints the distinct states TLC explored and its wall time.
 # TLC is fetched on first use, pinned by checksum in `proofs/tla/tools/tlc`.
+#
+# The suite is bounded. Every row runs on ONE TLC worker under a hard limit
+# of 120 seconds: a row that hits it is reported as TIMED OUT and fails the
+# recipe, it never passes. A configuration is sized to finish in under 60
+# seconds on one worker; one that does not is shrunk (its `.cfg` says what
+# was shrunk and what the smaller instance still covers), because the Lean
+# proof covers every size and TLC only has to show a small instance's
+# interleavings. Time a new row before adding it.
+#
+# As many rows run side by side as the machine has cores, each in a JVM
+# sized for its one worker, and their lines are printed in the order below
+# once all are done. With one worker a RED row stops at the shallowest
+# broken invariant, the same on every run.
+# Check every TLA+ row.
 tla:
     #!/usr/bin/env bash
     set -uo pipefail
     cd proofs/tla
-    fail=0
+    # Fetched once, before the rows run side by side.
+    ./tools/tlc --fetch-only >/dev/null || exit 1
+    results=$(mktemp -d)
+    trap 'rm -rf "$results"' EXIT
+    # The cores this run may use (`nproc` counts those it is confined to).
+    side=$(nproc 2>/dev/null || getconf _NPROCESSORS_ONLN)
+    row=0
+    # The module the next rows check; each block below sets it.
+    spec=RepeatableRead
+    # One row, started in the background: its line goes to a file named by
+    # its number, and a `.fail` file beside it marks a wrong verdict.
     check() {
-        local cfg="$1" expect="$2" inv="${3:-}" out broke verdict
-        out=$(./tools/tlc -metadir "states/$cfg" -config "$cfg.cfg" RepeatableRead.tla 2>&1)
-        broke=$(sed -n 's/^Error: Invariant \(.*\) is violated\.$/\1/p' <<<"$out" | head -1)
-        if grep -q "No error has been found" <<<"$out"; then
+        row=$((row + 1))
+        while [ "$(jobs -rp | wc -l)" -ge "$side" ]; do wait -n; done
+        run_row "$(printf '%04d' "$row")" "$spec" "$@" > "$results/$(printf '%04d' "$row").out" 2>&1 &
+    }
+    run_row() {
+        local n="$1" spec="$2" cfg="$3" expect="$4" inv="${5:-}" out code broke verdict states took
+        # A serial collector and two compiler threads: what one worker on
+        # one core uses. A temporary directory of its own, because TLC
+        # unpacks its standard modules into it and two rows must not share
+        # the files; the row's states go there too.
+        mkdir -p "$results/tmp.$n"
+        out=$(TLC_JVM_FLAGS="-XX:+UseSerialGC -XX:CICompilerCount=2 -Djava.io.tmpdir=$results/tmp.$n" \
+              timeout 120 ./tools/tlc -workers 1 -metadir "$results/tmp.$n/states" -config "$cfg.cfg" "$spec.tla" 2>&1)
+        code=$?
+        # TLC words a broken invariant two ways: "is violated." when the search reaches a bad
+        # state, and "is violated by the initial state:" when the very first state is already
+        # bad. Both name the invariant, and both count.
+        broke=$(sed -n -e 's/^Error: Invariant \(.*\) is violated\.$/\1/p' \
+                       -e 's/^Error: Invariant \(.*\) is violated by the initial state:$/\1/p' <<<"$out" | head -1)
+        states=$(sed -n 's/^.* states generated, \([0-9,]*\) distinct states found.*$/\1/p' <<<"$out" | tail -1)
+        took=$(sed -n 's/^Finished in \(.*\) at (.*$/\1/p' <<<"$out" | tail -1)
+        if [ "$code" -eq 124 ]; then
+            # The hard limit: a failure, whatever the row was meant to show.
+            verdict="TIMED OUT"
+            took="over 120s"
+        elif grep -q "No error has been found" <<<"$out"; then
             verdict=GREEN
         elif [ -n "$broke" ] && [ "$broke" = "$inv" ]; then
             verdict=RED
@@ -327,8 +380,9 @@ tla:
             verdict=BROKEN
             echo "$out" | tail -20
         fi
-        printf '  %-48s %-6s (expected %s)\n' "$cfg" "$verdict" "$expect${inv:+ on $inv}"
-        if [ "$verdict" != "$expect" ]; then fail=1; fi
+        printf '  %-48s %-9s %9s states %9s  (expected %s)\n' \
+            "$cfg" "$verdict" "${states:-?}" "${took:-?}" "$expect${inv:+ on $inv}"
+        if [ "$verdict" != "$expect" ]; then touch "$results/$n.fail"; fi
     }
     check MC_RepeatableRead_Green                      GREEN
     check MC_RepeatableRead_Red_Serializable           RED INV_AppendsCommit
@@ -336,6 +390,7 @@ tla:
     check MC_RepeatableRead_Red_ReadCommitted          RED INV_NoStaleDefinition
     check MC_DefraLevel_Green_Heads                    GREEN
     check MC_DefraLevel_Green_Counters                 GREEN
+    check MC_DefraLevel_Green_Counters_Clear           GREEN
     check MC_DefraLevel_Green_Migrations               GREEN
     check MC_DefraLevel_Red_RepeatableRead_Merges      RED INV_DuplicateMergesCommit
     check MC_DefraLevel_Red_NoPolicy                   RED INV_DuplicateMergesCommit
@@ -348,8 +403,58 @@ tla:
     check MC_DefraLevel_Red_RangeDeleteNotReplacement  RED INV_CounterExact
     check MC_DefraLevel_Red_PolicyIgnoresRange         RED INV_NoStaleDefinition
     check MC_DefraLevel_Red_DefinitionContentAddressed RED INV_NoStaleDefinition
-    rm -rf states ./*_TTrace_*.tla ./*_TTrace_*.bin
-    exit $fail
+    # E1. Lean: Regolith/LsmOrder.lean, compact_range_reads_newest.
+    spec=LsmOrder
+    # E31, a flush's table and its memtable's retirement are one publication.
+    # Lean: Regolith/LsmOrder.lean, flush_keeps_sources_disjoint,
+    # split_install_holds_a_memtable_twice.
+    check MC_LsmOrder_Red_SplitRetire                  RED NoDoubleSource
+    check MC_LsmOrder_Green                            GREEN
+    check MC_LsmOrder_Red_Intersect                    RED ReadNewest
+    # E6. Lean: Regolith/BatchView.lean, batch_one_view_newest.
+    spec=BatchRead
+    check MC_BatchRead_Green                           GREEN
+    check MC_BatchRead_Red_ViewPerKey                  RED BatchConsistent
+    check MC_BatchRead_Red_ViewPerKey_Exact            RED BatchExact
+    # E8. Lean: Regolith/Publication.lean, repeatable_snapshot.
+    spec=IngestPublication
+    check MC_IngestPublication_Green                   GREEN
+    check MC_IngestPublication_Red_CommitPassesSlot    RED RepeatableSnapshot
+    check MC_IngestPublication_Red_IngestPublishesEarly RED RepeatableSnapshot
+    # E2. Lean: Regolith/WalRecovery.lean, reachable_recovers_prefix.
+    spec=WalRotation
+    check MC_WalRotation_Green                         GREEN
+    check MC_WalRotation_Red_NoSync                    RED RecoversPrefix
+    check MC_WalRotation_Red_NoSync_Gap                RED NoGap
+    wait
+    rm -rf ./*_TTrace_*.tla ./*_TTrace_*.bin
+    cat "$results"/*.out
+    failed=$(find "$results" -name '*.fail' | wc -l)
+    echo "  $row rows, $failed with the wrong verdict"
+    [ "$failed" -eq 0 ]
+
+# `proofs/lean` is a Lake project named Regolith, plain Lean 4 core with no
+# dependencies, so it builds offline. Each module proves for every size what
+# a TLA+ model above checks for a few, and names that model in its header.
+# The build treats every warning as an error, so a proof left open fails it;
+# the grep refuses the placeholder words outright; and `Audit.lean` fails
+# unless every Regolith declaration rests on Lean's three standard
+# assumptions alone. elan provides the toolchain `lean-toolchain` pins.
+# Build and audit the Lean proofs in proofs/lean.
+lean:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    export PATH="$HOME/.elan/bin:$PATH"
+    cd proofs/lean
+    lake build
+    if grep -rnwE --include='*.lean' --exclude-dir=.lake 'sorry|admit|axiom' .; then
+        echo "error: proofs/lean holds sorry, admit or axiom; every proof must be complete" >&2
+        exit 1
+    fi
+    lake env lean Audit.lean
+
+# Every formal check: the TLA+ models and the Lean proofs.
+proofs: tla lean
 
 # ---------- consistency ----------
 
@@ -483,7 +588,7 @@ wasm-native records="5000" sustained="20000":
     set -euo pipefail
     for profile in embedded wasm; do
         echo "== profile $profile =="
-        cargo run --release -p regolith-wasm-probe -- \
+        cargo run --release -p regolith-wasm-probe --bin regolith-wasm-probe -- \
             --profile "$profile" --records {{records}} --sustained {{sustained}} \
             --probe-host --report-memory
     done
@@ -493,9 +598,25 @@ wasm-native records="5000" sustained="20000":
 # `tests/`, and all but the three `wasm_opfs*` files are native-only.
 # The runner is named per target instead, so only the named test
 # binaries are built.
+#
+# Needs `wasm-bindgen-test-runner` from the `wasm-bindgen-cli` release that
+# Cargo.lock pins for `wasm-bindgen`, to the patch: the two share an
+# unstable schema, and a runner of another version refuses the test binary
+# with a schema error after the whole build. The recipe checks that first
+# and says what to install.
 wasm-browser:
     #!/usr/bin/env bash
     set -euo pipefail
+    pinned=$(awk '/^name = "wasm-bindgen"$/ { found = 1; next } found && /^version = / { gsub(/"/, "", $3); print $3; exit }' Cargo.lock)
+    if ! command -v wasm-bindgen-test-runner >/dev/null 2>&1; then
+        echo "error: wasm-bindgen-test-runner is not on PATH; install it with: cargo install wasm-bindgen-cli --version $pinned --locked" >&2
+        exit 1
+    fi
+    have=$(wasm-bindgen --version 2>/dev/null | awk '{ print $2 }')
+    if [ "$have" != "$pinned" ]; then
+        echo "error: wasm-bindgen-cli is ${have:-not installed} but Cargo.lock pins wasm-bindgen $pinned, and the two must match exactly; install it with: cargo install wasm-bindgen-cli --version $pinned --locked" >&2
+        exit 1
+    fi
     export CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER=wasm-bindgen-test-runner
     # wasm-bindgen's default per-test budget is 20s, which a headless
     # browser on a shared runner can exceed on a test that mounts OPFS

@@ -335,7 +335,9 @@ The suite is the argument for trusting any of the above.
 just gate       # format, lint, docs, tests, dependency audit
 just test       # the whole suite under cargo-nextest
 just loom-all   # exhaustive model checking of the publication protocols
-just tla        # TLA+ model of commit validation per isolation level
+just tla        # TLA+ models: commit validation per isolation level, the storage engine
+just lean       # Lean proofs behind the storage-engine models, for every size
+just proofs     # both of the above
 just elle       # Elle consistency checking of transaction histories
 just chaos      # the full-size read-view chaos workload
 just wasm       # the wasm32-wasip1 lifecycle under wasmtime

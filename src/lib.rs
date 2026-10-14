@@ -1558,15 +1558,11 @@ impl Db {
     /// so it can rewrite entry sequence numbers. Callers may delete
     /// the source files or re-ingest them at any time.
     ///
-    /// The call waits for any flush already in progress. A memtable that
-    /// fills while a file is being ingested is sealed without waiting, and
-    /// the call writes it to disk right after that file is installed, so
-    /// the ingested entries order after every write acknowledged before
-    /// the call and before every write acknowledged after it. Until then
-    /// those memtables count toward [`Options::max_write_buffer_number`],
-    /// which slows and then stops writes. If writing them fails, the call
-    /// returns that error with the file already ingested, and they stay
-    /// readable until a later [`Db::flush`] writes them.
+    /// The call waits for any flush already in progress, and writes wait
+    /// while each file is rewritten and installed, so the ingested entries
+    /// order after every write acknowledged before the call and before
+    /// every write acknowledged after it, and no snapshot sees them appear
+    /// under it.
     pub fn ingest_external_files(
         &self,
         files: &[std::path::PathBuf],
@@ -1694,6 +1690,9 @@ impl Db {
             return Ok(existing);
         }
         self.validate_prefixed_key_size(&meta::name_key(name))?;
+        // Before the allocation, so a write that cannot be admitted leaves
+        // no name registered.
+        self.wait_for_write_capacity(&WriteOptions::default())?;
         let Some((handle, next_id)) = self.cfs.allocate(name) else {
             return Err(Error::invalid_argument(
                 "the column-family id space is exhausted",
@@ -1733,6 +1732,7 @@ impl Db {
             ));
         }
         self.validate_cf_handle(&cf)?;
+        self.wait_for_write_capacity(&WriteOptions::default())?;
         let lo = cf_lower_bound(cf.id());
         let hi = cf_upper_bound(cf.id());
         // Apply the data range-delete and the metadata entry
@@ -1772,6 +1772,7 @@ impl Db {
         self.ensure_writable()?;
         self.validate_cf_handle(cf)?;
         self.validate_write_kv_sizes(key, value)?;
+        self.wait_for_write_capacity(&WriteOptions::default())?;
         let mut batch = BTreeMap::new();
         batch.insert(prefix_key(cf.id(), key), Some(value.to_vec()));
         self.engine
@@ -1785,6 +1786,7 @@ impl Db {
         self.ensure_writable()?;
         self.validate_cf_handle(cf)?;
         self.validate_key_size(key)?;
+        self.wait_for_write_capacity(&WriteOptions::default())?;
         let mut batch = BTreeMap::new();
         batch.insert(prefix_key(cf.id(), key), None);
         self.engine
@@ -1806,6 +1808,7 @@ impl Db {
         self.validate_cf_handle(cf)?;
         self.validate_key_size(start)?;
         self.validate_key_size(end)?;
+        self.wait_for_write_capacity(&WriteOptions::default())?;
         self.engine
             .apply_grouped_batch(
                 BTreeMap::new(),
@@ -1824,6 +1827,7 @@ impl Db {
         self.ensure_writable()?;
         self.validate_cf_handle(cf)?;
         self.validate_write_kv_sizes(key, operand)?;
+        self.wait_for_write_capacity(&WriteOptions::default())?;
         self.engine
             .apply_grouped_batch(
                 BTreeMap::new(),

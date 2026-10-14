@@ -1052,19 +1052,13 @@ pub(crate) fn run_compact_range(
                 break;
             }
 
-            // At L0 files overlap each other, so picking any file that
-            // intersects the range drags in every other L0 file it
-            // overlaps - simplest correct move: take every L0 file
-            // that intersects the range in one shot.
+            // At L0 files overlap each other, so every L0 file the range
+            // drags in is taken in one shot, see `l0_inputs`.
             //
             // At L1+ files are non-overlapping, so we can pick them
             // one at a time.
             let inputs: Vec<Arc<LiveSst>> = if level == 0 {
-                files
-                    .iter()
-                    .filter(|f| file_overlaps_range(f, start, end))
-                    .map(Arc::clone)
-                    .collect()
+                l0_inputs(files, start, end)
             } else {
                 files
                     .iter()
@@ -1103,6 +1097,49 @@ pub(crate) fn run_compact_range(
         }
     }
     Ok(())
+}
+
+/// The L0 tables a `[start, end)` compaction pushes down: those that
+/// intersect it, and every older table whose keys overlap theirs.
+///
+/// L0 is in age order, oldest first, and a read walks it from the newest table
+/// back taking the first match (see `Version::add_file`). A table moved to L1
+/// with an older one left behind in L0 would read as the older value, so each
+/// table that joins widens the range the next older one is tested against.
+fn l0_inputs(
+    files: &[Arc<LiveSst>],
+    start: Option<&[u8]>,
+    end: Option<&[u8]>,
+) -> Vec<Arc<LiveSst>> {
+    let mut picked: Vec<bool> = files
+        .iter()
+        .map(|f| file_overlaps_range(f, start, end))
+        .collect();
+    let Some(newest) = picked.iter().rposition(|&p| p) else {
+        return Vec::new();
+    };
+    loop {
+        let inputs: Vec<Arc<LiveSst>> = files
+            .iter()
+            .zip(&picked)
+            .filter(|(_, p)| **p)
+            .map(|(f, _)| Arc::clone(f))
+            .collect();
+        let (min_key, mut max_key) = key_range(&inputs);
+        // The range end is exclusive and a table starting at `max_key`
+        // shares it, so test against the smallest key above it.
+        max_key.push(0);
+        let mut grew = false;
+        for (f, p) in files[..newest].iter().zip(&mut picked) {
+            if !*p && file_overlaps_range(f, Some(&min_key), Some(&max_key)) {
+                *p = true;
+                grew = true;
+            }
+        }
+        if !grew {
+            return inputs;
+        }
+    }
 }
 
 /// Inner body of a compaction: read the merged entries from
