@@ -104,10 +104,12 @@ pub enum Ticker {
     /// Number of snapshots released (dropped or explicitly
     /// released).
     SnapshotsReleased = 23,
-    /// Number of incomplete trailing WAL records discarded during
-    /// recovery. A non-zero value means a crash left a partly written
-    /// record behind and the bytes from it to end-of-file were dropped;
-    /// the discard is also logged with the file and the offset.
+    /// Opens that discarded the end of the newest write-ahead log: the
+    /// bytes from its first unusable record on, which no surviving record
+    /// proves were made durable, as a crash leaves an unsynced tail. Each
+    /// is also logged and passed to
+    /// [`crate::EventListener::on_wal_tail_discarded`], with the file and
+    /// the offset.
     WalTailDiscarded = 24,
     /// Optimistic or pessimistic transaction commits that returned
     /// `Ok`.
@@ -136,9 +138,12 @@ pub enum Ticker {
     /// policy declared them safe to leave unvalidated. Counted only
     /// for commits that returned `Ok`.
     PolicyScanRunsDropped = 31,
+    /// Bytes discarded from the end of the newest write-ahead log at open,
+    /// summed over the discards [`Ticker::WalTailDiscarded`] counts.
+    WalTailDiscardedBytes = 32,
 }
 
-const NUM_TICKERS: usize = 32;
+const NUM_TICKERS: usize = 33;
 
 impl Ticker {
     /// Every defined ticker, in discriminant order. Adding a variant
@@ -176,6 +181,7 @@ impl Ticker {
         Ticker::CommitWritesElided,
         Ticker::PolicyBlindMergesCommuted,
         Ticker::PolicyScanRunsDropped,
+        Ticker::WalTailDiscardedBytes,
     ];
 
     /// Stable string name for exporting to monitoring systems.
@@ -213,6 +219,7 @@ impl Ticker {
             Ticker::CommitWritesElided => "regolith.commit.writes_elided",
             Ticker::PolicyBlindMergesCommuted => "regolith.policy.blind_merges_commuted",
             Ticker::PolicyScanRunsDropped => "regolith.policy.scan_runs_dropped",
+            Ticker::WalTailDiscardedBytes => "regolith.wal.tail_discarded_bytes",
         }
     }
 }

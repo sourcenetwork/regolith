@@ -6,10 +6,12 @@
 //! benign/malignant split the fix rests on:
 //!
 //! * benign, and therefore recoverable with every earlier write intact:
-//!   the file ends inside its final record, at any offset;
+//!   the file ends inside its final record, at any offset, or its final
+//!   record is damaged with nothing after it to prove it was synced; the
+//!   discard is reported;
 //! * malignant, and therefore an error: damage in the middle of the log
-//!   with whole records still after it, and a whole final record whose
-//!   checksum does not match.
+//!   with whole records still after it, which prove the damaged bytes
+//!   were synced.
 //!
 //! A fix that turned the second class into "discard and carry on" would
 //! silently lose acknowledged writes, so every case below pins the
@@ -18,8 +20,14 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use std::sync::Arc;
+
 use regolith::{Db, DurabilityMode, Options};
 use tempfile::TempDir;
+
+mod common;
+
+use common::wal_format;
 
 fn opts() -> Options {
     Options::default()
@@ -116,29 +124,11 @@ fn reopen(db: &Path, n: usize) -> Result<Vec<usize>, String> {
 }
 
 /// The record boundaries of a WAL, walked with the framing the format
-/// defines: `[len u32 LE][type u8][payload][checksum u32]`. Computed here
-/// rather than imported, so a change to the engine's own framing helper
-/// cannot quietly move this test's oracle along with it.
+/// defines, from `common::wal_format` rather than the engine, so a change
+/// to the engine's own framing cannot quietly move this test's oracle
+/// along with it.
 fn boundaries(bytes: &[u8]) -> Vec<usize> {
-    /// Matches `WAL_STAMP_LEN` in `src/engine/wal.rs`. Records begin
-    /// after the format stamp, not at byte zero.
-    const STAMP: usize = 12;
-    let mut out = vec![STAMP];
-    loop {
-        let pos = *out.last().expect("seeded");
-        if pos + 5 > bytes.len() {
-            break;
-        }
-        let len = u32::from_le_bytes(bytes[pos..pos + 4].try_into().expect("four bytes")) as usize;
-        let Some(end) = pos.checked_add(5 + len + 4) else {
-            break;
-        };
-        if end > bytes.len() {
-            break;
-        }
-        out.push(end);
-    }
-    out
+    wal_format::record_bounds(bytes)
 }
 
 /// A cut at any offset is a torn tail: every record that survived whole
@@ -211,29 +201,40 @@ fn a_flip_in_the_middle_of_the_wal_never_silently_discards_the_records_after_it(
     assert!(refused > 0, "no mid-log flip was caught at all");
 }
 
-/// A whole final record whose checksum does not match is corruption, not
-/// a torn tail: every byte the record claims is present, which is bit rot
-/// rather than an interrupted write. Refusing is the contract; discarding
-/// it would make a rotted final record indistinguishable from a crash.
+/// Damage to the whole final record, with nothing after it, cannot be told
+/// from a crash: no surviving record proves that record was synced. The
+/// open keeps every record before it, drops it, and reports the drop with
+/// the file and the offset, so the loss of a rotted final record is never
+/// silent (the residual case the format accepts in place of padding every
+/// synced group to whole sectors).
 #[test]
-fn a_checksum_flip_in_the_whole_final_record_refuses_the_open() {
+fn a_flip_in_the_whole_final_record_drops_only_it_and_reports_the_drop() {
     let (files, wal) = fixture(6);
     let full = wal_bytes(&files, &wal);
+    let bounds = boundaries(&full);
+    let last_start = bounds[bounds.len() - 2];
     let root = TempDir::new().expect("tempdir");
     let db = root.path().join("db");
 
-    for bit in 0..8u8 {
+    for byte in [last_start, last_start + 4, last_start + 20, full.len() - 1] {
         let mut damaged = full.clone();
-        let last = damaged.len() - 1;
-        damaged[last] ^= 1 << bit;
+        damaged[byte] ^= 0x01;
         plant(&files, &wal, &damaged, &db);
-        let err = reopen(&db, 6).expect_err("a rotted whole final record must refuse");
-        assert!(
-            err.contains("checksum"),
-            "the refusal must name the reason, got: {err}",
-        );
+        let reports = wal_format::TailReports::new();
+        let d = Db::open(
+            &db,
+            opts().listeners(vec![reports.clone() as Arc<dyn regolith::EventListener>]),
+        )
+        .unwrap_or_else(|e| panic!("flip at {byte}: {e}"));
+        let found: Vec<usize> = (0..6)
+            .filter(|i| d.get(format!("k{i:04}").as_bytes()).unwrap().is_some())
+            .collect();
+        assert_eq!(found, (0..5).collect::<Vec<_>>(), "flip at {byte}");
+        let taken = reports.taken();
+        assert_eq!(taken.len(), 1, "flip at {byte} must be reported");
+        assert_eq!(taken[0].offset, last_start as u64);
+        assert_eq!(taken[0].discarded_bytes, (full.len() - last_start) as u64);
     }
-    println!("all 8 flips of the final checksum byte refused, naming the checksum");
 }
 
 /// Garbage appended after a whole log frames as a trailing partial record
@@ -316,11 +317,10 @@ fn a_zero_run_with_whole_records_after_it_still_refuses() {
     println!("zero run with records after it refused: {err}");
 }
 
-/// Truncating every record boundary in turn, then re-appending the whole
-/// original tail after the cut, recreates the shape the format cannot
-/// tell apart from a torn write only when the remainder fails to tile.
-/// Where it does tile, the open must refuse rather than discard the
-/// records beyond the damage.
+/// A length field that runs past the end of the file, with whole records
+/// still behind it: the damaged record's length cannot be trusted to find
+/// them, and the records after it must still be found, since they prove
+/// the damaged one was synced. The open refuses rather than discard them.
 #[test]
 fn a_mangled_length_field_with_a_tiling_remainder_refuses_rather_than_discarding() {
     let (files, wal) = fixture(8);
@@ -338,9 +338,9 @@ fn a_mangled_length_field_with_a_tiling_remainder_refuses_rather_than_discarding
 
     let err = reopen(&db, 8)
         .expect_err("a length that overruns the file with whole records after it must refuse");
-    println!("mangled length with tiling remainder refused: {err}");
+    println!("mangled length with records after it refused: {err}");
     assert!(
-        err.contains("whole record follows") || err.contains("corrupt"),
-        "the refusal must say why, got: {err}",
+        err.contains(&format!("damaged at offset {start}")),
+        "the refusal must say where, got: {err}",
     );
 }

@@ -34,11 +34,37 @@
 \* syncs, rotations, a clean close and a crash with recovery, against every
 \* crash state at every reachable state.
 \*
-\* THE ENGINE TODAY (format 1). Wal::append, Wal::sync_data and
-\* WalReplayIter (src/engine/wal.rs, wal_replay.rs): a whole record with a
-\* bad checksum is refused unless every byte after it is zero, and a record
-\* the file ends inside is a torn tail (E3). Plan 4.2 replaces that with the
-\* rule above; this model specifies it before the code.
+\* THE ENGINE (format 2, src/engine/wal.rs, wal_frame.rs, wal_replay.rs,
+\* recovery.rs).
+\*   AppendRecord   Wal::append_group: one record per commit group, its
+\*                  header carrying `synced_through`, the offset the last
+\*                  completed Wal::sync_data covered (record i's `st`).
+\*   Sync(k)        Wal::sync_data: `synced_through` moves, once the sync
+\*                  returns, to the offset it began at.
+\*   AppendClose    Wal::close: sync, append CLOSE, sync; the engine's
+\*                  close calls it, and nothing is appended after CLOSE.
+\*   Rotate         RegolithEngine::swap_wal (WalRotation.tla).
+\*   Crash          WalReplayIter reads P from every usable record
+\*                  (wal_frame::proof_past scans past the damage), refuses
+\*                  when O < P, and otherwise ends the log at O; recovery
+\*                  then truncates the log at O and syncs it
+\*                  (wal::truncate_durably) before the next log is created,
+\*                  and reports the drop.
+\* Format 1 logs written by 0.1.x are still read by the format 1 rule
+\* (RED Format1): a whole record with a bad checksum is refused unless
+\* every byte after it is zero, and a record the file ends inside is a
+\* torn tail.
+\*
+\* THE STAMP UNDER CHECKSUMS. The engine writes a log's stamp when it
+\* creates the log and makes it durable with the log's first sync, not
+\* with a sync of its own. A crash before that first sync (synced = 0
+\* here) can lose the stamp, and replay then keeps nothing of the log and
+\* reports every byte it held: the outcome of the crash state in which
+\* every record is unusable, which CrashStates holds whenever synced = 0.
+\* Every invariant below is checked against that outcome, so the model
+\* needs no state of its own for it. (With AEAD the stamp is sealed and
+\* synced at creation, RED StampNotSealed; the engine has no encryption
+\* at rest yet.)
 \*
 \* WHAT A CRASH LEAVES (the crash states, `CrashStates`).
 \*   - Under powersafe overwrite (D6: assumed, synced groups are not padded

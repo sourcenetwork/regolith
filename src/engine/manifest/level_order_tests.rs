@@ -43,6 +43,7 @@ fn table(
             largest_key: largest.to_vec(),
             file_size: 1,
             num_entries,
+            global_seq: None,
         },
         Arc::clone(reader),
     )

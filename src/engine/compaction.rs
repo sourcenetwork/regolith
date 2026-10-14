@@ -37,7 +37,10 @@ use crate::engine::compaction_backoff::FailureBackoff;
 use crate::engine::pending_outputs::PendingOutputs;
 use crate::env::{Env, JoinHandle};
 
+mod retire;
 mod stripes;
+
+use retire::Retirement;
 
 use stripes::Stripes;
 
@@ -1268,6 +1271,11 @@ fn perform_compaction_to(
     // list none the wiser: both would share a stripe and the older one, the
     // version that snapshot reads, would be dropped.
     let live = snapshots.live_seqs();
+    // Read with the inputs fixed too: the levels below the output can only
+    // gain a key of these inputs' ranges through this pass.
+    let version = versions.lock().current();
+    let retirement = Retirement::new(target_level, &version, live.first().copied());
+    let carried = retirement.carried_tombstones(&merged_range_tombstones);
 
     let CompactionOutputs {
         edits: new_file_edits,
@@ -1283,6 +1291,8 @@ fn perform_compaction_to(
         &overlap_files,
         &live,
         &merged_range_tombstones,
+        &carried,
+        &retirement,
     )?;
     edits.extend(new_file_edits);
 
@@ -1509,6 +1519,8 @@ fn stream_compaction_outputs(
     overlap_files: &[Arc<LiveSst>],
     live: &[u64],
     merged_range_tombstones: &RangeTombstoneSet,
+    carried_range_tombstones: &RangeTombstoneSet,
+    retirement: &Retirement<'_>,
 ) -> std::io::Result<CompactionOutputs> {
     let all_files: Vec<Arc<LiveSst>> = input_files
         .iter()
@@ -1531,12 +1543,14 @@ fn stream_compaction_outputs(
         streams.push(CompactionInputStream { iter });
     }
 
+    // Every tombstone of the inputs shadows the entries it covers; only
+    // those not retired are written out.
     let mut writer = StreamingCompactionWriter::new(
         versions,
         sst_dir,
         opts,
         target_level,
-        merged_range_tombstones,
+        carried_range_tombstones,
     );
     let stripes = Stripes::new(
         live,
@@ -1567,7 +1581,9 @@ fn stream_compaction_outputs(
             .as_deref()
             .is_some_and(|current| current != user_key)
         {
-            writer.add_group(&stripes.reduce_group(std::mem::take(&mut group)))?;
+            let mut reduced = stripes.reduce_group(std::mem::take(&mut group));
+            retirement.retire_deletion(&mut reduced);
+            writer.add_group(&reduced)?;
         }
         if current_user_key.as_deref() != Some(user_key) {
             current_user_key = Some(user_key.to_vec());
@@ -1580,7 +1596,9 @@ fn stream_compaction_outputs(
     }
 
     if current_user_key.is_some() {
-        writer.add_group(&stripes.reduce_group(group))?;
+        let mut reduced = stripes.reduce_group(group);
+        retirement.retire_deletion(&mut reduced);
+        writer.add_group(&reduced)?;
     }
 
     writer.finish()
@@ -1778,6 +1796,7 @@ impl<'a> StreamingCompactionWriter<'a> {
                 largest_key,
                 file_size,
                 num_entries,
+                global_seq: None,
             },
             reader,
         );
@@ -1877,6 +1896,7 @@ impl<'a> StreamingCompactionWriter<'a> {
                 largest_key: summary.largest_user_key,
                 file_size,
                 num_entries: summary.num_entries,
+                global_seq: None,
             },
             reader,
         );
@@ -2037,6 +2057,9 @@ fn delete_old_files(
         }
     }
 }
+
+#[cfg(test)]
+mod retire_tests;
 
 #[cfg(test)]
 mod tests {

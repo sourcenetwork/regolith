@@ -89,3 +89,7 @@ pub mod fault;
 
 /// A merge operator over values of three counters, with `touches`.
 pub mod parted;
+
+/// The format 2 write-ahead log layout, for tests that edit log bytes, and
+/// a listener that records the tails an open discards.
+pub mod wal_format;

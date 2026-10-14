@@ -19,6 +19,8 @@ use std::time::{Duration, Instant};
 use regolith::{Db, DurabilityMode, Options, RateLimiter};
 use tempfile::TempDir;
 
+mod common;
+
 fn opts() -> Options {
     Options::default().write_buffer_size(4 * 1024)
 }
@@ -294,34 +296,29 @@ fn vm_peak_kib() -> u64 {
 
 #[test]
 fn a_wal_claiming_a_huge_record_does_not_allocate_it() {
-    // The real record is captured while the database is still open: a
-    // clean close flushes the memtable and leaves the WAL empty, and this
-    // test needs a whole record to sit *after* the damage. That placement
-    // is what makes a bogus length corruption rather than the short
-    // trailing record every crash leaves behind, which replay is required
-    // to accept as the end of the log.
+    // The log is captured while the database is still open, with two
+    // synced records: the second proves the first durable, so a bogus
+    // length on the first is corruption rather than the short trailing
+    // record every crash leaves behind, which replay is required to
+    // accept as the end of the log.
     let dir = TempDir::new().unwrap();
-    let record = {
+    let (wal, mut bytes) = {
         let db = Db::open(dir.path(), opts().durability(DurabilityMode::Immediate)).unwrap();
         db.put(b"k", b"v").unwrap();
+        db.put(b"k2", b"v2").unwrap();
         let wal = files_with_ext(&dir.path().join("wal"), "log")
             .pop()
             .expect("a wal file");
         let bytes = fs::read(&wal).unwrap();
-        db.close().unwrap();
-        bytes
+        drop(db);
+        (wal, bytes)
     };
-    assert!(!record.is_empty(), "the put must have reached the WAL");
+    let first = common::wal_format::record_bounds(&bytes)[0];
 
-    let wal = files_with_ext(&dir.path().join("wal"), "log")
-        .pop()
-        .expect("a wal file");
-    // A record header claiming u32::MAX bytes of payload, with a whole
-    // record behind it: replay must reject it against the file size
-    // rather than reserving 4 GiB for it.
-    let mut bytes = u32::MAX.to_le_bytes().to_vec();
-    bytes.push(0x01);
-    bytes.extend_from_slice(&record);
+    // The first record's header claims u32::MAX bytes of payload, with a
+    // whole record behind it: replay must reject it without reserving
+    // 4 GiB for it.
+    bytes[first..first + 4].copy_from_slice(&u32::MAX.to_le_bytes());
     fs::write(&wal, &bytes).unwrap();
 
     let before = vm_peak_kib();

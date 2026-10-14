@@ -2,11 +2,16 @@
 //!
 //! Recovery reads the log one record at a time and hands each entry to
 //! the memtable before touching the next, so replay holds one record's
-//! payload rather than the whole log. The record framing, the checksum
-//! check and every error this produces are the same as the ones
-//! [`crate::engine::wal::Wal`] writes and the batch reader used before:
-//! this is a change of memory shape, not of format or of failure
-//! behaviour.
+//! payload rather than the whole log. The stamp says which framing the
+//! records use: format 2, which this build writes, or format 1, which
+//! 0.1.x wrote and which is still read by the rules it always was.
+//!
+//! The rule for format 2 is the one `proofs/tla/WalRecovery.tla` checks
+//! and `proofs/lean/Regolith/WalRecovery.lean` proves: at the first
+//! unusable record of the newest log, at O, refuse when a usable record
+//! anywhere in the file proves a byte past O synced (O < P), and
+//! otherwise end the log at O. Every unusable record is alike: torn,
+//! zeroed and garbled tails are one case, not three.
 
 use std::collections::VecDeque;
 use std::io::{self, BufReader};
@@ -19,12 +24,13 @@ use crate::env::{Env, ReadFile, ReadFileCursor};
 /// Where a WAL file sits in the recovery order.
 ///
 /// The torn-tail rule is only sound for the newest file. An earlier
-/// file was completed and closed before the rotation that created its
-/// successor, so no crash can leave a record in it half-written: a
-/// partial record there is media rot, and discarding it as a tail
-/// would drop acknowledged writes while still serving the records of
-/// every later file, leaving recovery on a state matching no prefix of
-/// the write history.
+/// file was synced whole before the rotation that created its successor
+/// (`proofs/tla/WalRotation.tla`), or truncated and synced by the recovery
+/// that created it, so no crash can leave a record in it half-written: a
+/// damaged record there is media rot, and discarding it as a tail would
+/// drop acknowledged writes while still serving the records of every
+/// later file, leaving recovery on a state matching no prefix of the
+/// write history.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum WalPosition {
     /// The file the database was writing to when it stopped.
@@ -36,18 +42,32 @@ pub(crate) enum WalPosition {
 use super::checksum;
 use super::wal::{
     RECORD_BATCH, RECORD_DELETE, RECORD_DELETE_RANGE, RECORD_MERGE, RECORD_PUT, TailVerdict,
-    WAL_STAMP_LEN, WalEntry, classify_incomplete_record, classify_unusable_record,
-    parse_batch_record, parse_delete_range_record, parse_delete_record, parse_merge_record,
-    parse_put_record, read_exact_or_truncated, read_wal_header,
+    WAL_STAMP_LEN, WalEntry, parse_delete_range_record, parse_delete_record, parse_merge_record,
+    parse_put_record, read_exact_or_truncated,
 };
+use super::wal_frame;
+use super::wal_v1::{
+    classify_incomplete_record, classify_unusable_record, parse_batch_record, read_wal_header,
+};
+
+/// How the records after the stamp are framed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Framing {
+    /// No stamp: a log a crash caught before anything in it was synced.
+    Unstamped,
+    /// 0.1.x logs: one checksummed record per write.
+    V1,
+    /// One record per commit group, each bound to this log's nonce.
+    V2 { nonce: u64 },
+}
 
 /// Reads a WAL file record by record.
 ///
 /// Peak live bytes are bounded by the largest single record in the
-/// file plus the entries decoded from it: a batch record yields its
-/// whole op list at once, every other record type yields exactly one
-/// entry. A commit never writes a record larger than one batch, so the
-/// bound is "one batch", not "one log".
+/// file plus the entries decoded from it. A format 2 group is decoded
+/// one operation at a time from its payload; a format 1 batch record
+/// yields its whole op list at once. A commit never writes a record
+/// larger than one group, so the bound is "one group", not "one log".
 pub(crate) struct WalReplayIter {
     reader: BufReader<ReadFileCursor<Box<dyn ReadFile>>>,
     path: PathBuf,
@@ -60,17 +80,25 @@ pub(crate) struct WalReplayIter {
     /// Reused record payload. Grows to the largest record seen and is
     /// not reallocated after that.
     payload: Vec<u8>,
-    /// Entries decoded from the current batch record, drained in order.
+    /// Where the next operation of the current format 2 group starts in
+    /// `payload`; at `payload.len()` the group is done.
+    group_at: usize,
+    /// Entries decoded from the current format 1 batch record, drained in
+    /// order.
     pending: VecDeque<WalEntry>,
     /// Set when the replay stopped short of the last byte and discarded
-    /// the rest as a crash artifact. Recovery reads it to tell a torn
-    /// tail in the newest WAL from damage earlier in the history.
+    /// the rest as a crash artifact. Recovery truncates the log there and
+    /// reports it.
     tail: Option<TailVerdict>,
     /// Whether the torn-tail rule applies to this file at all.
     position: WalPosition,
-    /// Kept for the whole life of the iterator: classifying a torn or
-    /// unusable tail re-reads the log, and that read has to reach the
-    /// same filesystem the records came from.
+    framing: Framing,
+    /// Whether a usable CLOSE was read. CLOSE proves the whole file
+    /// durable, so nothing may follow it.
+    closed: bool,
+    /// Kept for the whole life of the iterator: classifying a format 1
+    /// tail re-reads the log, and that read has to reach the same
+    /// filesystem the records came from.
     env: Arc<dyn Env>,
 }
 
@@ -97,48 +125,112 @@ impl WalReplayIter {
     /// same filesystem the database was written to, and for an OPFS
     /// database in a browser `std::fs` is not merely the wrong file,
     /// it reports `Unsupported` and no reopen can ever replay.
+    ///
+    /// A log with no stamp yields nothing. The newest such log is reported
+    /// as discarded whole when it holds any byte; an earlier one holding
+    /// anything but zeros is damage and refuses here.
     pub(crate) fn open(env: &Arc<dyn Env>, path: &Path, position: WalPosition) -> io::Result<Self> {
         let cursor = ReadFileCursor::new(env.open_read(path)?)?;
         let file_len = cursor.len();
         let mut reader = BufReader::new(cursor);
 
-        // Consume the stamp before any record is read. A log the stamp
-        // never reached reads back as empty; anything else that is not a
-        // valid stamp is refused here rather than parsed as records.
-        let mut head = [0u8; WAL_STAMP_LEN];
-        let stamped = match read_full(&mut reader, &mut head)? {
-            0 => None,
-            n => super::wal::validate_wal_stamp(&head[..n])?,
-        };
-        let consumed = stamped.unwrap_or(0) as u64;
-        // Nothing but a stamp-less empty log can leave records unread
-        // here, so an unstamped file yields no entries at all.
-        let file_len = if stamped.is_some() {
-            file_len
-        } else {
-            consumed
+        let mut stamp = [0u8; wal_frame::STAMP_LEN];
+        let head = read_full(&mut reader, &mut stamp[..WAL_STAMP_LEN])?;
+        let named = super::wal::validate_wal_stamp(&stamp[..head])
+            .map_err(|e| io::Error::new(e.kind(), format!("{}: {e}", path.display())))?;
+        let (framing, consumed) = match named {
+            None => (Framing::Unstamped, 0),
+            Some(2) => {
+                let rest = read_full(&mut reader, &mut stamp[WAL_STAMP_LEN..])?;
+                if WAL_STAMP_LEN + rest < wal_frame::STAMP_LEN {
+                    // A stamp torn by a crash while the log was created.
+                    (Framing::Unstamped, 0)
+                } else {
+                    let nonce = wal_frame::stamp_nonce(&stamp).map_err(|e| {
+                        io::Error::new(e.kind(), format!("{}: {e}", path.display()))
+                    })?;
+                    (Framing::V2 { nonce }, wal_frame::STAMP_LEN as u64)
+                }
+            }
+            Some(_) => (Framing::V1, WAL_STAMP_LEN as u64),
         };
 
-        Ok(Self {
+        let mut iter = Self {
             reader,
             path: path.to_path_buf(),
             file_len,
             consumed,
             payload: Vec::new(),
+            group_at: 0,
             pending: VecDeque::new(),
             tail: None,
             position,
+            framing,
+            closed: false,
             env: Arc::clone(env),
-        })
+        };
+        if framing == Framing::Unstamped {
+            iter.unstamped()?;
+        }
+        Ok(iter)
     }
 
-    /// The next entry, or `None` at a clean end of file.
+    /// Settle a log with no stamp: nothing in it was ever synced, unless
+    /// what is left of the stamp shows it was written whole and rotted
+    /// later, which refuses. The newest such log reports every byte it
+    /// held as discarded. An earlier one is the leftover of a crash at its
+    /// creation that a later recovery already replaced, and yields
+    /// nothing.
+    fn unstamped(&mut self) -> io::Result<()> {
+        if self.file_len == 0 {
+            return Ok(());
+        }
+        // A crash during creation leaves zeros or garbage, never a stamp
+        // whose checks pass with only its magic wrong, nor records that
+        // verify under its nonce.
+        let mut head = [0u8; wal_frame::STAMP_LEN + wal_frame::HEADER_LEN];
+        let n = (self.file_len as usize).min(head.len());
+        self.reader
+            .get_ref()
+            .file()
+            .read_exact_at(0, &mut head[..n])?;
+        if super::wal::stamp_was_written(&head[..n]) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "{}: the write-ahead log header is damaged",
+                    self.path.display()
+                ),
+            ));
+        }
+        if self.position == WalPosition::Newest {
+            self.tail = Some(TailVerdict {
+                offset: 0,
+                discarded_bytes: self.file_len,
+            });
+        }
+        // Nothing is read past the missing stamp.
+        self.file_len = 0;
+        Ok(())
+    }
+
+    /// The next entry, or `None` at the end of the log.
     ///
-    /// A truncated tail, a checksum mismatch or an unknown record type
-    /// is an error, exactly as it was for a whole-file replay.
+    /// The end of the log is the end of the file, or the first unusable
+    /// record of the newest log when nothing proves it synced; the
+    /// discard is then recorded for [`Self::discarded_tail`]. Damage that
+    /// held synced writes, and any damage in an earlier log, is an error.
     pub(crate) fn next_entry(&mut self) -> io::Result<Option<WalEntry>> {
+        match self.framing {
+            Framing::Unstamped => Ok(None),
+            Framing::V1 => self.next_v1_entry(),
+            Framing::V2 { nonce } => self.next_v2_entry(nonce),
+        }
+    }
+
+    fn next_v1_entry(&mut self) -> io::Result<Option<WalEntry>> {
         let record_start = self.consumed;
-        match self.next_entry_inner() {
+        match self.next_v1_entry_inner() {
             // A record the file ends inside is the ordinary shape of a
             // crash. Whether the tail is torn or is damage with whole
             // records behind it cannot be told from a streaming read, so
@@ -146,7 +238,7 @@ impl WalReplayIter {
             // whole-file replay uses.
             Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
                 if self.position == WalPosition::Earlier {
-                    return Err(self.damage_in_a_closed_file(record_start, "ends inside a record"));
+                    return Err(self.damage_in_a_closed_file(record_start));
                 }
                 self.tail = Some(classify_incomplete_record(
                     &*self.env,
@@ -161,9 +253,7 @@ impl WalReplayIter {
             // tail reads back.
             Err(e) if e.kind() == io::ErrorKind::InvalidData => {
                 if self.position == WalPosition::Earlier {
-                    return Err(
-                        self.damage_in_a_closed_file(record_start, "carries an unusable record")
-                    );
+                    return Err(self.damage_in_a_closed_file(record_start));
                 }
                 self.tail = Some(classify_unusable_record(
                     &*self.env,
@@ -176,14 +266,12 @@ impl WalReplayIter {
         }
     }
 
-    fn damage_in_a_closed_file(&self, record_start: u64, what: &str) -> io::Error {
+    fn damage_in_a_closed_file(&self, offset: u64) -> io::Error {
         io::Error::new(
             io::ErrorKind::InvalidData,
             format!(
-                "{} {what} at offset {record_start}, but a rotation already closed it, \
-                 so no crash could have left it partial. Discarding it as a tail would \
-                 drop acknowledged writes while later WAL files are still replayed, \
-                 leaving recovery on no prefix of the write history",
+                "write-ahead log {} is damaged at offset {offset}, and a newer log \
+                 follows it; refusing to open rather than lose the writes it held",
                 self.path.display()
             ),
         )
@@ -194,7 +282,100 @@ impl WalReplayIter {
         self.tail
     }
 
-    fn next_entry_inner(&mut self) -> io::Result<Option<WalEntry>> {
+    fn next_v2_entry(&mut self, nonce: u64) -> io::Result<Option<WalEntry>> {
+        loop {
+            if self.group_at < self.payload.len() {
+                let (entry, len) = wal_frame::decode_entry(&self.payload[self.group_at..])?;
+                self.group_at += len;
+                return Ok(Some(entry));
+            }
+            if self.consumed == self.file_len {
+                return Ok(None);
+            }
+            let record_start = self.consumed;
+            if self.closed || !self.read_v2_record(nonce)? {
+                return self.unusable_v2_record(nonce, record_start);
+            }
+        }
+    }
+
+    /// Read the format 2 record at `consumed`. `Ok(false)` when it is not
+    /// usable: the file ends inside it, a check fails, or its operations
+    /// do not parse. A group's operations are all checked here, before
+    /// any is yielded, so a group is replayed whole or not at all.
+    fn read_v2_record(&mut self, nonce: u64) -> io::Result<bool> {
+        let offset = self.consumed;
+        let remaining = self.file_len - offset;
+        if remaining < wal_frame::HEADER_LEN as u64 {
+            return Ok(false);
+        }
+        let mut bytes = [0u8; wal_frame::HEADER_LEN];
+        read_exact_or_truncated(&mut self.reader, &mut bytes, "truncated WAL record header")?;
+        let Some(header) = wal_frame::decode_header(&bytes, nonce, offset) else {
+            return Ok(false);
+        };
+        // Checked before anything is sized from the length, so a header
+        // that verified but runs past the file cannot ask for a buffer
+        // the file could not fill.
+        if header.record_len() > remaining {
+            return Ok(false);
+        }
+        self.payload.clear();
+        self.payload.resize(header.len as usize, 0);
+        read_exact_or_truncated(&mut self.reader, &mut self.payload, "truncated WAL record")?;
+        if !header.payload_matches(&self.payload) || !wal_frame::entries_are_whole(&self.payload) {
+            self.payload.clear();
+            return Ok(false);
+        }
+        self.consumed += header.record_len();
+        self.group_at = 0;
+        self.closed = header.kind == wal_frame::KIND_CLOSE;
+        Ok(true)
+    }
+
+    /// The format 2 record at `offset` is not usable. In an earlier log
+    /// that is damage. In the newest it ends the log, unless a usable
+    /// record proves a byte past `offset` synced.
+    fn unusable_v2_record(&mut self, nonce: u64, offset: u64) -> io::Result<Option<WalEntry>> {
+        self.payload.clear();
+        self.group_at = 0;
+        if self.position == WalPosition::Earlier {
+            return Err(self.damage_in_a_closed_file(offset));
+        }
+        // Every record read before `offset` claims no more than its own
+        // offset, so only a CLOSE among them, or a record after `offset`,
+        // can prove the damage synced.
+        let proof = if self.closed {
+            Some(self.file_len)
+        } else {
+            wal_frame::proof_past(
+                self.reader.get_ref().file(),
+                nonce,
+                offset + 1,
+                self.file_len,
+                offset,
+            )?
+        };
+        if let Some(synced) = proof {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "write-ahead log {} is damaged at offset {offset}, but offsets up to \
+                     {synced} were already made durable; refusing to open rather than \
+                     lose acknowledged writes",
+                    self.path.display()
+                ),
+            ));
+        }
+        self.tail = Some(TailVerdict {
+            offset,
+            discarded_bytes: self.file_len - offset,
+        });
+        self.consumed = self.file_len;
+        Ok(None)
+    }
+
+    fn next_v1_entry_inner(&mut self) -> io::Result<Option<WalEntry>> {
         loop {
             if let Some(entry) = self.pending.pop_front() {
                 return Ok(Some(entry));
@@ -310,7 +491,7 @@ mod tests {
             wal.append_merge(b"c", b"op", 3).unwrap();
             wal.append_delete_range(b"d", b"e", 4).unwrap();
             let mut group = Vec::new();
-            crate::engine::wal::encode_ops_batch_record(
+            crate::engine::wal::encode_ops_record(
                 &mut group,
                 &[
                     WriteBatchOp::Put {
@@ -414,32 +595,51 @@ mod tests {
         );
     }
 
+    /// A checksum mismatch in a record a later record proves synced is an
+    /// error; the same damage in the last record, which nothing vouches
+    /// for, is a tail.
     #[test]
-    fn checksum_mismatch_is_an_error() {
+    fn checksum_mismatch_below_a_later_proof_is_an_error() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("corrupt.wal");
         {
             let mut wal = Wal::create(&path).unwrap();
             wal.append_put(b"a", b"1", 1).unwrap();
             wal.sync_data().unwrap();
+            wal.append_put(b"b", b"2", 2).unwrap();
+            wal.sync_data().unwrap();
         }
-        let mut bytes = std::fs::read(&path).unwrap();
-        let last = bytes.len() - 1;
-        bytes[last] ^= 0xFF;
+        let clean = std::fs::read(&path).unwrap();
+        let mut bytes = clean.clone();
+        // The first record's last payload byte.
+        let first_end = crate::engine::wal_frame::STAMP_LEN
+            + crate::engine::wal_frame::HEADER_LEN
+            + crate::engine::wal::put_record_len(b"a", b"1");
+        bytes[first_end - 1] ^= 0xFF;
         std::fs::write(&path, &bytes).unwrap();
-
         let mut iter =
             WalReplayIter::open(&crate::env::std_env(), &path, WalPosition::Newest).unwrap();
         let err = iter.next_entry().expect_err("checksum must not pass");
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+
+        let mut bytes = clean;
+        let last = bytes.len() - 1;
+        bytes[last] ^= 0xFF;
+        std::fs::write(&path, &bytes).unwrap();
+        let mut iter =
+            WalReplayIter::open(&crate::env::std_env(), &path, WalPosition::Newest).unwrap();
+        assert!(iter.next_entry().unwrap().is_some());
+        assert!(iter.next_entry().unwrap().is_none());
+        assert_eq!(iter.discarded_tail().unwrap().offset, first_end as u64);
     }
 
     #[test]
     fn oversized_length_header_is_rejected_without_allocating() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("bad-len.wal");
-        // 4-byte length claiming 3 GiB, then nothing.
-        let mut bytes = (3u32 * 1024 * 1024 * 1024).to_le_bytes().to_vec();
+        // A format 1 record header claiming 3 GiB, then nothing.
+        let mut bytes = crate::engine::wal_v1::stamp().to_vec();
+        bytes.extend_from_slice(&(3u32 * 1024 * 1024 * 1024).to_le_bytes());
         bytes.push(RECORD_PUT);
         std::fs::write(&path, &bytes).unwrap();
 

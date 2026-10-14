@@ -5,7 +5,9 @@
 use std::ops::ControlFlow;
 
 use super::super::MergeChain;
-use super::{DbSlice, LookupKey, MemTable, NodeRef, VALUE_TYPE_MERGE, decode_internal_key};
+use super::{
+    DbSlice, LookupKey, MemTable, NodeRef, Ordering, VALUE_TYPE_MERGE, decode_internal_key,
+};
 
 /// Visits one entry of a key in a memtable: its node, sequence and value type.
 pub(crate) trait VisitNode<'mem, R>:
@@ -116,6 +118,26 @@ impl MemTable {
             node = current.next();
         }
         None
+    }
+
+    /// Whether this memtable holds an entry whose user key lies in
+    /// `[first, last]`, or a range tombstone reaching into it, at any
+    /// sequence. One seek; the tombstones are read only when there are any.
+    pub(crate) fn holds_key_in(&self, first: &[u8], last: &[u8]) -> bool {
+        let start = LookupKey::from_prefixed(first, u64::MAX);
+        if self
+            .list
+            .seek_ge(start.internal())
+            .is_some_and(|node| decode_internal_key(node.key()).0 <= last)
+        {
+            return true;
+        }
+        self.range_tombstone_bytes.load(Ordering::Acquire) != 0
+            && self
+                .range_tombstones
+                .lock()
+                .iter()
+                .any(|rt| rt.start.as_slice() <= last && first < rt.end.as_slice())
     }
 
     /// Visits `lk`'s entries newest first among those at or below the lookup's

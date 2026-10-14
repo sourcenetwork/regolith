@@ -305,6 +305,17 @@ Either way, recovery reaches a **valid prefix** of the write history: some numbe
 writes applied, in order, no gaps, no half-applied batch. A `WriteBatch` is atomic under
 both modes.
 
+Every log record carries the offset the last completed sync made durable. A power cut can
+leave the end of the newest log torn, zeroed or garbled; recovery drops what no sync
+covered, truncates it, and reports it (a warn line, the `regolith.wal.tail_discarded`
+tickers and `EventListener::on_wal_tail_discarded`). Damage to bytes a surviving record
+proves were synced refuses the open instead. Rot inside the last synced group of a crashed
+log cannot be told from a torn write, so it is dropped the same way: reported, never
+silent.
+
+A database written by 0.1.x opens, and the open rewrites its log in format 2, which 0.1.x
+refuses to open: the upgrade is one-way.
+
 ## Platforms
 
 | Target | Status |

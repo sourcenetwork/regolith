@@ -11,7 +11,7 @@ Early-stage. The public API (`Db`, `Snapshot`, `WriteBatch`, `Options`) is small
 - **Pure Rust, no FFI**: no C/C++ toolchain, no `bindgen`, no linker surprises in the library or checked-in workspace tools
 - **LSM-tree**: write-optimized with level-based background compaction
 - **MVCC**: point-in-time consistent reads via global sequence numbers
-- **Crash recovery**: WAL with xxhash-checksummed records
+- **Crash recovery**: WAL whose records carry the offset the last sync made durable, so replay tells a crash from damage
 - **Concurrent reads**: an arena-backed skip list memtable (`src/engine/skiplist/`) that readers walk without a lock until a range delete lands in it; a block-cache hit is lock-free
 - **No async runtime required**: compaction runs on background worker threads (`Options::max_background_compactions`), or inline on a target that has none
 
@@ -103,9 +103,10 @@ src/
     ├── skiplist/       # Insert-only concurrent skip list over the arena
     ├── sstable.rs      # SSTable reader/writer, footer, index block
     ├── sstable/        # SSTable key walks and size limits
-    ├── wal.rs          # Write-ahead log: append, replay discriminator, checksummed records
-    ├── wal_replay.rs   # Streaming reader over one WAL file
-    ├── recovery.rs     # Rebuilding the memtable from the WALs at open
+    ├── wal.rs          # Write-ahead log writer (format 2), CLOSE, format 1 reading rules
+    ├── wal_frame.rs    # WAL format 2: stamp, group record frame, the scan past damage
+    ├── wal_replay.rs   # Streaming reader over one WAL file: the O < P rule
+    ├── recovery.rs     # Replaying the WALs at open, the dropped-tail report, the rewrite
     ├── arena.rs        # Bump allocator for one memtable
     ├── block.rs        # Data blocks: prefix compression, restart points, varint
     ├── block_cache.rs  # Sharded CLOCK cache for decompressed SSTable blocks

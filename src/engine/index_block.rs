@@ -22,7 +22,7 @@
 use std::io;
 
 use super::block::BlockHandle;
-use super::internal_key::compare_internal_keys;
+use super::internal_key::{compare_internal_keys, compare_internal_split};
 
 /// One index entry: where its key lives inside the blob, and the data
 /// block (or leaf) it points at.
@@ -128,6 +128,12 @@ impl IndexBlock {
         self.partition_point(target)
     }
 
+    /// [`IndexBlock::seek`] for the internal key `user_key || trailer`,
+    /// without concatenating it.
+    pub(crate) fn seek_split(&self, user_key: &[u8], trailer: &[u8]) -> usize {
+        self.partition_by(|key| compare_internal_split(key, user_key, trailer).is_lt())
+    }
+
     /// Sum of the handle sizes of every entry whose key falls between
     /// the two probes, clamped to the last entry so a `hi` past the end
     /// still charges the final block.
@@ -158,14 +164,18 @@ impl IndexBlock {
     }
 
     fn partition_point(&self, target: &[u8]) -> usize {
+        self.partition_by(|key| compare_internal_keys(key, target).is_lt())
+    }
+
+    /// Index of the first entry whose key `below` rejects.
+    fn partition_by(&self, mut below: impl FnMut(&[u8]) -> bool) -> usize {
         self.slots.partition_point(|slot| {
             let start = slot.key_offset as usize;
             let end = start + slot.key_len as usize;
             // The slot table is built from `blob` in `decode`, so this
             // range is always in bounds; an empty fallback keeps the
             // comparison total rather than panicking if it ever is not.
-            let key = self.blob.get(start..end).unwrap_or(&[]);
-            compare_internal_keys(key, target).is_lt()
+            below(self.blob.get(start..end).unwrap_or(&[]))
         })
     }
 }

@@ -17,12 +17,14 @@ use std::fs::{self, OpenOptions};
 use std::io;
 use std::path::{Path, PathBuf};
 
-use regolith::{Db, Error, Options};
+use std::sync::Arc;
+
+use regolith::{Db, DurabilityMode, Error, Options, Statistics, Ticker};
 use tempfile::TempDir;
 
 mod common;
 
-use common::{count_sst_files, count_wal_files, force_compaction, open};
+use common::{count_sst_files, count_wal_files, force_compaction, open, wal_format};
 
 // ── helpers ─────────────────────────────────────────────────────
 
@@ -73,28 +75,73 @@ fn assert_open_fails_with_kind(dir: &TempDir, expected: io::ErrorKind) {
 
 // ── WAL tail corruption ─────────────────────────────────────────
 
+/// Options that report what an open discards.
+fn reporting_opts(reports: &Arc<wal_format::TailReports>) -> (Options, Arc<Statistics>) {
+    let stats = Arc::new(Statistics::new());
+    let opts = common::small_opts()
+        .listeners(vec![reports.clone() as Arc<dyn regolith::EventListener>])
+        .statistics(Some(Arc::clone(&stats)));
+    (opts, stats)
+}
+
 #[test]
-fn torn_wal_tail_checksum_flip_fails_open_and_keeps_wal() {
-    // A checksum mismatch means replay cannot prove which committed
-    // records are safe. Open must fail closed and leave the WAL for
-    // repair/inspection rather than silently keeping only a prefix.
+fn damage_a_later_record_proves_synced_fails_open_and_keeps_wal() {
+    // Under Immediate durability each record carries the offset the sync
+    // before it covered, so the second record proves the first durable.
+    // Damage to the first is then loss of an acknowledged write: open
+    // must fail closed and leave the log for repair or inspection.
     let dir = TempDir::new().unwrap();
     {
-        let db = open(&dir);
+        let db = Db::open(
+            dir.path(),
+            common::small_opts().durability(DurabilityMode::Immediate),
+        )
+        .unwrap();
         db.put(b"good_1", b"1").unwrap();
         db.put(b"good_2", b"2").unwrap();
     }
 
     let wal = first_wal(dir.path());
     let wal_count = count_wal_files(dir.path());
-    let size = fs::metadata(&wal).unwrap().len() as usize;
-    // Flip the last byte of the file - always part of the trailing
-    // record's 4-byte checksum.
-    flip_byte(&wal, size - 1);
+    let bounds = wal_format::record_bounds(&fs::read(&wal).unwrap());
+    flip_byte(&wal, bounds[1] - 1);
 
     assert_open_fails_with_kind(&dir, io::ErrorKind::InvalidData);
     assert!(wal.exists());
     assert_eq!(count_wal_files(dir.path()), wal_count);
+}
+
+#[test]
+fn a_damaged_final_record_nothing_proves_synced_is_dropped_and_reported() {
+    // Nothing after the last record vouches for it, so a crash was free
+    // to leave it in any state: the open keeps every record before it,
+    // drops it, and says so.
+    let dir = TempDir::new().unwrap();
+    {
+        let db = open(&dir);
+        db.put(b"good_1", b"1").unwrap();
+        db.put(b"good_2", b"2").unwrap();
+    }
+    let wal = first_wal(dir.path());
+    let bytes = fs::read(&wal).unwrap();
+    let bounds = wal_format::record_bounds(&bytes);
+    flip_byte(&wal, bytes.len() - 1);
+
+    let reports = wal_format::TailReports::new();
+    let (opts, stats) = reporting_opts(&reports);
+    let db = Db::open(dir.path(), opts).unwrap();
+    assert_eq!(db.get(b"good_1").unwrap(), Some(b"1".to_vec()));
+    assert_eq!(db.get(b"good_2").unwrap(), None);
+    let taken = reports.taken();
+    assert_eq!(taken.len(), 1);
+    assert_eq!(taken[0].file_path, wal);
+    assert_eq!(taken[0].offset, bounds[1] as u64);
+    assert_eq!(taken[0].discarded_bytes, (bytes.len() - bounds[1]) as u64);
+    assert_eq!(stats.get_ticker(Ticker::WalTailDiscarded), 1);
+    assert_eq!(
+        stats.get_ticker(Ticker::WalTailDiscardedBytes),
+        taken[0].discarded_bytes
+    );
 }
 
 #[test]
@@ -115,16 +162,7 @@ fn wal_truncated_at_arbitrary_offset_replays_the_whole_records_before_the_cut() 
         let wal = first_wal(dir.path());
         let wal_count = count_wal_files(dir.path());
         let full = fs::read(&wal).unwrap();
-        // `[stamp: 12][len: u32 LE][type: u8][payload][crc: u32 LE]`,
-        // so this is where the first record ends. The length is read
-        // after the stamp, not at byte zero: reading it at zero takes
-        // four bytes of the REGO stamp as a length and lands the cut
-        // somewhere arbitrary. Matches `WAL_STAMP_LEN` in
-        // `src/engine/wal.rs`.
-        const STAMP: u64 = 12;
-        let len =
-            u32::from_le_bytes(full[STAMP as usize..STAMP as usize + 4].try_into().unwrap()) as u64;
-        let first_end = STAMP + 9 + len;
+        let first_end = wal_format::record_bounds(&full)[1] as u64;
         let cut = full.len() as u64 - trim;
         assert!(
             cut > first_end && cut < full.len() as u64,
@@ -142,19 +180,23 @@ fn wal_truncated_at_arbitrary_offset_replays_the_whole_records_before_the_cut() 
 }
 
 #[test]
-fn wal_checksum_flip_in_final_record_fails_open() {
-    // Flipping a checksum byte in the last record is still a
-    // corruption signal. Do not convert it into a clean stop.
+fn wal_checksum_flip_in_final_record_of_a_closed_log_fails_open() {
+    // A clean close syncs every record and then appends CLOSE, which
+    // proves the whole log durable. Damage to the final record is then
+    // corruption, not a crash: do not convert it into a clean stop.
     let dir = TempDir::new().unwrap();
     {
         let db = open(&dir);
         db.put(b"first", b"v1").unwrap();
         db.put(b"second", b"v2").unwrap();
+        db.close().unwrap();
     }
     let wal = first_wal(dir.path());
-    let size = fs::metadata(&wal).unwrap().len() as usize;
-    // Flip the very last byte (high byte of the trailing checksum).
-    flip_byte(&wal, size - 1);
+    let bytes = fs::read(&wal).unwrap();
+    let bounds = wal_format::record_bounds(&bytes);
+    let close = bounds[bounds.len() - 2];
+    assert_eq!(wal_format::kind_at(&bytes, close), wal_format::KIND_CLOSE);
+    flip_byte(&wal, close - 1);
 
     assert_open_fails_with_kind(&dir, io::ErrorKind::InvalidData);
     assert!(wal.exists());

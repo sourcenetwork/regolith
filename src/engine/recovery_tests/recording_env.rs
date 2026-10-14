@@ -9,15 +9,20 @@ use std::{
 };
 
 #[derive(Debug, Default)]
-pub(super) struct Recording {
+pub(crate) struct Recording {
+    /// Every host write to a log, one entry per call, a vectored write as
+    /// one.
     pub writes: Vec<Vec<u8>>,
     pub data_syncs: usize,
     pub fail_on_write: Option<usize>,
     pub partial_failures: usize,
+    /// Writes and syncs in the order they happened: `write <len>` and
+    /// `sync`.
+    pub log: Vec<String>,
 }
 
 #[derive(Debug, Default)]
-pub(super) struct RecordingEnv {
+pub(crate) struct RecordingEnv {
     inner: StdEnv,
     pub events: Arc<Mutex<Recording>>,
 }
@@ -31,6 +36,7 @@ impl WriteFile for RecordingWrite {
     fn write_all(&mut self, bytes: &[u8]) -> io::Result<()> {
         let mut events = self.events.lock().unwrap();
         events.writes.push(bytes.to_vec());
+        events.log.push(format!("write {}", bytes.len()));
         if events.fail_on_write == Some(events.writes.len()) {
             events.fail_on_write = None;
             events.partial_failures += 1;
@@ -42,6 +48,11 @@ impl WriteFile for RecordingWrite {
         self.inner.write_all(bytes)
     }
 
+    /// One recorded write, as the host sees one `writev`.
+    fn write_all_vectored(&mut self, slices: &[&[u8]]) -> io::Result<()> {
+        self.write_all(&slices.concat())
+    }
+
     fn flush(&mut self) -> io::Result<()> {
         self.inner.flush()
     }
@@ -51,7 +62,10 @@ impl WriteFile for RecordingWrite {
     }
 
     fn sync_data(&mut self) -> io::Result<()> {
-        self.events.lock().unwrap().data_syncs += 1;
+        let mut events = self.events.lock().unwrap();
+        events.data_syncs += 1;
+        events.log.push("sync".to_string());
+        drop(events);
         self.inner.sync_data()
     }
 

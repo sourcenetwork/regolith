@@ -584,11 +584,10 @@ pub fn watch(label: &'static str, body: impl FnOnce(&AtomicU64) + Send + 'static
 
 // ─── on-disk shapes ─────────────────────────────────────────────────────
 
-/// One framed record. The WAL writes `[len: u32 LE][type: u8][payload]
-/// [crc: u32 LE]` and the MANIFEST writes `[len: u32 LE][edits]
-/// [crc: u32 LE]`; see `src/engine/wal.rs` and `src/engine/manifest.rs`.
-/// Knowing the frames is what lets these tests say *where* a cut landed
-/// instead of only that it did.
+/// One framed record. The WAL frames are format 2 group records, read with
+/// `common::wal_format`; the MANIFEST writes `[len: u32 LE][edits]
+/// [crc: u32 LE]` (`src/engine/manifest.rs`). Knowing the frames is what
+/// lets these tests say *where* a cut landed instead of only that it did.
 #[derive(Clone, Copy, Debug)]
 pub struct Frame {
     pub start: u64,
@@ -597,12 +596,13 @@ pub struct Frame {
     pub kind: u8,
 }
 
-/// Both the WAL and the MANIFEST open with a 12-byte format stamp, so
-/// records start there rather than at byte zero. Matches
-/// `WAL_STAMP_LEN` and `MANIFEST_STAMP_LEN`.
+/// The MANIFEST opens with a 12-byte format stamp, so records start there
+/// rather than at byte zero. Matches `MANIFEST_STAMP_LEN`.
 pub const STAMP: usize = 12;
 
 fn frames(bytes: &[u8], header: usize) -> Vec<Frame> {
+    // Only the MANIFEST is framed this way now.
+    debug_assert_eq!(header, 4);
     let mut out = Vec::new();
     let mut pos = STAMP;
     while pos + header < bytes.len() {
@@ -626,16 +626,18 @@ fn frames(bytes: &[u8], header: usize) -> Vec<Frame> {
     out
 }
 
-/// WAL frames, with a header of `[len: u32][type: u8]`.
+/// WAL frames: format 2 records, one per commit group.
 #[cfg(target_os = "linux")]
 pub fn wal_frames(bytes: &[u8]) -> Vec<Frame> {
-    let f = frames(bytes, 5);
+    let f: Vec<Frame> = crate::common::wal_format::record_bounds(bytes)
+        .windows(2)
+        .map(|w| Frame {
+            start: w[0] as u64,
+            end: w[1] as u64,
+            kind: crate::common::wal_format::kind_at(bytes, w[0]),
+        })
+        .collect();
     assert!(!f.is_empty(), "the WAL fixture parsed as zero records");
-    assert_eq!(
-        f.last().expect("non-empty").end,
-        bytes.len() as u64,
-        "WAL frames must tile the file exactly; the on-disk format changed",
-    );
     f
 }
 

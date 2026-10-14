@@ -327,6 +327,7 @@ mod tests {
             largest_key: summary.largest_user_key,
             file_size: 0,
             num_entries: summary.num_entries,
+            global_seq: None,
         };
         LiveSst::new(meta, Arc::new(SsTableReader::open(&path, file_id).unwrap()))
     }

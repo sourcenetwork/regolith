@@ -10,10 +10,15 @@
 //! `RESTART_INTERVAL` entries we reset `shared = 0` and record the entry's byte
 //! offset as a restart point, enabling binary search within the block.
 
+use std::cmp::Ordering;
 use std::io;
 use std::ops::ControlFlow;
 
-use super::internal_key::{INTERNAL_KEY_SUFFIX_LEN, compare_internal_keys};
+use super::internal_key::INTERNAL_KEY_SUFFIX_LEN;
+#[cfg(test)]
+use super::internal_key::compare_internal_keys;
+
+mod stamp;
 
 /// Entries per restart point. Smaller = faster lookups, larger = better compression.
 pub(crate) const RESTART_INTERVAL: usize = 16;
@@ -30,6 +35,9 @@ pub(crate) struct Block {
     data: Vec<u8>,
     restarts: Vec<u32>,
     entries_end: usize,
+    /// For a block of an ingested table, the `!seq` bytes every entry's key
+    /// reads with in place of the ones it stores (see the `stamp` module).
+    stamp: Option<[u8; 8]>,
 }
 
 impl Block {
@@ -93,7 +101,51 @@ impl Block {
             data,
             restarts,
             entries_end,
+            stamp: None,
         })
+    }
+
+    /// This block, every entry of it reading at `seq` whatever sequence
+    /// its key stores: a block of an ingested table. Its entries must hold
+    /// at most one key each, which the ingest checks.
+    pub(crate) fn stamped(mut self, seq: u64) -> Self {
+        self.stamp = Some((!seq).to_be_bytes());
+        self
+    }
+
+    /// The stamp its entries read with, for a block of an ingested table.
+    pub(crate) fn stamp(&self) -> Option<[u8; 8]> {
+        self.stamp
+    }
+
+    /// How `key`, an entry of this block as stored, orders against
+    /// `target` as this block reads it.
+    #[inline]
+    pub(crate) fn compare_entry(&self, key: &[u8], target: &[u8]) -> Ordering {
+        stamp::compare(key, self.stamp, target)
+    }
+
+    /// `key`, an entry of this block as stored, as an owned copy a reader
+    /// sees.
+    pub(crate) fn owned_key(&self, key: &[u8]) -> Vec<u8> {
+        let mut owned = key.to_vec();
+        if let Some(stamp) = self.stamp {
+            stamp::swap(&mut owned, stamp);
+        }
+        owned
+    }
+
+    /// `key`, an entry of this block as stored, as a reader sees it: the
+    /// stored key itself, or for a stamped block a copy in `out` that
+    /// carries the stamp.
+    pub(crate) fn read_key<'a>(&self, key: &'a [u8], out: &'a mut Vec<u8>) -> &'a [u8] {
+        match self.stamp {
+            Some(stamp) => {
+                stamp::read_into(key, stamp, out);
+                out
+            }
+            None => key,
+        }
     }
 
     /// Approximate heap bytes held by this block. Used by the
@@ -145,11 +197,28 @@ impl Block {
     ///
     /// The closure receives `(key, value_offset, value_len)` rather than
     /// a value slice so it can build an owning view over the whole block
-    /// (see [`crate::DbSlice`]) without holding a borrow of it.
-    pub(crate) fn scan_from<F, R>(
+    /// (see [`crate::DbSlice`]) without holding a borrow of it. A stamped
+    /// block hands it each key with the stamp, put in place for the call and
+    /// taken out before the next key is reconstructed from it.
+    pub(crate) fn scan_from<F, R>(&self, target: &[u8], key_buf: &mut Vec<u8>, f: F) -> Option<R>
+    where
+        F: FnMut(&[u8], usize, usize) -> ControlFlow<R>,
+    {
+        // Decided once per scan, so a block of a table regolith wrote walks
+        // exactly as it would with no stamps in the engine at all.
+        match self.stamp {
+            None => self.walk_from::<false, F, R>(target, key_buf, [0; 8], f),
+            Some(stamp) => self.walk_from::<true, F, R>(target, key_buf, stamp, f),
+        }
+    }
+
+    /// [`Block::scan_from`], with `STAMPED` saying whether `stamp` applies.
+    #[inline(always)]
+    fn walk_from<const STAMPED: bool, F, R>(
         &self,
         target: &[u8],
         key_buf: &mut Vec<u8>,
+        stamp: [u8; 8],
         mut f: F,
     ) -> Option<R>
     where
@@ -165,14 +234,22 @@ impl Block {
             let (consumed, value_offset, value_len) = decode_entry_at(data, pos, key_buf);
             pos += consumed;
             if below_target {
-                if compare_internal_keys(key_buf, target).is_lt() {
+                if stamp::compare(key_buf, STAMPED.then_some(stamp), target).is_lt() {
                     continue;
                 }
                 below_target = false;
             }
+            if !STAMPED {
+                if let ControlFlow::Break(result) = f(key_buf, value_offset, value_len) {
+                    return Some(result);
+                }
+                continue;
+            }
+            let stored = stamp::swap(key_buf, stamp);
             if let ControlFlow::Break(result) = f(key_buf, value_offset, value_len) {
                 return Some(result);
             }
+            stamp::swap(key_buf, stored);
         }
         None
     }
@@ -214,6 +291,7 @@ impl Block {
         if data.is_empty() {
             return 0;
         }
+        let stamp = self.stamp;
         let mut left = 0;
         let mut right = self.restarts.len();
         while left < right {
@@ -226,7 +304,7 @@ impl Block {
             // probe needs no reconstruction buffer.
             debug_assert_eq!(header.shared, 0);
             let key = &data[header.key_offset..header.key_offset + header.unshared];
-            if compare_internal_keys(key, target).is_lt() {
+            if stamp::compare(key, stamp, target).is_lt() {
                 left = mid + 1;
             } else {
                 right = mid;

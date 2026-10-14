@@ -321,14 +321,20 @@ struct MemWriteFile {
 
 impl WriteFile for MemWriteFile {
     fn write_all(&mut self, buf: &[u8]) -> io::Result<()> {
+        self.write_all_vectored(&[buf])
+    }
+
+    /// One lock and one reservation for every slice.
+    fn write_all_vectored(&mut self, slices: &[&[u8]]) -> io::Result<()> {
+        let len = slices.iter().map(|s| s.len()).sum::<usize>();
         let mut data = self.data.lock();
-        data.try_reserve(buf.len()).map_err(|_| {
+        data.try_reserve(len).map_err(|_| {
             io::Error::new(
                 io::ErrorKind::OutOfMemory,
-                format!("cannot grow a MemEnv file by {} bytes", buf.len()),
+                format!("cannot grow a MemEnv file by {len} bytes"),
             )
         })?;
-        data.extend_from_slice(buf);
+        slices.iter().for_each(|s| data.extend_from_slice(s));
         Ok(())
     }
 

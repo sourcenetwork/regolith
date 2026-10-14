@@ -1,9 +1,10 @@
 //! Adversarial probes for the WAL torn-tail rule (the torn-tail rule).
 //!
-//! The rule under test: an incomplete *trailing* record is the ordinary
-//! shape of a crash and must be discarded, keeping every whole record
-//! before it; anything else wrong with the log is corruption and must be
-//! an error rather than a silent truncation.
+//! The rule under test: a damaged record that nothing after it proves
+//! synced is the ordinary shape of a crash and must be discarded, keeping
+//! every whole record before it, and reported; damage a later record
+//! proves synced is corruption and must be an error rather than a silent
+//! truncation.
 //!
 //! The fixture is richer than the one in `tests/corruption_exhaustive`:
 //! it mixes single puts, deletes, range deletes, merges and multi-op
@@ -18,8 +19,14 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use std::sync::Arc;
+
 use regolith::{Db, Options, WriteBatch, WriteOptions};
 use tempfile::TempDir;
+
+mod common;
+
+use common::wal_format;
 
 /// One write the fixture performed, in order.
 #[derive(Clone, Debug)]
@@ -237,26 +244,14 @@ fn overwrite(path: &Path, offset: usize, patch: &[u8]) {
     fs::write(path, &bytes).expect("write");
 }
 
-/// Record boundaries in a WAL, derived from the on-disk framing.
+/// Record boundaries in a WAL, derived from the on-disk framing as
+/// `common::wal_format` reads it.
 fn frames(bytes: &[u8]) -> Vec<(usize, usize)> {
-    let mut out = Vec::new();
-    let mut pos = STAMP;
-    while pos + 5 <= bytes.len() {
-        let len = u32::from_le_bytes([bytes[pos], bytes[pos + 1], bytes[pos + 2], bytes[pos + 3]])
-            as usize;
-        let end = pos + 5 + len + 4;
-        if end > bytes.len() {
-            break;
-        }
-        out.push((pos, end));
-        pos = end;
-    }
-    out
+    wal_format::record_bounds(bytes)
+        .windows(2)
+        .map(|w| (w[0], w[1]))
+        .collect()
 }
-
-/// Matches `WAL_STAMP_LEN` in `src/engine/wal.rs`. Records begin after
-/// the format stamp, not at byte zero.
-const STAMP: usize = 12;
 
 // --- the attacks -------------------------------------------------------
 
@@ -381,7 +376,7 @@ fn a_mid_log_length_inflated_past_the_file_is_refused() {
     let mut bad = Vec::new();
     let mut trials = 0usize;
     for &(start, end) in &fr[..fr.len() - 1] {
-        let real = (end - start - 9) as u32;
+        let real = (end - start - wal_format::HEADER_LEN) as u32;
         for extra in [1u32, 3, 9, 64, 4096, 1 << 20, u32::MAX - real] {
             trials += 1;
             let claimed = real + extra;
@@ -404,11 +399,14 @@ fn a_mid_log_length_inflated_past_the_file_is_refused() {
     assert!(bad.is_empty(), "{}", bad.join("\n  "));
 }
 
-/// A flipped checksum on the *last* record is a whole record that fails
-/// its checksum, not a torn tail: every byte it promised is present and
-/// they are wrong. Replay must refuse.
+/// A flip anywhere in the *last* record, with nothing after it to prove
+/// that record was synced, cannot be told from the record a crash tore:
+/// the open keeps every record before it and reports the drop. Under the
+/// fixture's `Immediate` durability this is the residual case the format
+/// accepts rather than padding every synced group to whole sectors, and
+/// it is never silent.
 #[test]
-fn a_flipped_checksum_on_the_last_record_is_refused() {
+fn a_flip_in_the_last_record_drops_only_it_and_is_reported() {
     let fx = fixture();
     let bytes = fx
         .files
@@ -416,24 +414,38 @@ fn a_flipped_checksum_on_the_last_record_is_refused() {
         .find(|(n, _)| *n == fx.wal_rel)
         .map(|(_, b)| b.clone())
         .expect("wal bytes");
-    let (_, end) = *frames(&bytes).last().expect("non-empty");
+    let (start, end) = *frames(&bytes).last().expect("non-empty");
     let root = TempDir::new().expect("tempdir");
     let db = root.path().join("db");
     let mut bad = Vec::new();
-    for offset in end - 4..end {
-        for bit in 0..8u8 {
-            let outcome = trial(fx, &db, |d| flip(&wal_path(d, fx), offset, bit));
-            if let Recovered::Opened(state) = outcome {
+    let mut trials = 0usize;
+    for offset in (start..end).step_by(3) {
+        for bit in [0u8, 5] {
+            trials += 1;
+            plant(fx, &db);
+            flip(&wal_path(&db, fx), offset, bit);
+            let reports = wal_format::TailReports::new();
+            let opened = Db::open(
+                &db,
+                opts().listeners(vec![reports.clone() as Arc<dyn regolith::EventListener>]),
+            );
+            let Ok(handle) = opened else {
                 bad.push(format!(
-                    "checksum byte {offset} bit {bit}: opened on prefix(es) {:?} instead of \
-                     refusing",
-                    matching_prefixes(fx, &state)
+                    "byte {offset} bit {bit}: refused, expected a reported drop"
+                ));
+                continue;
+            };
+            let ks = matching_prefixes(fx, &drain(&handle));
+            if ks != vec![fx.states.len() - 2] || reports.taken().len() != 1 {
+                bad.push(format!(
+                    "byte {offset} bit {bit}: opened on prefix(es) {ks:?} with {} report(s)",
+                    reports.taken().len()
                 ));
             }
         }
     }
     println!(
-        "last-record checksum flips: 32 trials, {} violations",
+        "last-record flips: {trials} trials, {} violations",
         bad.len()
     );
     assert!(bad.is_empty(), "{}", bad.join("\n  "));
@@ -543,15 +555,12 @@ fn plant_split(fx: &Fixture, db: &Path, split_at: usize, cut_first_to: Option<us
     let id = wal_id_of(&fx.wal_rel);
     let dir = wal_path(db, fx).parent().expect("wal dir").to_path_buf();
     fs::remove_file(wal_path(db, fx)).expect("remove original wal");
+    let (head, tail) = wal_format::split_at(&bytes, split_at);
     let head = match cut_first_to {
         Some(n) => &bytes[..n],
-        None => &bytes[..split_at],
+        None => &head[..],
     };
     fs::write(dir.join(format!("wal_{id:06}.log")), head).expect("write first wal");
-    // The tail is a fresh file, so it needs its own stamp: the split
-    // point is inside the record stream, past the original one.
-    let mut tail = bytes[..STAMP].to_vec();
-    tail.extend_from_slice(&bytes[split_at..]);
     fs::write(dir.join(format!("wal_{:06}.log", id + 1)), &tail).expect("write second wal");
 }
 
@@ -568,20 +577,12 @@ fn plant_split(fx: &Fixture, db: &Path, split_at: usize, cut_first_to: Option<us
 /// damage in a file a rotation already closed is refused instead of
 /// being discarded as a tail.
 ///
-/// **This test does not currently demonstrate that.** It reports 54
-/// cuts and 0 violations, and it reports 0 with the `WalPosition`
-/// check forced off as well, so it does not discriminate between the
-/// two behaviours. The "54 of 54" figure in the plan was measured
-/// before the WAL carried a format stamp, and the stamp changed what
-/// this split reaches. The change above is justified by the argument,
-/// not by this run: an earlier file was closed by a rotation, so no
-/// crash can have left a record in it half-written. Treat this as a
-/// gate that is currently green rather than as proof.
-///
-/// Measured: 54 cut offsets inside the earlier file's last record, 54 of
-/// them opened on a state matching no prefix of the write history. The
-/// control, the same split with no cut, opens on the full history, so
-/// the split itself is invisible and the cut is the only variable.
+/// The second file is the tail of the fixture's log under the same stamp,
+/// its records signed again for their new offsets
+/// (`wal_format::split_at`), so the split itself is invisible: the
+/// control, the same split with no cut, opens on the full history, and
+/// the cut is the only variable. Every cut must refuse, which a replay
+/// that treated the earlier file's damage as its tail would not.
 ///
 /// Reaching it needs two WAL files at open, which is the window between
 /// a rotation and the flush that removes the old file, plus damage to
@@ -622,15 +623,12 @@ fn a_torn_tail_in_an_earlier_wal_file_is_not_the_end_of_the_log() {
     for cut in last_in_head.0 + 1..last_in_head.1 {
         plant_split(fx, &db, split, Some(cut));
         if let Recovered::Opened(state) = recover(&db) {
-            let ks = matching_prefixes(fx, &state);
-            if ks.is_empty() {
-                bad.push(format!(
-                    "earlier WAL cut to {cut}: opened on a state matching NO prefix of the \
-                     write history ({} entries); records from the later WAL are served while \
-                     earlier acknowledged writes are gone",
-                    state.len(),
-                ));
-            }
+            bad.push(format!(
+                "earlier WAL cut to {cut}: opened on prefix(es) {:?} ({} entries) instead of \
+                 refusing; the earlier log was complete when the newer one began",
+                matching_prefixes(fx, &state),
+                state.len(),
+            ));
         }
     }
     println!(

@@ -278,18 +278,29 @@ struct StdWriteFile {
 
 impl WriteFile for StdWriteFile {
     /// One `writev` for the whole record. `write_all_vectored` on a POSIX file
-    /// is the syscall this exists for: without it, a WAL payload at or above
-    /// the buffer capacity forces the 5-byte header out in a syscall of its
-    /// own, so one record costs two writes and leaves a wider window between
-    /// the header and the payload.
+    /// is the syscall this exists for: a WAL record's header and its payload
+    /// leave in one syscall, with no copy to join them.
     fn write_all_vectored(&mut self, slices: &[&[u8]]) -> io::Result<()> {
         use std::io::IoSlice;
-        let mut bufs: Vec<IoSlice<'_>> = slices
-            .iter()
-            .filter(|s| !s.is_empty())
-            .map(|s| IoSlice::new(s))
-            .collect();
-        let mut rest = &mut bufs[..];
+        // A WAL record is a header and a payload, so a few slices cover
+        // every caller on the write path; they stay on the stack, and a
+        // longer list pays one allocation.
+        const INLINE: usize = 4;
+        let mut inline = [IoSlice::new(&[]); INLINE];
+        let mut heap = Vec::new();
+        let filled = slices.iter().filter(|s| !s.is_empty());
+        let bufs: &mut [IoSlice<'_>] = if slices.len() <= INLINE {
+            let mut n = 0;
+            for s in filled {
+                inline[n] = IoSlice::new(s);
+                n += 1;
+            }
+            &mut inline[..n]
+        } else {
+            heap.extend(filled.map(|s| IoSlice::new(s)));
+            &mut heap[..]
+        };
+        let mut rest = bufs;
         while !rest.is_empty() {
             let n = self.file.write_vectored(rest)?;
             if n == 0 {
