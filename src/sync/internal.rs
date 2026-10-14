@@ -237,9 +237,10 @@ struct GateState {
 /// A reader-writer gate whose exclusive guard can own its claim.
 ///
 /// The engine uses one to serialize compaction against the operations
-/// that must not see a file unlinked underneath them. Compaction and
-/// ordinary reads enter shared; a flush, a manual compaction and a
-/// checkpoint enter exclusive.
+/// that must not see a file unlinked underneath them. Compaction passes,
+/// background or inline, enter shared; `compact_range`, an external file
+/// ingest, a checkpoint and `drop_all` enter exclusive. Reads and flushes
+/// do not enter it.
 ///
 /// Writer-preferring: a waiting writer blocks new readers, so a steady
 /// stream of compaction passes cannot starve the checkpoint waiting

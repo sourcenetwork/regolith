@@ -23,12 +23,12 @@ const SAMPLE_STRIDE: u64 = 97;
 /// strided sample.
 pub fn run(
     path: &Path,
-    mut opts: Options,
+    opts: Options,
     write_buffer: usize,
     count: u64,
     reporter: &mut Reporter,
 ) -> Result<(), String> {
-    opts.write_buffer_size = write_buffer;
+    let opts = opts.write_buffer_size(write_buffer);
     let db = Db::open(path, opts)
         .map_err(|e| format!("sustained open {} failed: {e}", path.display()))?;
     reporter.pass("sustained open");

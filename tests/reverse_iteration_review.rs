@@ -17,11 +17,9 @@ use regolith::{Db, DurabilityMode, Options};
 use tempfile::TempDir;
 
 fn opts() -> Options {
-    Options {
-        write_buffer_size: 4 * 1024,
-        durability: DurabilityMode::Eventual,
-        ..Options::default()
-    }
+    Options::default()
+        .write_buffer_size(4 * 1024)
+        .durability(DurabilityMode::Eventual)
 }
 
 /// Write `keys`, then check the reverse walk against the forward one.

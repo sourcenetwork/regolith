@@ -7,7 +7,7 @@
 
 use regolith::{
     Db, IsolationLevel, OptimisticTransactionDb, Options, Transaction, TransactionDb,
-    TransactionError, TxResult,
+    TransactionError, TxResult, TxnOptions,
 };
 use std::collections::HashSet;
 use std::path::Path;
@@ -149,7 +149,7 @@ impl TxnPlan {
         &self,
         model: Model,
         blind_appends: bool,
-        tx: &mut Transaction<'_>,
+        tx: &mut Transaction,
     ) -> TxResult<Vec<Mop>> {
         let mut observed = Vec::with_capacity(self.mops.len());
         let mut read = HashSet::new();
@@ -234,20 +234,17 @@ impl TxDb {
             Isolation::DefraLevel => Ok(TxDb::Defra(
                 OptimisticTransactionDb::open(
                     path,
-                    Options {
-                        merge_operator: Some(Arc::new(ListAppend)),
-                        ..opts
-                    },
+                    opts.merge_operator(Some(Arc::new(ListAppend))),
                 )?
                 .with_isolation(IsolationLevel::DefraLevel),
             )),
         }
     }
 
-    pub fn begin(&self) -> Transaction<'_> {
+    pub fn begin(&self) -> Transaction {
         match self {
-            TxDb::Pessimistic(db) => db.begin_transaction(),
-            TxDb::Optimistic(db) | TxDb::Defra(db) => db.begin_transaction(),
+            TxDb::Pessimistic(db) => db.begin(&TxnOptions::new()),
+            TxDb::Optimistic(db) | TxDb::Defra(db) => db.begin(&TxnOptions::new()),
         }
     }
 
@@ -292,7 +289,7 @@ pub fn run_txn(db: &TxDb, model: Model, plan: &TxnPlan) -> Outcome {
         let mut tx = db.begin();
         match plan.execute(model, db.blind_appends(), &mut tx) {
             Ok(observed) => match tx.commit() {
-                Ok(()) => return Outcome::Committed(observed),
+                Ok(_) => return Outcome::Committed(observed),
                 Err(TransactionError::Conflict { .. }) | Err(TransactionError::Busy(_)) => {
                     last_retryable = true;
                 }

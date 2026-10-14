@@ -44,6 +44,22 @@ pub(crate) struct Skip {
     /// or any entry at or below it. `None` when the key's entries here ran
     /// out first.
     pub(crate) stop: Option<u64>,
+    /// The value type of the entry `stop` names. Meaningless when `stop` is
+    /// `None`.
+    pub(crate) stop_type: u8,
+}
+
+/// How one source's visit of a key's entries above a floor ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Above<R> {
+    /// The visit broke with a result.
+    Broke(R),
+    /// It reached an entry at or below the floor, so every older entry, in
+    /// this source and the older ones, is below it too.
+    Floor,
+    /// This source's entries for the key ran out above the floor; an older
+    /// source may hold more.
+    Exhausted,
 }
 
 impl ReadView {
@@ -121,10 +137,7 @@ mod tests {
 
     /// A database where only an explicit flush moves data between sources.
     fn open(dir: &TempDir) -> Db {
-        let options = Options {
-            max_background_compactions: 0,
-            ..Options::default()
-        };
+        let options = Options::default().max_background_compactions(0);
         Db::open(dir.path(), options).unwrap()
     }
 

@@ -39,10 +39,7 @@ fn files_at(db: &Db, level: usize) -> u64 {
 #[test]
 fn a_source_whose_tombstone_reaches_existing_data_lands_in_l0_not_beside_it() {
     let dir = TempDir::new().unwrap();
-    let options = Options {
-        max_background_compactions: 0,
-        ..Options::default()
-    };
+    let options = Options::default().max_background_compactions(0);
     let db = Db::open(dir.path(), options).unwrap();
     for key in [b"c", b"d", b"e", b"f"] {
         db.put(key, b"old").unwrap();
@@ -83,10 +80,7 @@ fn a_source_whose_tombstone_reaches_existing_data_lands_in_l0_not_beside_it() {
 #[test]
 fn a_source_whose_tombstone_stays_clear_of_existing_data_still_goes_to_the_bottom() {
     let dir = TempDir::new().unwrap();
-    let options = Options {
-        max_background_compactions: 0,
-        ..Options::default()
-    };
+    let options = Options::default().max_background_compactions(0);
     let db = Db::open(dir.path(), options).unwrap();
     for key in [b"c", b"d", b"e", b"f"] {
         db.put(key, b"old").unwrap();

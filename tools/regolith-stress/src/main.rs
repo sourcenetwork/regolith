@@ -108,10 +108,7 @@ fn main() {
         }
     };
 
-    let opts = Options {
-        write_buffer_size: 64 * 1024,
-        ..Options::default()
-    };
+    let opts = Options::default().write_buffer_size(64 * 1024);
 
     let mut db = Db::open(&db_path, opts.clone()).expect("open database");
     let mut reference: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();

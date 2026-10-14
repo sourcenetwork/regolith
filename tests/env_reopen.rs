@@ -20,11 +20,9 @@ use regolith::env::{Env, WriteMode};
 use regolith::{Db, MemEnv, Options, WriteBatch};
 
 fn opts(env: &Arc<MemEnv>) -> Options {
-    Options {
-        env: env.clone(),
-        max_background_compactions: 0,
-        ..Options::default()
-    }
+    Options::default()
+        .env(env.clone())
+        .max_background_compactions(0)
 }
 
 /// The regression: a database on a non-default `Env` must reopen and

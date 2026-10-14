@@ -138,23 +138,18 @@ const NO_AUTO_COMPACTION: usize = 1_000_000;
 const CHILD_TIMEOUT: Duration = Duration::from_secs(180);
 
 fn write_buffered_opts(write_buffer_size: usize) -> Options {
-    Options {
-        write_buffer_size,
-        ..Options::default()
-    }
+    Options::default().write_buffer_size(write_buffer_size)
 }
 
 /// The option set shared by the parent and the child of the compaction
 /// test, so the two can never disagree about which compactions run.
 fn manual_compaction_opts(write_buffer_size: usize) -> Options {
-    Options {
-        write_buffer_size,
-        durability: DurabilityMode::Immediate,
-        l0_compaction_trigger: NO_AUTO_COMPACTION,
-        level0_slowdown_writes_trigger: NO_AUTO_COMPACTION,
-        level0_stop_writes_trigger: NO_AUTO_COMPACTION,
-        ..Options::default()
-    }
+    Options::default()
+        .write_buffer_size(write_buffer_size)
+        .durability(DurabilityMode::Immediate)
+        .l0_compaction_trigger(NO_AUTO_COMPACTION)
+        .level0_slowdown_writes_trigger(NO_AUTO_COMPACTION)
+        .level0_stop_writes_trigger(NO_AUTO_COMPACTION)
 }
 
 fn compact_only(spec: &ChildSpec) {

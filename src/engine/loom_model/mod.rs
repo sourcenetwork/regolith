@@ -9,7 +9,7 @@
 //!
 //! # What loom here does and does not prove
 //!
-//! Loom sees the atomics that come from `crate::sync` and the locks
+//! Loom sees the atomics that come from `crate::sync::internal` and the locks
 //! built on them, and nothing else. It therefore checks:
 //!
 //! - that a reader which observes a node observes the links that were
@@ -23,7 +23,7 @@
 //! - that a reader pinning one version walks a whole snapshot across a
 //!   concurrent compaction, and that a flush and a compaction
 //!   publishing at once cannot lose one another's edits;
-//! - that the arena's chunk list, a `crate::sync::UnsafeCell` rather than
+//! - that the arena's chunk list, a `crate::sync::internal::UnsafeCell` rather than
 //!   a lock (invariant A8 in `engine::arena`), sees no access that is
 //!   not ordered before or after every other access to it: every model
 //!   that allocates now runs its allocations through the tracked cell,
@@ -33,7 +33,7 @@
 //! The version models in [`version`] are protocol models and say so:
 //! the production `VersionSet` writes a manifest record and opens an
 //! SSTable reader inside `apply`, and its locks come from `std::sync`
-//! rather than from `crate::sync`, so loom can neither run it nor see
+//! rather than from `crate::sync::internal`, so loom can neither run it nor see
 //! its ordering. What they reproduce is the part loom can decide - the
 //! `Arc<Version>` pin, the clone-mutate-store, and the lock scope around
 //! it - with the table contents stood in for.

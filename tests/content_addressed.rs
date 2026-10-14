@@ -18,6 +18,7 @@
 use std::path::Path;
 use std::sync::Arc;
 
+use regolith::Error;
 use regolith::prelude::*;
 
 /// Sums big-endian i64 deltas.
@@ -61,10 +62,7 @@ impl KeyClassifier for Keys {
 }
 
 fn options() -> Options {
-    Options {
-        merge_operator: Some(Arc::new(CounterMerge)),
-        ..Options::default()
-    }
+    Options::default().merge_operator(Some(Arc::new(CounterMerge)))
 }
 
 fn open(dir: &Path) -> OptimisticTransactionDb {
@@ -73,21 +71,21 @@ fn open(dir: &Path) -> OptimisticTransactionDb {
         .with_policy(Arc::new(Keys))
 }
 
-fn conflicted(result: TxResult<()>) -> bool {
+fn conflicted<T>(result: TxResult<T>) -> bool {
     matches!(result, Err(TransactionError::Conflict { .. }))
 }
 
 /// The key a failed commit named, if it failed on a conflict.
-fn conflict_key(result: TxResult<()>) -> Option<Vec<u8>> {
+fn conflict_key<T>(result: TxResult<T>) -> Option<Vec<u8>> {
     match result {
-        Err(TransactionError::Conflict { key, .. }) => Some(key),
+        Err(TransactionError::Conflict(conflict)) => Some(conflict.key().to_vec()),
         _ => None,
     }
 }
 
 /// A transaction at `DefraLevel`.
-fn begin(db: &OptimisticTransactionDb) -> Transaction<'_> {
-    db.begin_transaction_with(IsolationLevel::DefraLevel)
+fn begin(db: &OptimisticTransactionDb) -> Transaction {
+    db.begin(&TxnOptions::new().isolation(IsolationLevel::DefraLevel))
 }
 
 /// The value of the counter under `key`.
@@ -107,7 +105,7 @@ impl Read {
     const ALL: [Self; 3] = [Self::Get, Self::GetSlice, Self::GetForUpdate];
 
     /// Whether the read finds a value under `key`.
-    fn finds(self, tx: &Transaction<'_>, key: &[u8]) -> bool {
+    fn finds(self, tx: &Transaction, key: &[u8]) -> bool {
         match self {
             Self::Get => tx.get(key).unwrap().is_some(),
             Self::GetSlice => tx.get_slice(key).unwrap().is_some(),
@@ -132,7 +130,7 @@ impl Removal {
             Self::Delete => db.db().delete(b"b/block").unwrap(),
             Self::DeleteRange => db.db().delete_range(b"b/", b"b0").unwrap(),
             Self::InTransaction => {
-                let collector = db.begin_transaction_with(IsolationLevel::DefraLevel);
+                let collector = db.begin(&TxnOptions::new().isolation(IsolationLevel::DefraLevel));
                 collector.delete(b"b/block").unwrap();
                 collector.commit().unwrap();
             }
@@ -144,14 +142,14 @@ impl Removal {
 /// under it, as a block store does for a block it is about to write. Returns
 /// what the second commit made of it, the first having committed.
 fn both_create(db: &OptimisticTransactionDb, level: IsolationLevel, key: &[u8]) -> TxResult<()> {
-    let first = db.begin_transaction_with(level);
-    let second = db.begin_transaction_with(level);
+    let first = db.begin(&TxnOptions::new().isolation(level));
+    let second = db.begin(&TxnOptions::new().isolation(level));
     for tx in [&first, &second] {
         assert_eq!(tx.get_for_update(key).unwrap(), None);
         tx.put(key, b"bytes").unwrap();
     }
     first.commit().unwrap();
-    second.commit()
+    second.commit().map(|_| ())
 }
 
 #[test]
@@ -159,14 +157,14 @@ fn two_transactions_that_create_the_same_block_both_commit() {
     for flush in [false, true] {
         let dir = tempfile::tempdir().unwrap();
         let db = open(dir.path());
-        let first = db.begin_transaction_with(IsolationLevel::DefraLevel);
-        let second = db.begin_transaction_with(IsolationLevel::DefraLevel);
-        // Different bytes, against the contract, so the second put cannot pass
-        // as a rewrite of what the key holds: only the exemption lets it
-        // through.
-        for (tx, bytes) in [(&first, &b"first"[..]), (&second, &b"second"[..])] {
+        let first = db.begin(&TxnOptions::new().isolation(IsolationLevel::DefraLevel));
+        let second = db.begin(&TxnOptions::new().isolation(IsolationLevel::DefraLevel));
+        // Each read the key before putting it, and a read that found nothing
+        // is validated in full on an ordinary key, so only the exemption lets
+        // the second commit through.
+        for tx in [&first, &second] {
             assert_eq!(tx.get_for_update(b"b/shared").unwrap(), None);
-            tx.put(b"b/shared", bytes).unwrap();
+            tx.put(b"b/shared", b"bytes").unwrap();
         }
         first.commit().unwrap();
         if flush {
@@ -177,7 +175,7 @@ fn two_transactions_that_create_the_same_block_both_commit() {
             .unwrap_or_else(|e| panic!("flush={flush}: {e:?}"));
         assert_eq!(
             db.db().get(b"b/shared").unwrap().as_deref(),
-            Some(&b"second"[..])
+            Some(&b"bytes"[..])
         );
     }
 }
@@ -219,30 +217,102 @@ fn other_levels_with_the_same_classifier_conflict_as_before() {
     }
 }
 
+/// Whether a commit failed because a content-addressed key would have held
+/// different bytes.
+fn mismatched<T>(result: TxResult<T>) -> bool {
+    matches!(
+        result,
+        Err(TransactionError::Engine(Error::ContentMismatch))
+    )
+}
+
 #[test]
-fn different_bytes_under_one_key_commit_too_and_the_last_commit_wins() {
+fn different_bytes_under_one_key_fail_loud_and_the_first_commit_stands() {
     // The caller's contract is that a content-addressed key never holds
-    // different bytes. regolith cannot check it, so the rule is "never
-    // conflicts" and the later commit decides what the key holds.
-    for one_commits_last in [false, true] {
-        let dir = tempfile::tempdir().unwrap();
-        let db = open(dir.path());
-        let one = db.begin_transaction_with(IsolationLevel::DefraLevel);
-        let two = db.begin_transaction_with(IsolationLevel::DefraLevel);
-        for (tx, bytes) in [(&one, b"one"), (&two, b"two")] {
-            tx.get_for_update(b"b/shared").unwrap();
-            tx.put(b"b/shared", bytes).unwrap();
+    // different bytes. A commit that puts other bytes beside a newer commit
+    // of the key breaks it, applies nothing, and says so.
+    for flush in [false, true] {
+        for one_commits_last in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let db = open(dir.path());
+            let one = begin(&db);
+            let two = begin(&db);
+            for (tx, bytes) in [(&one, b"one"), (&two, b"two")] {
+                tx.get_for_update(b"b/shared").unwrap();
+                tx.put(b"b/shared", bytes).unwrap();
+                tx.put(b"h/side", bytes).unwrap();
+            }
+            let (earlier, later) = if one_commits_last {
+                (two, one)
+            } else {
+                (one, two)
+            };
+            earlier.commit().unwrap();
+            if flush {
+                db.db().flush().unwrap();
+            }
+            assert!(
+                mismatched(later.commit()),
+                "flush={flush}, one_commits_last={one_commits_last}"
+            );
+            let want: &[u8] = if one_commits_last { b"two" } else { b"one" };
+            assert_eq!(db.db().get(b"b/shared").unwrap().as_deref(), Some(want));
+            assert_eq!(
+                db.db().get(b"h/side").unwrap().as_deref(),
+                Some(want),
+                "the refused commit applied nothing"
+            );
         }
-        let (earlier, later) = if one_commits_last {
-            (two, one)
-        } else {
-            (one, two)
-        };
-        earlier.commit().unwrap();
-        later.commit().unwrap();
-        let want: &[u8] = if one_commits_last { b"one" } else { b"two" };
-        assert_eq!(db.db().get(b"b/shared").unwrap().as_deref(), Some(want));
     }
+}
+
+#[test]
+fn a_put_beside_a_plain_write_of_other_bytes_fails_loud() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = open(dir.path());
+    let tx = begin(&db);
+    tx.put(b"b/shared", b"mine").unwrap();
+    db.db().put(b"b/shared", b"theirs").unwrap();
+    assert!(mismatched(tx.commit()));
+    assert_eq!(
+        db.db().get(b"b/shared").unwrap().as_deref(),
+        Some(&b"theirs"[..])
+    );
+}
+
+#[test]
+fn a_put_beside_a_plain_write_of_the_same_bytes_commits() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = open(dir.path());
+    let tx = begin(&db);
+    tx.put(b"b/shared", b"bytes").unwrap();
+    db.db().put(b"b/shared", b"bytes").unwrap();
+    tx.commit().unwrap();
+}
+
+#[test]
+fn a_put_over_a_newer_delete_commits_whatever_the_bytes() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = open(dir.path());
+    db.db().put(b"b/shared", b"old").unwrap();
+    let tx = begin(&db);
+    tx.put(b"b/shared", b"new").unwrap();
+    db.db().delete(b"b/shared").unwrap();
+    tx.commit().unwrap();
+    assert_eq!(
+        db.db().get(b"b/shared").unwrap().as_deref(),
+        Some(&b"new"[..])
+    );
+}
+
+#[test]
+fn an_ordinary_key_with_different_bytes_still_conflicts_instead() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = open(dir.path());
+    let tx = begin(&db);
+    tx.put(b"ordinary", b"mine").unwrap();
+    db.db().put(b"ordinary", b"theirs").unwrap();
+    assert!(conflicted(tx.commit()));
 }
 
 #[test]
@@ -251,8 +321,8 @@ fn a_put_of_a_block_commits_after_a_delete_of_it_but_not_the_other_way_round() {
         let dir = tempfile::tempdir().unwrap();
         let db = open(dir.path());
         db.db().put(b"b/shared", b"bytes").unwrap();
-        let put = db.begin_transaction_with(IsolationLevel::DefraLevel);
-        let delete = db.begin_transaction_with(IsolationLevel::DefraLevel);
+        let put = db.begin(&TxnOptions::new().isolation(IsolationLevel::DefraLevel));
+        let delete = db.begin(&TxnOptions::new().isolation(IsolationLevel::DefraLevel));
         put.get_for_update(b"b/shared").unwrap();
         put.put(b"b/shared", b"bytes").unwrap();
         delete.get_for_update(b"b/shared").unwrap();
@@ -299,13 +369,30 @@ fn a_delete_of_a_block_is_validated_like_a_delete_of_any_other_key() {
         put.commit().unwrap();
         assert_eq!(conflict_key(delete.commit()), Some(key.to_vec()), "{name}");
 
-        // So does a delete of a key the transaction read first, even though
-        // the put left the key as it was read.
+        // A delete of an ordinary key the transaction read first holds while
+        // the key holds the bytes the read returned: a put that left them as
+        // they were is not a change, so it commits and the delete follows it.
+        // A block's read is for its presence only and does not stand for the
+        // delete, which is checked as the write it is: the put beat it.
         let (_dir, db) = fresh();
         let (delete, put) = (begin(&db), begin(&db));
         assert!(delete.get_for_update(key).unwrap().is_some());
         delete.delete(key).unwrap();
         put.put(key, b"bytes").unwrap();
+        put.commit().unwrap();
+        if key == b"ordinary" {
+            delete.commit().unwrap();
+            assert_eq!(db.db().get(key).unwrap(), None, "{name}");
+        } else {
+            assert_eq!(conflict_key(delete.commit()), Some(key.to_vec()), "{name}");
+        }
+
+        // A put that changed the bytes beats the delete on either.
+        let (_dir, db) = fresh();
+        let (delete, put) = (begin(&db), begin(&db));
+        assert!(delete.get_for_update(key).unwrap().is_some());
+        delete.delete(key).unwrap();
+        put.put(key, b"changed").unwrap();
         put.commit().unwrap();
         assert_eq!(conflict_key(delete.commit()), Some(key.to_vec()), "{name}");
 
@@ -339,7 +426,7 @@ fn a_block_read_as_present_conflicts_once_it_is_gone() {
                     let dir = tempfile::tempdir().unwrap();
                     let db = open(dir.path());
                     db.db().put(b"b/block", b"bytes").unwrap();
-                    let tx = db.begin_transaction_with(IsolationLevel::DefraLevel);
+                    let tx = db.begin(&TxnOptions::new().isolation(IsolationLevel::DefraLevel));
                     assert!(read.finds(&tx, b"b/block"));
                     removal.apply(&db);
                     if flush {
@@ -348,9 +435,12 @@ fn a_block_read_as_present_conflicts_once_it_is_gone() {
                     if write_elsewhere {
                         tx.put(b"elsewhere", b"x").unwrap();
                     }
+                    // A transaction that writes nothing validates the reads it
+                    // asked to have checked, and no other.
+                    let checked = write_elsewhere || matches!(read, Read::GetForUpdate);
                     assert_eq!(
                         conflict_key(tx.commit()),
-                        Some(b"b/block".to_vec()),
+                        checked.then(|| b"b/block".to_vec()),
                         "{read:?} {removal:?} flush={flush} write_elsewhere={write_elsewhere}"
                     );
                 }
@@ -366,10 +456,10 @@ fn a_block_read_as_absent_conflicts_once_it_is_put() {
             for flush in [false, true] {
                 let dir = tempfile::tempdir().unwrap();
                 let db = open(dir.path());
-                let tx = db.begin_transaction_with(IsolationLevel::DefraLevel);
+                let tx = db.begin(&TxnOptions::new().isolation(IsolationLevel::DefraLevel));
                 assert!(!read.finds(&tx, b"b/block"));
                 if by_transaction {
-                    let writer = db.begin_transaction_with(IsolationLevel::DefraLevel);
+                    let writer = db.begin(&TxnOptions::new().isolation(IsolationLevel::DefraLevel));
                     writer.put(b"b/block", b"bytes").unwrap();
                     writer.commit().unwrap();
                 } else {
@@ -398,7 +488,7 @@ fn reads_blocks_that_stay_present(level: IsolationLevel, read: Read, flush: bool
     db.db().put(b"b/back", b"bytes").unwrap();
     db.db().put(b"b/block", b"bytes").unwrap();
     db.db().put(b"b/count", &0i64.to_be_bytes()).unwrap();
-    let tx = db.begin_transaction_with(level);
+    let tx = db.begin(&TxnOptions::new().isolation(level));
     for key in [&b"b/back"[..], &b"b/block"[..], &b"b/count"[..]] {
         assert!(read.finds(&tx, key));
     }
@@ -410,7 +500,7 @@ fn reads_blocks_that_stay_present(level: IsolationLevel, read: Read, flush: bool
         db.db().flush().unwrap();
     }
     tx.put(b"elsewhere", b"x").unwrap();
-    tx.commit()
+    tx.commit().map(|_| ())
 }
 
 #[test]
@@ -435,8 +525,8 @@ fn a_block_read_as_present_survives_whatever_leaves_it_present() {
 fn a_transaction_mixing_both_kinds_conflicts_only_on_the_ordinary_one() {
     let dir = tempfile::tempdir().unwrap();
     let db = open(dir.path());
-    let first = db.begin_transaction_with(IsolationLevel::DefraLevel);
-    let second = db.begin_transaction_with(IsolationLevel::DefraLevel);
+    let first = db.begin(&TxnOptions::new().isolation(IsolationLevel::DefraLevel));
+    let second = db.begin(&TxnOptions::new().isolation(IsolationLevel::DefraLevel));
     for tx in [&first, &second] {
         tx.get_for_update(b"b/shared").unwrap();
         tx.put(b"b/shared", b"bytes").unwrap();
@@ -448,8 +538,8 @@ fn a_transaction_mixing_both_kinds_conflicts_only_on_the_ordinary_one() {
     // be the one reported.
     assert_eq!(conflict_key(second.commit()), Some(b"ordinary".to_vec()));
 
-    let first = db.begin_transaction_with(IsolationLevel::DefraLevel);
-    let second = db.begin_transaction_with(IsolationLevel::DefraLevel);
+    let first = db.begin(&TxnOptions::new().isolation(IsolationLevel::DefraLevel));
+    let second = db.begin(&TxnOptions::new().isolation(IsolationLevel::DefraLevel));
     for (tx, own) in [(&first, &b"first"[..]), (&second, &b"second"[..])] {
         tx.get_for_update(b"b/other").unwrap();
         tx.put(b"b/other", b"bytes").unwrap();
@@ -473,7 +563,7 @@ fn reads_a_block_that_changes(
     let dir = tempfile::tempdir().unwrap();
     let db = open(dir.path());
     db.db().put(b"b/block", b"bytes").unwrap();
-    let tx = db.begin_transaction_with(level);
+    let tx = db.begin(&TxnOptions::new().isolation(level));
     if for_update {
         tx.get_for_update(b"b/block").unwrap();
     } else {
@@ -530,14 +620,17 @@ fn scans_then_writes(
         scanned.extend_from_slice(name);
         db.db().put(&scanned, b"bytes").unwrap();
     }
-    let tx = db.begin_transaction_with(level);
+    let tx = db.begin(&TxnOptions::new().isolation(level));
     assert_eq!(tx.scan_stream(Some(prefix), Some(end)).count(), 3);
     if delete {
         tx.delete(key).unwrap();
     } else {
         tx.put(key, b"mine").unwrap();
     }
-    db.db().put(key, b"changed").unwrap();
+    // A block is put with the bytes it names, so the write that lands first
+    // carries the same ones.
+    let newer: &[u8] = if delete { b"changed" } else { b"mine" };
+    db.db().put(key, newer).unwrap();
     tx.commit().is_ok()
 }
 
@@ -578,8 +671,8 @@ fn a_commutative_prefix_and_a_block_in_one_commit_each_keep_their_rule() {
         let db = open(dir.path());
         db.db().put(b"h/a", b"cid").unwrap();
         db.db().put(b"h/z", b"cid").unwrap();
-        let first = db.begin_transaction_with(level);
-        let second = db.begin_transaction_with(level);
+        let first = db.begin(&TxnOptions::new().isolation(level));
+        let second = db.begin(&TxnOptions::new().isolation(level));
         for tx in [&first, &second] {
             assert_eq!(tx.scan_stream(Some(b"h/"), Some(b"h0")).count(), 2);
             tx.put(b"h/m", b"superseded").unwrap();
@@ -600,7 +693,7 @@ fn a_merge_into_a_block_is_not_validated() {
         let dir = tempfile::tempdir().unwrap();
         let db = open(dir.path());
         db.db().put(b"b/count", &0i64.to_be_bytes()).unwrap();
-        let tx = db.begin_transaction_with(level);
+        let tx = db.begin(&TxnOptions::new().isolation(level));
         tx.get(b"b/count").unwrap();
         tx.merge(b"b/count", &1i64.to_be_bytes()).unwrap();
         // A replacement, not another operand: nothing but the exemption lets a
@@ -620,20 +713,19 @@ fn a_commit_of_many_blocks_validates_none_of_them() {
         let dir = tempfile::tempdir().unwrap();
         let db = open(dir.path());
         let block = |i: usize| format!("b/{i:04}").into_bytes();
-        let first = db.begin_transaction_with(IsolationLevel::DefraLevel);
-        let second = db.begin_transaction_with(IsolationLevel::DefraLevel);
+        let first = db.begin(&TxnOptions::new().isolation(IsolationLevel::DefraLevel));
+        let second = db.begin(&TxnOptions::new().isolation(IsolationLevel::DefraLevel));
         let sides = [
             (&first, 0..BLOCKS, "first"),
             (&second, BLOCKS / 2..BLOCKS * 3 / 2, "second"),
         ];
-        // The blocks both write carry different bytes, against the contract,
-        // so no put passes as a rewrite of what the block holds: only the
-        // exemption lets them through.
+        // Each reads its blocks before putting them, and a read that found
+        // nothing is validated in full on an ordinary key, so only the
+        // exemption lets the blocks both write through.
         for (tx, range, writer) in sides {
             for i in range {
                 tx.get_for_update(&block(i)).unwrap();
-                tx.put(&block(i), format!("{writer} {i}").as_bytes())
-                    .unwrap();
+                tx.put(&block(i), format!("block {i}").as_bytes()).unwrap();
             }
             tx.put(b"head", writer.as_bytes()).unwrap();
         }
@@ -646,18 +738,17 @@ fn a_commit_of_many_blocks_validates_none_of_them() {
         // is the one conflict the second commit reports.
         assert_eq!(conflict_key(second.commit()), Some(b"head".to_vec()));
 
-        let second = db.begin_transaction_with(IsolationLevel::DefraLevel);
+        let second = db.begin(&TxnOptions::new().isolation(IsolationLevel::DefraLevel));
         for i in BLOCKS / 2..BLOCKS * 3 / 2 {
             second
-                .put(&block(i), format!("second {i}").as_bytes())
+                .put(&block(i), format!("block {i}").as_bytes())
                 .unwrap();
         }
         second.commit().unwrap();
         for i in 0..BLOCKS * 3 / 2 {
-            let writer = if i < BLOCKS / 2 { "first" } else { "second" };
             assert_eq!(
                 db.db().get(&block(i)).unwrap().as_deref(),
-                Some(format!("{writer} {i}").as_bytes()),
+                Some(format!("block {i}").as_bytes()),
                 "flush={flush} block {i}"
             );
         }

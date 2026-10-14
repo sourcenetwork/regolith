@@ -21,14 +21,11 @@ use crate::engine::after_next_ingest_seq;
 use crate::portability::Ordering;
 use crate::{
     Db, IngestOptions, IsolationLevel, OptimisticTransactionDb, Options, SstFileWriter,
-    TransactionError, WriteBatch,
+    TransactionError, TxnOptions, WriteBatch,
 };
 
 fn options() -> Options {
-    Options {
-        max_background_compactions: 0,
-        ..Options::default()
-    }
+    Options::default().max_background_compactions(0)
 }
 
 /// An external table holding `k = new`.
@@ -173,7 +170,7 @@ fn a_transaction_that_read_the_value_an_ingest_replaces_conflicts() {
     after_next_ingest_seq(move || {
         let writer_db = Arc::clone(&held);
         let window = Window::open(held.db(), move || put_other(writer_db.db()));
-        let txn = held.begin_transaction_owned(IsolationLevel::SnapshotIsolation);
+        let txn = held.begin(&TxnOptions::new().isolation(IsolationLevel::SnapshotIsolation));
         let read = txn.get(b"k").unwrap();
         *slot.borrow_mut() = Some((window, txn, read));
     });

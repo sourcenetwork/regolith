@@ -40,12 +40,10 @@ struct Fixture {
 }
 
 fn opts() -> Options {
-    Options {
+    Options::default()
         // Large enough that nothing flushes: every write stays in the
         // WAL, which is what the tests corrupt.
-        write_buffer_size: 1 << 22,
-        ..Options::default()
-    }
+        .write_buffer_size(1 << 22)
 }
 
 fn ops() -> Vec<Op> {

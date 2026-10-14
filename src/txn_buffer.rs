@@ -22,13 +22,14 @@
 //!
 //! # Why the reclamation problem does not arise
 //!
-//! Nodes are never unlinked. An overwrite prepends, and the walk returns
-//! the first match, so the newest value for a key is the one found. The
-//! list is freed only in `Drop`, which takes `&mut self` and therefore
-//! cannot run beside a reader. That is what makes a plain `AtomicPtr`
-//! list sound here without epochs or hazard pointers, and it is a
-//! property of how a transaction is used rather than of this type: it
-//! holds because a transaction is resolved exclusively.
+//! Nodes are never unlinked while the buffer is shared. An overwrite
+//! prepends, and the walk returns the first match, so the newest value for a
+//! key is the one found. The list is freed only in `Drop`, `drain` and
+//! `truncate`, which take `&mut self` and therefore cannot run beside a
+//! reader. That is what makes a plain `AtomicPtr` list sound here without
+//! epochs or hazard pointers, and it is a property of how a transaction is
+//! used rather than of this type: it holds because a transaction is resolved
+//! (or rolled back to a savepoint) exclusively.
 //!
 //! # Reading one key's writes
 //!
@@ -97,6 +98,10 @@ pub(crate) struct TxnBuffer<K: 'static, V: 'static> {
     /// that has to cost nothing.
     head: AtomicPtr<Node<K, V>>,
     len: AtomicUsize,
+    /// Entries `truncate` and `drain` have ever taken off the list, so that
+    /// [`Self::generation`] never falls. Only those two write it, and both
+    /// hold `&mut self`.
+    removed: u64,
     /// An index over the list, built once it grows past `spill_at`.
     /// Values are pointers into the list rather than copies of it.
     spill: OnceLock<ConcurrentMap<K, NodeRef<K, V>>>,
@@ -125,6 +130,7 @@ impl<K: 'static, V: 'static> Default for TxnBuffer<K, V> {
         Self {
             head: AtomicPtr::new(core::ptr::null_mut()),
             len: AtomicUsize::new(0),
+            removed: 0,
             spill: OnceLock::new(),
             spill_at: 0,
             spill_published: AtomicBool::new(false),
@@ -144,6 +150,7 @@ where
         Self {
             head: AtomicPtr::new(core::ptr::null_mut()),
             len: AtomicUsize::new(0),
+            removed: 0,
             spill: OnceLock::new(),
             spill_at,
             spill_published: AtomicBool::new(false),
@@ -154,6 +161,17 @@ where
     /// Entries buffered, counting an overwritten key once per write.
     pub(crate) fn len(&self) -> usize {
         self.len.load(Ordering::Acquire)
+    }
+
+    /// A number that changes whenever the buffer does and never falls: it
+    /// grows by one for each entry inserted and by at least one for each
+    /// `truncate` or `drain` that takes entries off. So two reads that agree
+    /// saw the same entries, which a length cannot say once a truncation can
+    /// bring the length back to an earlier value.
+    pub(crate) fn generation(&self) -> u64 {
+        // A removal counts twice: once for the length it took off and once for
+        // the entries gone, so the sum rises by what was removed.
+        self.len() as u64 + 2 * self.removed
     }
 
     /// Buffer `key` at `value`, replacing whatever this buffer held for
@@ -451,6 +469,41 @@ where
         out
     }
 
+    /// Drop the newest entries until `len` remain, so [`Self::len`] reads
+    /// `len` afterwards. A `len` at or above the current one drops nothing.
+    ///
+    /// The cost is the entries dropped, never the entries kept: they are the
+    /// front of the list, and the index, once built, is pointed back at the
+    /// next older node of each key they carried. This is how a savepoint
+    /// rolls back, with the buffer's entry count as the mark.
+    ///
+    /// Takes `&mut self` for the reason `drain` does: freeing a node is sound
+    /// only when no reader can be walking the list, and a mutable borrow says
+    /// so.
+    pub(crate) fn truncate(&mut self, len: usize) {
+        let before = *self.len.get_mut();
+        let mut remaining = before;
+        let mut head = *self.head.get_mut();
+        while remaining > len && !head.is_null() {
+            // SAFETY: `&mut self` makes this thread the only one that can reach
+            // the list, and `head` is a node `push` allocated by `Box::into_raw`.
+            let node = unsafe { Box::from_raw(head) };
+            if let Some(spill) = self.spill.get() {
+                // The head is the newest node of its key, so the index holds
+                // it. Its older node, if any, is the key's newest now.
+                let older = Self::older(&node);
+                spill.compute(node.key.clone(), |_| {
+                    (!older.is_null()).then_some(NodeRef(older))
+                });
+            }
+            head = node.next;
+            remaining -= 1;
+        }
+        *self.head.get_mut() = head;
+        *self.len.get_mut() = remaining;
+        self.removed += (before - remaining) as u64;
+    }
+
     /// Every buffered entry, newest write of each key only.
     ///
     /// Takes `&mut self` because it consumes the buffer: draining is what
@@ -471,6 +524,7 @@ where
             drained.push((node.key, node.value));
         }
         self.len.store(0, Ordering::Release);
+        self.removed += drained.len() as u64;
         self.spill = OnceLock::new();
         self.spill_published.store(false, Ordering::Release);
         self.spill_seeded.store(false, Ordering::Release);
@@ -492,3 +546,6 @@ impl<K: 'static, V: 'static> Drop for TxnBuffer<K, V> {
 
 #[cfg(test)]
 mod scan_tests;
+
+#[cfg(test)]
+mod truncate_tests;

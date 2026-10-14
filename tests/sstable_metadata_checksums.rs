@@ -26,11 +26,9 @@ use tempfile::TempDir;
 const KEYS: u32 = 600;
 
 fn opts() -> Options {
-    Options {
-        write_buffer_size: 64 * 1024 * 1024,
-        durability: DurabilityMode::Eventual,
-        ..Options::default()
-    }
+    Options::default()
+        .write_buffer_size(64 * 1024 * 1024)
+        .durability(DurabilityMode::Eventual)
 }
 
 fn key(i: u32) -> Vec<u8> {

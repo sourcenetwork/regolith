@@ -7,7 +7,7 @@ use std::ops::ControlFlow;
 use std::sync::Arc;
 
 use super::super::MergeChain;
-use super::super::source_walk::Skip;
+use super::super::source_walk::{Above, Skip};
 use super::{
     Block, BlockCache, DbSlice, LookupKey, SsTableReader, VALUE_TYPE_MERGE, decode_internal_key,
     invalid_data,
@@ -74,13 +74,79 @@ impl SsTableReader {
         let mut passed = false;
         let stop = self.scan_key(lk, key_buf, cache, |_, seq, vt, _, _| {
             if seq <= floor || vt != VALUE_TYPE_MERGE {
-                ControlFlow::Break(seq)
+                ControlFlow::Break((seq, vt))
             } else {
                 passed = true;
                 ControlFlow::Continue(())
             }
         })?;
-        Ok(Skip { passed, stop })
+        Ok(Skip {
+            passed,
+            stop: stop.map(|(seq, _)| seq),
+            stop_type: stop.map_or(0, |(_, vt)| vt),
+        })
+    }
+
+    /// [`MemTable::newer_in_range`](crate::engine::memtable::MemTable::newer_in_range)
+    /// for one table: every data block that holds a key of `[lo, hi)` is read,
+    /// since a table keeps no sequence range of its own to rule it out.
+    pub(crate) fn newer_in_range(
+        &self,
+        lo: &[u8],
+        hi: &[u8],
+        floor: u64,
+        key_buf: &mut Vec<u8>,
+        cache: &BlockCache,
+    ) -> io::Result<Option<(Vec<u8>, u64, u8)>> {
+        let start = LookupKey::from_prefixed(lo, u64::MAX);
+        let search_key = start.internal();
+        let mut cursor = self.seek_block_cursor(search_key, cache)?;
+        while let Some(at) = cursor {
+            let block = self.load_block_at_cursor(&at, cache)?;
+            let ended = block.scan_from(search_key, key_buf, |ik, _, _| {
+                let (user_key, seq, vt) = decode_internal_key(ik);
+                if user_key >= hi {
+                    return ControlFlow::Break(None);
+                }
+                if seq > floor {
+                    return ControlFlow::Break(Some((user_key.to_vec(), seq, vt)));
+                }
+                ControlFlow::Continue(())
+            });
+            match ended {
+                Some(found) => return Ok(found),
+                None => cursor = self.next_block_cursor(&at, cache)?,
+            }
+        }
+        Ok(None)
+    }
+
+    /// [`MemTable::visit_above`](crate::engine::memtable::MemTable::visit_above)
+    /// for one table: `lk`'s entries newest first among those at or below the
+    /// lookup's snapshot and above `floor`, carrying on into the following
+    /// data blocks for as long as the key does, until `visit` breaks.
+    pub(crate) fn visit_above<R>(
+        &self,
+        lk: &LookupKey,
+        floor: u64,
+        key_buf: &mut Vec<u8>,
+        cache: &BlockCache,
+        mut visit: impl FnMut(u64, u8, DbSlice) -> ControlFlow<R>,
+    ) -> io::Result<Above<R>> {
+        let ended = self.scan_key(lk, key_buf, cache, |block, seq, vt, offset, len| {
+            if seq <= floor {
+                return ControlFlow::Break(Ok(None));
+            }
+            let Some(value) = DbSlice::from_block(Arc::clone(block), offset, len) else {
+                return ControlFlow::Break(Err(invalid_data("block value extends past block")));
+            };
+            visit(seq, vt, value).map_break(|result| Ok(Some(result)))
+        })?;
+        Ok(match ended.transpose()? {
+            None => Above::Exhausted,
+            Some(None) => Above::Floor,
+            Some(Some(result)) => Above::Broke(result),
+        })
     }
 
     /// Visits `lk`'s entries newest first from the lookup's snapshot, carrying
@@ -216,8 +282,8 @@ mod tests {
         count
     }
 
-    /// `skip_merges_above` for `key` read at `snapshot_seq`.
-    fn skip(
+    /// `skip_merges_above` for `key` read at `snapshot_seq`, as reported.
+    fn skip_typed(
         reader: &SsTableReader,
         cache: &BlockCache,
         key: &[u8],
@@ -230,9 +296,57 @@ mod tests {
             .unwrap()
     }
 
+    /// [`skip_typed`] without the stop's value type, which the model test and
+    /// `the_stop_names_the_value_type_of_the_entry_it_ended_at` check apart, so
+    /// the cases below stay about where the skip ended.
+    fn skip(
+        reader: &SsTableReader,
+        cache: &BlockCache,
+        key: &[u8],
+        snapshot_seq: u64,
+        floor: u64,
+    ) -> Skip {
+        Skip {
+            stop_type: 0,
+            ..skip_typed(reader, cache, key, snapshot_seq, floor)
+        }
+    }
+
     /// A skip that passed an operand or not, and stopped at `stop`.
     fn ended(passed: bool, stop: Option<u64>) -> Skip {
-        Skip { passed, stop }
+        Skip {
+            passed,
+            stop,
+            stop_type: 0,
+        }
+    }
+
+    #[test]
+    fn the_stop_names_the_value_type_of_the_entry_it_ended_at() {
+        let mut entries = vec![(b"k".as_slice(), 1, Kind::Put)];
+        entries.extend(operands(b"k", 2..=3));
+        entries.push((b"k", 4, Kind::Delete));
+        entries.extend(operands(b"k", 5..=6));
+        entries.push((b"l", 7, Kind::Put));
+        for_both_indexes(&entries, |reader, cache| {
+            let stopped = skip_typed(reader, cache, b"k", u64::MAX, 0);
+            assert_eq!(
+                (stopped.passed, stopped.stop, stopped.stop_type),
+                (true, Some(4), VALUE_TYPE_DELETION)
+            );
+            let stopped = skip_typed(reader, cache, b"l", u64::MAX, 0);
+            assert_eq!(
+                (stopped.stop, stopped.stop_type),
+                (Some(7), VALUE_TYPE_VALUE)
+            );
+            // At the floor the skip stops on whatever entry is there, an
+            // operand included.
+            let stopped = skip_typed(reader, cache, b"k", u64::MAX, 6);
+            assert_eq!(
+                (stopped.stop, stopped.stop_type),
+                (Some(6), VALUE_TYPE_MERGE)
+            );
+        });
     }
 
     /// `collect_merge_chain` for `key` read at `snapshot_seq`.
@@ -272,6 +386,7 @@ mod tests {
         for (_, seq, kind) in visible(entries, key, snapshot_seq) {
             if seq <= floor || kind != Kind::Merge {
                 skip.stop = Some(seq);
+                skip.stop_type = kind.value_type();
                 break;
             }
             skip.passed = true;
@@ -577,7 +692,7 @@ mod tests {
                 let cache = BlockCache::new(1024 * 1024);
                 for key in KEYS.into_iter().chain([b"absent".as_slice()]) {
                     prop_assert_eq!(
-                        skip(&reader, &cache, key, snapshot_seq, floor),
+                        skip_typed(&reader, &cache, key, snapshot_seq, floor),
                         model_skip(&entries, key, snapshot_seq, floor),
                         "skip, partitioned={}", partitioned
                     );

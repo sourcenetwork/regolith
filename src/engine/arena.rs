@@ -97,7 +97,7 @@ use std::ptr::NonNull;
 
 use kovan_queue::array_queue::ArrayQueue;
 
-use crate::sync::{Arc, AtomicUsize, Ordering, UnsafeCell};
+use crate::sync::internal::{Arc, AtomicUsize, Ordering, UnsafeCell};
 
 /// Alignment every chunk is allocated at. Covers every alignment the
 /// skip-list asks for, so a fresh chunk never needs leading padding.
@@ -399,7 +399,7 @@ pub(crate) struct Arena {
     base: usize,
     max_chunk_size: usize,
     #[cfg(debug_assertions)]
-    allocating: crate::sync::AtomicBool,
+    allocating: crate::sync::internal::AtomicBool,
 }
 
 // SAFETY (A8): at most one thread is ever inside `alloc`, which is the
@@ -434,7 +434,7 @@ impl Arena {
             base,
             max_chunk_size: profile.max_chunk_size.max(base),
             #[cfg(debug_assertions)]
-            allocating: crate::sync::AtomicBool::new(false),
+            allocating: crate::sync::internal::AtomicBool::new(false),
         }
     }
 
@@ -451,7 +451,7 @@ impl Arena {
             return None;
         }
         #[cfg(debug_assertions)]
-        let _writer = crate::sync::SingleWriterGuard::enter(
+        let _writer = crate::sync::internal::SingleWriterGuard::enter(
             &self.allocating,
             "Arena::alloc is single-writer (A8); the memtable's one writer is its only allocator",
         );

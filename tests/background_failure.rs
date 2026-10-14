@@ -157,12 +157,10 @@ fn key(i: u32) -> Vec<u8> {
 fn a_compaction_that_fails_midway_leaves_no_outputs_behind() {
     let dir = tempfile::tempdir().unwrap();
     let env = Arc::new(SstBudgetEnv::new());
-    let opts = Options {
-        env: Arc::clone(&env) as Arc<dyn Env>,
-        max_background_compactions: 0,
-        target_file_size: 16 * 1024,
-        ..Options::default()
-    };
+    let opts = Options::default()
+        .env(Arc::clone(&env) as Arc<dyn Env>)
+        .max_background_compactions(0)
+        .target_file_size(16 * 1024);
     let db = Db::open(dir.path(), opts).unwrap();
 
     for batch in 0..4u32 {
@@ -196,10 +194,10 @@ fn a_compaction_that_fails_midway_leaves_no_outputs_behind() {
 fn a_failing_background_worker_backs_off_and_counts_its_failures() {
     let dir = tempfile::tempdir().unwrap();
     let env = Arc::new(SstBudgetEnv::new());
-    let opts = |l0_compaction_trigger| Options {
-        env: Arc::clone(&env) as Arc<dyn Env>,
-        l0_compaction_trigger,
-        ..Options::default()
+    let opts = |l0_compaction_trigger| {
+        Options::default()
+            .env(Arc::clone(&env) as Arc<dyn Env>)
+            .l0_compaction_trigger(l0_compaction_trigger)
     };
 
     let db = Db::open(dir.path(), opts(1_000)).unwrap();
@@ -237,11 +235,9 @@ fn a_failing_background_worker_backs_off_and_counts_its_failures() {
 fn a_flush_that_fails_after_writing_its_table_leaves_no_file_behind() {
     let dir = tempfile::tempdir().unwrap();
     let env = Arc::new(SstBudgetEnv::new());
-    let opts = Options {
-        env: Arc::clone(&env) as Arc<dyn Env>,
-        max_background_compactions: 0,
-        ..Options::default()
-    };
+    let opts = Options::default()
+        .env(Arc::clone(&env) as Arc<dyn Env>)
+        .max_background_compactions(0);
     let db = Db::open(dir.path(), opts).unwrap();
     for i in 0..1_000u32 {
         db.put(&key(i), &[7u8; 64]).unwrap();
@@ -292,12 +288,12 @@ fn wait_until(limit: Duration, mut ready: impl FnMut() -> bool) {
 fn a_writer_stopped_behind_failing_compaction_gets_the_failure_instead_of_waiting() {
     let dir = tempfile::tempdir().unwrap();
     let env = Arc::new(SstBudgetEnv::new());
-    let opts = |l0_compaction_trigger| Options {
-        env: Arc::clone(&env) as Arc<dyn Env>,
-        l0_compaction_trigger,
-        level0_slowdown_writes_trigger: 0,
-        level0_stop_writes_trigger: 4,
-        ..Options::default()
+    let opts = |l0_compaction_trigger| {
+        Options::default()
+            .env(Arc::clone(&env) as Arc<dyn Env>)
+            .l0_compaction_trigger(l0_compaction_trigger)
+            .level0_slowdown_writes_trigger(0)
+            .level0_stop_writes_trigger(4)
     };
 
     let db = Db::open(dir.path(), opts(1_000)).unwrap();
@@ -351,12 +347,10 @@ fn a_writer_stopped_behind_failing_flushes_retries_them_and_recovers() {
     let db = Arc::new(
         Db::open(
             dir.path(),
-            Options {
-                env: Arc::clone(&env) as Arc<dyn Env>,
-                write_buffer_size: 64 * 1024,
-                max_write_buffer_number: 1,
-                ..Options::default()
-            },
+            Options::default()
+                .env(Arc::clone(&env) as Arc<dyn Env>)
+                .write_buffer_size(64 * 1024)
+                .max_write_buffer_number(1),
         )
         .unwrap(),
     );

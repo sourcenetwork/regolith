@@ -2,7 +2,7 @@
 //! [`super::super::arena::Arena::alloc`] at a time.
 //!
 //! `alloc` no longer takes a lock: its chunk list is a
-//! `crate::sync::UnsafeCell` instead, checked by loom under `--cfg loom`
+//! `crate::sync::internal::UnsafeCell` instead, checked by loom under `--cfg loom`
 //! and a plain `std::cell::UnsafeCell` otherwise. This is the
 //! calibration that shows loom actually sees the state a `Mutex` used to
 //! protect, by racing two allocations with nothing serializing them.

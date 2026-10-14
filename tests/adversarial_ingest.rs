@@ -32,10 +32,7 @@ fn build_sst(path: &std::path::Path, batch: usize, opts: &Options) {
 fn ingest_under_concurrent_writers_stays_visible_and_loses_nothing() {
     let dir = TempDir::new().unwrap();
     let staging = TempDir::new().unwrap();
-    let opts = Options {
-        write_buffer_size: 32 * 1024,
-        ..Options::default()
-    };
+    let opts = Options::default().write_buffer_size(32 * 1024);
     let db = Arc::new(Db::open(dir.path(), opts.clone()).unwrap());
 
     let stop = Arc::new(AtomicBool::new(false));
@@ -161,10 +158,7 @@ fn wal_disabled_writers_in_a_group_do_not_break_recovery() {
     let db = Arc::new(
         Db::open(
             dir.path(),
-            Options {
-                write_buffer_size: 8 * 1024 * 1024,
-                ..Options::default()
-            },
+            Options::default().write_buffer_size(8 * 1024 * 1024),
         )
         .unwrap(),
     );

@@ -126,12 +126,12 @@ pub fn survey(dir: &std::path::Path, opts: Options, report: &mut Report) -> Resu
 /// files. Never returns.
 pub fn crash_compact(
     dir: &std::path::Path,
-    mut opts: Options,
+    opts: Options,
     budget: u64,
     report: &mut Report,
 ) -> Result<bool, String> {
     report.stage("baseline, before compaction-kill open");
-    opts.compaction_filter = Some(Arc::new(ExitAfter::new(budget)));
+    let opts = opts.compaction_filter(Some(Arc::new(ExitAfter::new(budget))));
     let db = Db::open(dir, opts).map_err(|e| format!("open failed: {e}"))?;
     report.stage("after open");
     report.check_u64("crash_compact.budget", budget);

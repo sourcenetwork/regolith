@@ -23,16 +23,14 @@ use std::sync::Arc;
 /// no background worker, and small enough to cross a flush boundary
 /// inside a test.
 fn mem_options(env: &MemEnv) -> Options {
-    Options {
-        env: Arc::new(env.clone()),
-        max_background_compactions: 0,
-        write_buffer_size: 4 * 1024,
-        block_cache_size: 64 * 1024,
-        target_file_size: 16 * 1024,
-        level_base_bytes: 64 * 1024,
-        l0_compaction_trigger: 2,
-        ..Options::default()
-    }
+    Options::default()
+        .env(Arc::new(env.clone()))
+        .max_background_compactions(0)
+        .write_buffer_size(4 * 1024)
+        .block_cache_size(64 * 1024)
+        .target_file_size(16 * 1024)
+        .level_base_bytes(64 * 1024)
+        .l0_compaction_trigger(2)
 }
 
 fn open_mem(env: &MemEnv, path: &str) -> Db {

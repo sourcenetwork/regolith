@@ -92,7 +92,8 @@ fn scan_stream_does_not_read_the_range_it_skips() {
         .scan_stream(None, None)
         .expect("scan_stream")
         .take(5)
-        .count();
+        .try_fold(0usize, |taken, entry| entry.map(|_| taken + 1))
+        .expect("scan rows");
     ARMED.store(false, Ordering::Relaxed);
     let streamed = BYTES.load(Ordering::Relaxed);
 

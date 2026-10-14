@@ -22,11 +22,7 @@ fn an_environment_without_a_filesystem_reports_nothing() {
     let env: Arc<dyn Env> = Arc::new(MemEnv::new());
     let db = Db::open(
         std::path::Path::new("/db"),
-        Options {
-            env,
-            max_background_compactions: 0,
-            ..Options::default()
-        },
+        Options::default().env(env).max_background_compactions(0),
     )
     .unwrap();
     assert_eq!(db.get_int_property("regolith.disk-available-bytes"), None);

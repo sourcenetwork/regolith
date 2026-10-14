@@ -37,12 +37,10 @@ fn env_u64(name: &str, default: u64) -> u64 {
 /// memtable keeps a batch repetition off the flush path so the number is the
 /// batch write path itself.
 fn opts() -> Options {
-    Options {
-        write_buffer_size: 64 * 1024 * 1024,
-        block_cache_size: 8 * 1024 * 1024,
-        block_cache_num_shard_bits: 0,
-        ..common::default_opts()
-    }
+    common::default_opts()
+        .write_buffer_size(64 * 1024 * 1024)
+        .block_cache_size(8 * 1024 * 1024)
+        .block_cache_num_shard_bits(0)
 }
 
 fn batch_rep(batch_ops: usize, dur: Duration) -> f64 {

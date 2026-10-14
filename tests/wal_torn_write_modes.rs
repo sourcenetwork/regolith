@@ -33,10 +33,7 @@ fn crash_child() {
 }
 
 fn opts() -> Options {
-    Options {
-        write_buffer_size: 1 << 20,
-        ..Options::default()
-    }
+    Options::default().write_buffer_size(1 << 20)
 }
 
 fn cut_inside_a_wal_write(db: &std::path::Path, nth: u64, tear: TearMode) -> ChildOutcome {

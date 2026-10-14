@@ -16,14 +16,7 @@ use tempfile::TempDir;
 #[test]
 fn dbslice_hash_and_eq_agree_across_every_owner() {
     let dir = TempDir::new().unwrap();
-    let db = Db::open(
-        dir.path(),
-        Options {
-            write_buffer_size: 4 * 1024,
-            ..Options::default()
-        },
-    )
-    .unwrap();
+    let db = Db::open(dir.path(), Options::default().write_buffer_size(4 * 1024)).unwrap();
 
     let payload = vec![b'q'; 300];
     db.put(b"same_a", &payload).unwrap();
@@ -76,16 +69,8 @@ fn dbslice_hash_and_eq_agree_across_every_owner() {
 #[test]
 fn a_cross_column_family_batch_is_atomic_under_group_commit() {
     let dir = TempDir::new().unwrap();
-    let db = Arc::new(
-        Db::open(
-            dir.path(),
-            Options {
-                write_buffer_size: 16 * 1024,
-                ..Options::default()
-            },
-        )
-        .unwrap(),
-    );
+    let db =
+        Arc::new(Db::open(dir.path(), Options::default().write_buffer_size(16 * 1024)).unwrap());
     let cfs: Vec<_> = (0..4)
         .map(|i| db.create_column_family(&format!("cf{i}")).unwrap())
         .collect();
@@ -175,16 +160,8 @@ fn a_cross_column_family_batch_is_atomic_under_group_commit() {
 #[test]
 fn a_checkpoint_taken_under_load_is_a_consistent_point_in_time() {
     let dir = TempDir::new().unwrap();
-    let db = Arc::new(
-        Db::open(
-            dir.path(),
-            Options {
-                write_buffer_size: 32 * 1024,
-                ..Options::default()
-            },
-        )
-        .unwrap(),
-    );
+    let db =
+        Arc::new(Db::open(dir.path(), Options::default().write_buffer_size(32 * 1024)).unwrap());
 
     let stop = Arc::new(AtomicBool::new(false));
     let mut writers = Vec::new();
@@ -249,16 +226,8 @@ fn a_checkpoint_taken_under_load_is_a_consistent_point_in_time() {
 #[test]
 fn a_backup_taken_under_load_restores_whole_batches() {
     let dir = TempDir::new().unwrap();
-    let db = Arc::new(
-        Db::open(
-            dir.path(),
-            Options {
-                write_buffer_size: 32 * 1024,
-                ..Options::default()
-            },
-        )
-        .unwrap(),
-    );
+    let db =
+        Arc::new(Db::open(dir.path(), Options::default().write_buffer_size(32 * 1024)).unwrap());
 
     let stop = Arc::new(AtomicBool::new(false));
     let mut writers = Vec::new();
@@ -317,16 +286,8 @@ fn a_backup_taken_under_load_restores_whole_batches() {
 #[test]
 fn a_tailing_iterator_never_surfaces_a_partial_batch() {
     let dir = TempDir::new().unwrap();
-    let db = Arc::new(
-        Db::open(
-            dir.path(),
-            Options {
-                write_buffer_size: 16 * 1024,
-                ..Options::default()
-            },
-        )
-        .unwrap(),
-    );
+    let db =
+        Arc::new(Db::open(dir.path(), Options::default().write_buffer_size(16 * 1024)).unwrap());
 
     let stop = Arc::new(AtomicBool::new(false));
     let rounds = 400usize;

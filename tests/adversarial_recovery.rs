@@ -13,12 +13,10 @@ use regolith::{Db, Options, WriteOptions};
 use tempfile::TempDir;
 
 fn opts() -> Options {
-    Options {
+    Options::default()
         // Large enough that nothing flushes: everything under test stays
         // in the WAL, which is the point.
-        write_buffer_size: 8 * 1024 * 1024,
-        ..Options::default()
-    }
+        .write_buffer_size(8 * 1024 * 1024)
 }
 
 fn wal_files(db_dir: &Path) -> Vec<PathBuf> {
@@ -307,14 +305,7 @@ fn an_oversized_length_header_is_refused_not_allocated() {
 fn corruption_in_an_earlier_wal_is_not_skipped() {
     let dir = TempDir::new().unwrap();
     {
-        let db = Db::open(
-            dir.path(),
-            Options {
-                write_buffer_size: 4 * 1024,
-                ..Options::default()
-            },
-        )
-        .unwrap();
+        let db = Db::open(dir.path(), Options::default().write_buffer_size(4 * 1024)).unwrap();
         for i in 0..400 {
             db.put(format!("m{i:04}").as_bytes(), &[b'x'; 128]).unwrap();
         }

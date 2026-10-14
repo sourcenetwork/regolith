@@ -17,10 +17,7 @@ fn build(path: &std::path::Path, batch: usize, opts: &Options) {
 fn no_writers_at_all() {
     let dir = TempDir::new().unwrap();
     let staging = TempDir::new().unwrap();
-    let opts = Options {
-        write_buffer_size: 32 * 1024,
-        ..Options::default()
-    };
+    let opts = Options::default().write_buffer_size(32 * 1024);
     let db = Db::open(dir.path(), opts.clone()).unwrap();
 
     for batch in 0..5usize {
@@ -66,10 +63,7 @@ fn no_writers_at_all() {
 fn one_plain_write_between_ingests() {
     let dir = TempDir::new().unwrap();
     let staging = TempDir::new().unwrap();
-    let opts = Options {
-        write_buffer_size: 32 * 1024,
-        ..Options::default()
-    };
+    let opts = Options::default().write_buffer_size(32 * 1024);
     let db = Db::open(dir.path(), opts.clone()).unwrap();
 
     for batch in 0..5usize {
@@ -103,10 +97,7 @@ fn one_plain_write_between_ingests() {
 fn cold_cache_per_ingest() {
     let dir = TempDir::new().unwrap();
     let staging = TempDir::new().unwrap();
-    let opts = Options {
-        write_buffer_size: 32 * 1024,
-        ..Options::default()
-    };
+    let opts = Options::default().write_buffer_size(32 * 1024);
     for batch in 0..5usize {
         let path = staging.path().join(format!("ing_{batch}.sst"));
         build(&path, batch, &opts);

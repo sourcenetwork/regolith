@@ -171,23 +171,21 @@ impl Env for CaptureEnv {
 }
 
 fn options(env: Arc<dyn Env>, style: CompactionStyle) -> Options {
-    Options {
-        env,
-        durability: DurabilityMode::Immediate,
-        max_background_compactions: 0,
-        compaction_style: style,
-        write_buffer_size: 1024 * 1024,
-        l0_compaction_trigger: 1_000_000,
-        level0_slowdown_writes_trigger: 0,
-        level0_stop_writes_trigger: 0,
-        universal_compaction_options: UniversalCompactionOptions {
+    Options::default()
+        .env(env)
+        .durability(DurabilityMode::Immediate)
+        .max_background_compactions(0)
+        .compaction_style(style)
+        .write_buffer_size(1024 * 1024)
+        .l0_compaction_trigger(1_000_000)
+        .level0_slowdown_writes_trigger(0)
+        .level0_stop_writes_trigger(0)
+        .universal_compaction_options(UniversalCompactionOptions {
             min_merge_width: 100,
             max_merge_width: 100,
             max_size_amplification_percent: u32::MAX,
             ..UniversalCompactionOptions::default()
-        },
-        ..Options::default()
-    }
+        })
 }
 
 fn capture_compaction(style: CompactionStyle, expected: &[(Vec<u8>, Vec<u8>)]) -> CrashImage {

@@ -12,10 +12,7 @@ use regolith::{Db, Error, Options, WriteBatch, WriteOptions};
 use tempfile::TempDir;
 
 fn opts() -> Options {
-    Options {
-        write_buffer_size: 64 * 1024,
-        ..Options::default()
-    }
+    Options::default().write_buffer_size(64 * 1024)
 }
 
 fn assert_read_only(what: &str, got: regolith::Result<()>) {

@@ -44,12 +44,10 @@ fn env_u64(name: &str, default: u64) -> u64 {
 /// it, so the number measures the memtable and WAL append path rather than a
 /// flush storm, and RSS stays bounded across the whole sweep.
 fn opts() -> Options {
-    Options {
-        write_buffer_size: 64 * 1024 * 1024,
-        block_cache_size: 8 * 1024 * 1024,
-        block_cache_num_shard_bits: 0,
-        ..common::default_opts()
-    }
+    common::default_opts()
+        .write_buffer_size(64 * 1024 * 1024)
+        .block_cache_size(8 * 1024 * 1024)
+        .block_cache_num_shard_bits(0)
 }
 
 struct Rep {

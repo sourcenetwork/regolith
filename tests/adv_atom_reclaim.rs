@@ -96,14 +96,7 @@ fn fill(db: &Db, rounds: usize, per_round: usize, tag: u8) {
 /// disk space that `df` still counts and that nothing can free.
 fn unlinked_sstable_inodes_are_released_after_a_compaction() {
     let dir = TempDir::new().expect("tempdir");
-    let db = Db::open(
-        dir.path(),
-        Options {
-            write_buffer_size: 4 * 1024,
-            ..Options::default()
-        },
-    )
-    .expect("open");
+    let db = Db::open(dir.path(), Options::default().write_buffer_size(4 * 1024)).expect("open");
 
     fill(&db, 8, 400, b'a');
     db.compact_range(None, None).expect("compact");
@@ -159,14 +152,8 @@ fn wait_for_reclamation(dir: &Path) -> (Vec<String>, Vec<String>) {
 fn dropping_the_db_closes_every_descriptor_it_opened() {
     let dir = TempDir::new().expect("tempdir");
     {
-        let db = Db::open(
-            dir.path(),
-            Options {
-                write_buffer_size: 4 * 1024,
-                ..Options::default()
-            },
-        )
-        .expect("open");
+        let db =
+            Db::open(dir.path(), Options::default().write_buffer_size(4 * 1024)).expect("open");
         fill(&db, 8, 400, b'b');
         db.compact_range(None, None).expect("compact");
     }
@@ -194,14 +181,7 @@ fn dropping_the_db_closes_every_descriptor_it_opened() {
 /// from this same thread drains what the first one retired.
 fn a_second_publication_from_the_same_thread_releases_the_pinned_inodes() {
     let dir = TempDir::new().expect("tempdir");
-    let db = Db::open(
-        dir.path(),
-        Options {
-            write_buffer_size: 4 * 1024,
-            ..Options::default()
-        },
-    )
-    .expect("open");
+    let db = Db::open(dir.path(), Options::default().write_buffer_size(4 * 1024)).expect("open");
 
     fill(&db, 8, 400, b'c');
     db.compact_range(None, None).expect("compact");
@@ -239,14 +219,7 @@ fn descriptors_survive_the_db_but_not_the_publishing_thread() {
     let path = dir.path().to_path_buf();
 
     let handle = std::thread::spawn(move || {
-        let db = Db::open(
-            &path,
-            Options {
-                write_buffer_size: 4 * 1024,
-                ..Options::default()
-            },
-        )
-        .expect("open");
+        let db = Db::open(&path, Options::default().write_buffer_size(4 * 1024)).expect("open");
         fill(&db, 8, 400, b'd');
         db.compact_range(None, None).expect("compact");
         drop(db);
@@ -279,14 +252,8 @@ fn pinned_inode_count_versus_workload_size() {
     let mut rows = Vec::new();
     for rounds in [4usize, 8, 16, 32] {
         let dir = TempDir::new().expect("tempdir");
-        let db = Db::open(
-            dir.path(),
-            Options {
-                write_buffer_size: 4 * 1024,
-                ..Options::default()
-            },
-        )
-        .expect("open");
+        let db =
+            Db::open(dir.path(), Options::default().write_buffer_size(4 * 1024)).expect("open");
         fill(&db, rounds, 400, b'e');
         db.compact_range(None, None).expect("compact");
         let (live, deleted) = open_fds_under(dir.path());
@@ -321,14 +288,7 @@ fn pinned_inode_count_versus_workload_size() {
 fn an_idle_reader_thread_does_not_gate_descriptors_created_after_it_idled() {
     let dir = TempDir::new().expect("tempdir");
     let db = std::sync::Arc::new(
-        Db::open(
-            dir.path(),
-            Options {
-                write_buffer_size: 4 * 1024,
-                ..Options::default()
-            },
-        )
-        .expect("open"),
+        Db::open(dir.path(), Options::default().write_buffer_size(4 * 1024)).expect("open"),
     );
     db.put(b"seed", b"v").expect("put");
 

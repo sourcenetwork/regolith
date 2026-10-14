@@ -18,7 +18,7 @@ use std::time::Duration;
 use proptest::prelude::*;
 use regolith::{
     IsolationLevel, OptimisticTransactionDb, Options, ScanDirection, TransactionDb,
-    TransactionError,
+    TransactionError, TxnOptions,
 };
 use tempfile::TempDir;
 
@@ -46,10 +46,10 @@ fn seed(db: &regolith::Db, keys: &[&[u8]]) {
 /// yielded the key it reasons about before reasoning about the commit.
 /// A scan that silently yielded nothing would prove nothing.
 fn scanned_keys(stream: regolith::TxnScanStream<'_>) -> Vec<Vec<u8>> {
-    stream.map(|(key, _)| key).collect()
+    stream.map(|item| item.unwrap().0).collect()
 }
 
-fn is_conflict(r: &regolith::TxResult<()>) -> bool {
+fn is_conflict<T>(r: &regolith::TxResult<T>) -> bool {
     matches!(r, Err(TransactionError::Conflict { .. }))
 }
 
@@ -75,7 +75,7 @@ fn serializable_aborts_when_a_scanned_key_is_overwritten() {
     let db = opt_db(&dir);
     seed(db.db(), &[b"a", b"k", b"z"]);
 
-    let a = db.begin_transaction_with(IsolationLevel::Serializable);
+    let a = db.begin(&TxnOptions::new().isolation(IsolationLevel::Serializable));
     let seen = scanned_keys(a.scan_stream(Some(b"a"), Some(b"z")));
     assert!(
         seen.contains(&b"k".to_vec()),
@@ -86,7 +86,7 @@ fn serializable_aborts_when_a_scanned_key_is_overwritten() {
     a.put(b"other", b"1").unwrap();
 
     match a.commit() {
-        Err(TransactionError::Conflict { key, .. }) => assert_eq!(key, b"k".to_vec()),
+        Err(TransactionError::Conflict(conflict)) => assert_eq!(conflict.key(), b"k"),
         other => panic!("expected a conflict on k, got {other:?}"),
     }
 }
@@ -107,7 +107,7 @@ fn serializable_ignores_keys_outside_the_scanned_range() {
         let db = opt_db(&dir);
         seed(db.db(), &[b"a", b"k", b"z"]);
 
-        let a = db.begin_transaction_with(IsolationLevel::Serializable);
+        let a = db.begin(&TxnOptions::new().isolation(IsolationLevel::Serializable));
         let seen = scanned_keys(a.scan_stream(Some(b"a"), Some(b"k")));
         assert!(
             !seen.contains(&b"k".to_vec()),
@@ -127,7 +127,7 @@ fn serializable_ignores_keys_outside_the_scanned_range() {
         let db = opt_db(&dir);
         seed(db.db(), &[b"a", b"k", b"k2", b"z"]);
 
-        let a = db.begin_transaction_with(IsolationLevel::Serializable);
+        let a = db.begin(&TxnOptions::new().isolation(IsolationLevel::Serializable));
         let seen = scanned_keys(a.scan_stream_in(Some(b"k2"), Some(b"z"), ScanDirection::Reverse));
         assert_eq!(seen, [b"k2".to_vec()]);
 
@@ -160,14 +160,15 @@ fn a_scan_then_write_of_the_same_bytes_never_loses_an_update() {
         let db = opt_db(&dir);
         db.db().put(b"counter", &5u64.to_le_bytes()).unwrap();
 
-        let first = db.begin_transaction_with(level);
-        let second = db.begin_transaction_with(level);
+        let first = db.begin(&TxnOptions::new().isolation(level));
+        let second = db.begin(&TxnOptions::new().isolation(level));
 
         for txn in [&first, &second] {
             let mut stream = txn.scan_stream(Some(b"counter"), Some(b"counter\0"));
             let (key, value) = stream
                 .next()
-                .unwrap_or_else(|| panic!("{level:?}: counter must be yielded"));
+                .unwrap_or_else(|| panic!("{level:?}: counter must be yielded"))
+                .unwrap();
             assert_eq!(key, b"counter".to_vec());
             assert_eq!(u64::from_le_bytes(value.as_slice().try_into().unwrap()), 5);
             drop(stream);
@@ -203,17 +204,18 @@ fn a_scan_then_write_of_the_same_bytes_never_loses_an_update() {
         let db = pes_db(&dir);
         db.db().put(b"counter", &5u64.to_le_bytes()).unwrap();
 
-        let a = db.begin_transaction_with(level);
+        let a = db.begin(&TxnOptions::new().isolation(level));
         {
             let mut stream = a.scan_stream(Some(b"counter"), Some(b"counter\0"));
             let (key, value) = stream
                 .next()
-                .unwrap_or_else(|| panic!("{level:?}: counter must be yielded"));
+                .unwrap_or_else(|| panic!("{level:?}: counter must be yielded"))
+                .unwrap();
             assert_eq!(key, b"counter".to_vec());
             assert_eq!(u64::from_le_bytes(value.as_slice().try_into().unwrap()), 5);
         }
 
-        let b = db.begin_transaction_with(level);
+        let b = db.begin(&TxnOptions::new().isolation(level));
         let current = u64::from_le_bytes(
             b.get_for_update(b"counter")
                 .unwrap()
@@ -253,7 +255,7 @@ fn read_committed_validates_nothing_it_did_not_write() {
         let db = opt_db(&dir);
         seed(db.db(), &[b"a", b"k", b"z"]);
 
-        let a = db.begin_transaction_with(level);
+        let a = db.begin(&TxnOptions::new().isolation(level));
         let seen = scanned_keys(a.scan_stream(Some(b"a"), Some(b"z")));
         assert!(
             seen.contains(&b"k".to_vec()),
@@ -293,7 +295,7 @@ fn reverse_and_prefix_scans_record_their_keys_too() {
         let db = opt_db(&dir);
         seed(db.db(), &[b"a", b"k", b"z"]);
 
-        let a = db.begin_transaction_with(IsolationLevel::Serializable);
+        let a = db.begin(&TxnOptions::new().isolation(IsolationLevel::Serializable));
         a.put(b"b", b"pending").unwrap();
         let seen = scanned_keys(a.scan_stream_in(Some(b"a"), Some(b"z"), ScanDirection::Reverse));
         assert_eq!(
@@ -305,7 +307,7 @@ fn reverse_and_prefix_scans_record_their_keys_too() {
         db.db().put(b"k", b"1").unwrap();
         a.put(b"other", b"1").unwrap();
         match a.commit() {
-            Err(TransactionError::Conflict { key, .. }) => assert_eq!(key, b"k".to_vec()),
+            Err(TransactionError::Conflict(conflict)) => assert_eq!(conflict.key(), b"k"),
             other => panic!("expected a conflict on k, got {other:?}"),
         }
     }
@@ -319,7 +321,7 @@ fn reverse_and_prefix_scans_record_their_keys_too() {
         let db = opt_db(&dir);
         seed(db.db(), &[b"p:1", b"p:k", b"p:z", b"q"]);
 
-        let a = db.begin_transaction_with(IsolationLevel::Serializable);
+        let a = db.begin(&TxnOptions::new().isolation(IsolationLevel::Serializable));
         a.put(b"p:m", b"pending").unwrap();
         let seen = scanned_keys(a.scan_stream(Some(b"p:"), Some(b"p;")));
         assert_eq!(
@@ -336,7 +338,7 @@ fn reverse_and_prefix_scans_record_their_keys_too() {
         db.db().put(b"p:k", b"1").unwrap();
         a.put(b"other", b"1").unwrap();
         match a.commit() {
-            Err(TransactionError::Conflict { key, .. }) => assert_eq!(key, b"p:k".to_vec()),
+            Err(TransactionError::Conflict(conflict)) => assert_eq!(conflict.key(), b"p:k"),
             other => panic!("expected a conflict on p:k, got {other:?}"),
         }
     }
@@ -349,7 +351,7 @@ fn reverse_and_prefix_scans_record_their_keys_too() {
         let db = opt_db(&dir);
         seed(db.db(), &[b"p:1", b"p:k", b"p:z", b"q"]);
 
-        let a = db.begin_transaction_with(IsolationLevel::Serializable);
+        let a = db.begin(&TxnOptions::new().isolation(IsolationLevel::Serializable));
         a.put(b"p:m", b"pending").unwrap();
         let seen = scanned_keys(a.scan_stream(Some(b"p:"), Some(b"p;")));
         assert_eq!(
@@ -372,19 +374,20 @@ fn reverse_and_prefix_scans_record_their_keys_too() {
 /// One actor's progress through `begin -> scan -> put -> commit`, so a
 /// schedule bit can be mapped straight onto "take this actor's next
 /// step" without re-deriving what that step is from the outside.
-enum Step<'a> {
+enum Step {
     NotBegun,
-    Begun(regolith::Transaction<'a>),
-    Scanned(regolith::Transaction<'a>, u64),
-    Ready(regolith::Transaction<'a>),
+    Begun(regolith::Transaction),
+    Scanned(regolith::Transaction, u64),
+    Ready(regolith::Transaction),
     Committed,
 }
 
 /// The value the counter holds according to a scan of `[c, d)`, which
 /// includes the counter itself and any neighbour keys T7 seeded beside
 /// it, so the tracked key is not the only one this scan records.
-fn scan_counter(txn: &regolith::Transaction<'_>, direction: ScanDirection) -> u64 {
-    for (key, value) in txn.scan_stream_in(Some(b"c"), Some(b"d"), direction) {
+fn scan_counter(txn: &regolith::Transaction, direction: ScanDirection) -> u64 {
+    for item in txn.scan_stream_in(Some(b"c"), Some(b"d"), direction) {
+        let (key, value) = item.unwrap();
         if key == b"counter" {
             return u64::from_le_bytes(value.as_slice().try_into().expect("8-byte counter"));
         }
@@ -396,14 +399,17 @@ fn scan_counter(txn: &regolith::Transaction<'_>, direction: ScanDirection) -> u6
 /// whether this step was a commit that came back `Conflict`, which
 /// resets the actor to `NotBegun` for a fresh attempt from a new
 /// snapshot.
-fn advance<'a>(
-    step: Step<'a>,
-    db: &'a OptimisticTransactionDb,
+fn advance(
+    step: Step,
+    db: &OptimisticTransactionDb,
     level: IsolationLevel,
     direction: ScanDirection,
-) -> (Step<'a>, bool) {
+) -> (Step, bool) {
     match step {
-        Step::NotBegun => (Step::Begun(db.begin_transaction_with(level)), false),
+        Step::NotBegun => (
+            Step::Begun(db.begin(&TxnOptions::new().isolation(level))),
+            false,
+        ),
         Step::Begun(txn) => {
             let seen = scan_counter(&txn, direction);
             (Step::Scanned(txn, seen), false)
@@ -413,7 +419,7 @@ fn advance<'a>(
             (Step::Ready(txn), false)
         }
         Step::Ready(txn) => match txn.commit() {
-            Ok(()) => (Step::Committed, false),
+            Ok(_) => (Step::Committed, false),
             Err(TransactionError::Conflict { .. }) => (Step::NotBegun, true),
             Err(e) => panic!("unexpected transaction error: {e}"),
         },
@@ -513,10 +519,11 @@ fn counter_of(value: &[u8]) -> u64 {
 
 /// The counter as a scan of `[count, counter2]` sees it. The neighbours on
 /// both sides put the counter strictly inside the stretch the scan walks.
-fn scan_counter_value(txn: &regolith::Transaction<'_>) -> Option<u64> {
+fn scan_counter_value(txn: &regolith::Transaction) -> Option<u64> {
     let mut seen = Vec::new();
     let mut counter = None;
-    for (key, value) in txn.scan_stream(Some(b"count"), Some(b"counter3")) {
+    for item in txn.scan_stream(Some(b"count"), Some(b"counter3")) {
+        let (key, value) = item.unwrap();
         if key == b"counter" {
             counter = Some(counter_of(value.as_slice()));
         }
@@ -536,8 +543,8 @@ fn a_scan_serves_a_locked_key_at_its_lock_horizon() {
         let db = pes_db(&dir);
         db.db().put(b"counter", &5u64.to_le_bytes()).unwrap();
         seed(db.db(), &[b"count", b"counter2"]);
-        let a = db.begin_transaction_with(level);
-        let b = db.begin_transaction_with(level);
+        let a = db.begin(&TxnOptions::new().isolation(level));
+        let b = db.begin(&TxnOptions::new().isolation(level));
         b.get_for_update(b"counter").unwrap();
         b.put(b"counter", &6u64.to_le_bytes()).unwrap();
         b.commit().unwrap();
@@ -563,9 +570,9 @@ fn a_scan_before_get_for_update_still_anchors_at_the_begin_snapshot() {
         let db = pes_db(&dir);
         db.db().put(b"counter", &5u64.to_le_bytes()).unwrap();
         seed(db.db(), &[b"count", b"counter2"]);
-        let a = db.begin_transaction_with(level);
+        let a = db.begin(&TxnOptions::new().isolation(level));
         assert_eq!(scan_counter_value(&a), Some(5));
-        let b = db.begin_transaction_with(level);
+        let b = db.begin(&TxnOptions::new().isolation(level));
         b.get_for_update(b"counter").unwrap();
         b.put(b"counter", &6u64.to_le_bytes()).unwrap();
         b.commit().unwrap();
@@ -590,15 +597,15 @@ fn a_scan_skips_a_locked_key_deleted_before_the_lock() {
         let dir = TempDir::new().unwrap();
         let db = pes_db(&dir);
         seed(db.db(), &[b"a", b"k", b"z"]);
-        let a = db.begin_transaction_with(level);
-        let b = db.begin_transaction_with(level);
+        let a = db.begin(&TxnOptions::new().isolation(level));
+        let b = db.begin(&TxnOptions::new().isolation(level));
         b.get_for_update(b"k").unwrap();
         b.delete(b"k").unwrap();
         b.commit().unwrap();
 
         assert_eq!(a.get_for_update(b"k").unwrap(), None);
         let stream = a.scan_stream(Some(b"a"), Some(b"zz"));
-        let seen: Vec<Vec<u8>> = stream.map(|(key, _)| key).collect();
+        let seen: Vec<Vec<u8>> = stream.map(|item| item.unwrap().0).collect();
         assert_eq!(seen, [b"a".to_vec(), b"z".to_vec()], "{level:?}");
     }
 }
@@ -610,12 +617,12 @@ fn a_write_inside_a_walked_range_is_validated_as_a_read() {
         let dir = TempDir::new().unwrap();
         let db = pes_db(&dir);
         seed(db.db(), &[b"a", b"z"]);
-        let a = db.begin_transaction_with(level);
+        let a = db.begin(&TxnOptions::new().isolation(level));
         assert_eq!(
             scanned_keys(a.scan_stream(Some(b"a"), Some(b"zz"))),
             [b"a".to_vec(), b"z".to_vec()]
         );
-        let b = db.begin_transaction_with(level);
+        let b = db.begin(&TxnOptions::new().isolation(level));
         b.put(b"m", b"b").unwrap();
         b.commit().unwrap();
         a.put(b"m", b"a").unwrap();
@@ -636,14 +643,14 @@ fn a_write_inside_a_walked_range_is_validated_as_a_read() {
                     if seeded_m {
                         seed(pes.db(), &[b"m"]);
                     }
-                    (pes.db(), pes.begin_transaction_with(level))
+                    (pes.db(), pes.begin(&TxnOptions::new().isolation(level)))
                 } else {
                     opt = opt_db(&dir);
                     seed(opt.db(), &[b"a", b"z"]);
                     if seeded_m {
                         seed(opt.db(), &[b"m"]);
                     }
-                    (opt.db(), opt.begin_transaction_with(level))
+                    (opt.db(), opt.begin(&TxnOptions::new().isolation(level)))
                 };
                 base.put(b"m", b"x").unwrap();
                 a.put(b"m", b"x").unwrap();
@@ -662,11 +669,11 @@ fn a_write_inside_a_walked_range_is_validated_as_a_read() {
 /// T10: a stream records its stretch at its first snapshot key and closes it where it stopped.
 #[test]
 fn a_stream_records_what_it_yielded_whenever_it_stops() {
-    let attempt = |scan: &dyn Fn(&regolith::Transaction<'_>), key: &[u8]| {
+    let attempt = |scan: &dyn Fn(&regolith::Transaction), key: &[u8]| {
         let dir = TempDir::new().unwrap();
         let db = opt_db(&dir);
         seed(db.db(), &[b"a", b"b", b"c"]);
-        let a = db.begin_transaction_with(IsolationLevel::SnapshotIsolation);
+        let a = db.begin(&TxnOptions::new().isolation(IsolationLevel::SnapshotIsolation));
         scan(&a);
         db.db().put(key, b"x").unwrap();
         a.put(key, b"x").unwrap();
@@ -714,7 +721,7 @@ fn a_stream_left_in_scope_does_not_hold_the_transaction() {
     let dir = TempDir::new().unwrap();
     let db = opt_db(&dir);
     seed(db.db(), &[b"a"]);
-    let tx = db.begin_transaction();
+    let tx = db.begin(&TxnOptions::new());
     let mut stream = tx.scan_stream(None, None);
     assert!(stream.next().is_some());
     tx.commit().unwrap();
@@ -741,13 +748,13 @@ fn repeatable_read_commits_when_a_scanned_key_is_reclaimed_underneath() {
         let db = opt_db(&dir);
         seed(db.db(), &keys);
 
-        let append = db.begin_transaction_with(level);
+        let append = db.begin(&TxnOptions::new().isolation(level));
         let heads = scanned_keys(append.scan_stream(Some(b"head/"), Some(b"head0")));
         let markers = scanned_keys(append.scan_stream(Some(b"marker/"), Some(b"marker0")));
         assert_eq!(heads, [b"head/current".to_vec(), b"head/old".to_vec()]);
         assert_eq!(markers, [b"marker/old/current".to_vec()]);
 
-        let prune = db.begin_transaction_with(level);
+        let prune = db.begin(&TxnOptions::new().isolation(level));
         prune.delete(b"head/old").unwrap();
         prune.delete(b"marker/old/current").unwrap();
         prune.commit().unwrap();
@@ -770,11 +777,11 @@ fn repeatable_read_commits_when_a_scanned_key_is_reclaimed_underneath() {
         let db = pes_db(&dir);
         seed(db.db(), &keys);
 
-        let append = db.begin_transaction_with(level);
+        let append = db.begin(&TxnOptions::new().isolation(level));
         let heads = scanned_keys(append.scan_stream(Some(b"head/"), Some(b"head0")));
         assert_eq!(heads, [b"head/current".to_vec(), b"head/old".to_vec()]);
 
-        let prune = db.begin_transaction_with(level);
+        let prune = db.begin(&TxnOptions::new().isolation(level));
         prune.delete(b"head/old").unwrap();
         prune.delete(b"marker/old/current").unwrap();
         prune.commit().unwrap();
@@ -802,13 +809,13 @@ fn repeatable_read_aborts_when_a_point_read_key_is_overwritten() {
     let db = opt_db(&dir);
     seed(db.db(), &[b"k"]);
 
-    let a = db.begin_transaction_with(IsolationLevel::RepeatableRead);
+    let a = db.begin(&TxnOptions::new().isolation(IsolationLevel::RepeatableRead));
     assert_eq!(a.get(b"k").unwrap(), Some(b"0".to_vec()));
     db.db().put(b"k", b"1").unwrap();
     a.put(b"other", b"1").unwrap();
 
     match a.commit() {
-        Err(TransactionError::Conflict { key, .. }) => assert_eq!(key, b"k".to_vec()),
+        Err(TransactionError::Conflict(conflict)) => assert_eq!(conflict.key(), b"k"),
         other => panic!("expected a conflict on k, got {other:?}"),
     }
 
@@ -816,15 +823,15 @@ fn repeatable_read_aborts_when_a_point_read_key_is_overwritten() {
     let db = pes_db(&dir);
     seed(db.db(), &[b"k"]);
 
-    let a = db.begin_transaction_with(IsolationLevel::RepeatableRead);
+    let a = db.begin(&TxnOptions::new().isolation(IsolationLevel::RepeatableRead));
     assert_eq!(a.get(b"k").unwrap(), Some(b"0".to_vec()));
-    let writer = db.begin_transaction_with(IsolationLevel::RepeatableRead);
+    let writer = db.begin(&TxnOptions::new().isolation(IsolationLevel::RepeatableRead));
     writer.put(b"k", b"1").unwrap();
     writer.commit().unwrap();
     a.put(b"other", b"1").unwrap();
 
     match a.commit() {
-        Err(TransactionError::Conflict { key, .. }) => assert_eq!(key, b"k".to_vec()),
+        Err(TransactionError::Conflict(conflict)) => assert_eq!(conflict.key(), b"k"),
         other => panic!("pessimistic: expected a conflict on k, got {other:?}"),
     }
 }
@@ -844,8 +851,8 @@ fn repeatable_read_admits_write_skew_through_scans() {
         let db = opt_db(&dir);
         seed(db.db(), &[b"x", b"y"]);
 
-        let a = db.begin_transaction_with(level);
-        let b = db.begin_transaction_with(level);
+        let a = db.begin(&TxnOptions::new().isolation(level));
+        let b = db.begin(&TxnOptions::new().isolation(level));
         assert_eq!(
             scanned_keys(a.scan_stream(Some(b"y"), Some(b"y0"))),
             [b"y".to_vec()]
@@ -878,7 +885,7 @@ fn repeatable_read_ignores_keys_outside_the_scanned_range() {
     let db = opt_db(&dir);
     seed(db.db(), &[b"a", b"k", b"z"]);
 
-    let a = db.begin_transaction_with(IsolationLevel::RepeatableRead);
+    let a = db.begin(&TxnOptions::new().isolation(IsolationLevel::RepeatableRead));
     let seen = scanned_keys(a.scan_stream(Some(b"a"), Some(b"k")));
     assert_eq!(seen, [b"a".to_vec()]);
 

@@ -620,10 +620,7 @@ mod tests {
     use tempfile::TempDir;
 
     fn tiny_flush_opts() -> Options {
-        Options {
-            write_buffer_size: 4 * 1024,
-            ..Options::default()
-        }
+        Options::default().write_buffer_size(4 * 1024)
     }
 
     fn populate(db: &Db, prefix: &str, n: usize) {

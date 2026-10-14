@@ -64,10 +64,7 @@ pub struct Fixture {
 
 impl Fixture {
     pub fn opts(&self) -> Options {
-        Options {
-            write_buffer_size: self.write_buffer,
-            ..Options::default()
-        }
+        Options::default().write_buffer_size(self.write_buffer)
     }
 
     /// Lay the pristine files down at `db`, replacing whatever a previous
@@ -207,10 +204,7 @@ pub fn table_fixture() -> &'static Fixture {
         const WRITE_BUFFER: usize = 4096;
         let root = TempDir::new().expect("table fixture: tempdir");
         let db = root.path().join("db");
-        let opts = Options {
-            write_buffer_size: WRITE_BUFFER,
-            ..Options::default()
-        };
+        let opts = Options::default().write_buffer_size(WRITE_BUFFER);
         let mut history = History::new();
         let handle = Db::open(&db, opts).expect("table fixture: open");
         for i in 0..KEYS {

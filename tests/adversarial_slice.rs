@@ -14,13 +14,11 @@ use regolith::{ArenaProfile, Db, DbSlice, Options, WriteBatch};
 use tempfile::TempDir;
 
 fn embedded_opts() -> Options {
-    Options {
-        write_buffer_size: 32 * 1024,
-        arena_profile: ArenaProfile::EMBEDDED,
-        block_cache_size: 64 * 1024,
-        block_cache_num_shard_bits: 0,
-        ..Options::default()
-    }
+    Options::default()
+        .write_buffer_size(32 * 1024)
+        .arena_profile(ArenaProfile::EMBEDDED)
+        .block_cache_size(64 * 1024)
+        .block_cache_num_shard_bits(0)
 }
 
 /// A slice taken from the memtable must survive the memtable being
@@ -189,11 +187,9 @@ fn empty_values_and_minimal_keys_round_trip() {
 #[test]
 fn values_far_larger_than_a_chunk_round_trip() {
     let dir = TempDir::new().unwrap();
-    let opts = Options {
-        write_buffer_size: 32 * 1024,
-        arena_profile: ArenaProfile::EMBEDDED,
-        ..Options::default()
-    };
+    let opts = Options::default()
+        .write_buffer_size(32 * 1024)
+        .arena_profile(ArenaProfile::EMBEDDED);
     let db = Db::open(dir.path(), opts).unwrap();
 
     // EMBEDDED caps ordinary chunks at 64 KiB.
@@ -246,14 +242,12 @@ fn values_far_larger_than_a_chunk_round_trip() {
 #[test]
 fn allocations_that_straddle_a_chunk_boundary_stay_intact() {
     let dir = TempDir::new().unwrap();
-    let opts = Options {
-        write_buffer_size: 1024 * 1024,
-        arena_profile: ArenaProfile {
+    let opts = Options::default()
+        .write_buffer_size(1024 * 1024)
+        .arena_profile(ArenaProfile {
             initial_chunk_size: 4096,
             max_chunk_size: 4096,
-        },
-        ..Options::default()
-    };
+        });
     let db = Db::open(dir.path(), opts).unwrap();
 
     let mut expected: Vec<(String, Vec<u8>)> = Vec::new();

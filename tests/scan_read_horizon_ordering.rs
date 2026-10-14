@@ -121,14 +121,7 @@ fn run(
 ) -> (u64, Vec<String>) {
     let dir = TempDir::new().expect("tempdir");
     let db = Arc::new(
-        Db::open(
-            dir.path(),
-            Options {
-                write_buffer_size: 16 * 1024,
-                ..Options::default()
-            },
-        )
-        .expect("open"),
+        Db::open(dir.path(), Options::default().write_buffer_size(16 * 1024)).expect("open"),
     );
     let cf = match surface {
         Surface::ScanCf | Surface::ScanPageCf => Some(Arc::new(

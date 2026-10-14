@@ -12,16 +12,7 @@ use regolith::{Db, Options};
 use tempfile::TempDir;
 
 fn open(dir: &TempDir) -> Arc<Db> {
-    Arc::new(
-        Db::open(
-            dir.path(),
-            Options {
-                write_buffer_size: 8 * 1024,
-                ..Options::default()
-            },
-        )
-        .expect("open"),
-    )
+    Arc::new(Db::open(dir.path(), Options::default().write_buffer_size(8 * 1024)).expect("open"))
 }
 
 const KEYS: usize = 512;

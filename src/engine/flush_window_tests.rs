@@ -39,11 +39,9 @@ fn reads_right_after_a_flush_installs_its_table_count_each_operand_once() {
     let db = Arc::new(
         Db::open(
             dir.path(),
-            Options {
-                max_background_compactions: 0,
-                merge_operator: Some(Arc::new(Append)),
-                ..Options::default()
-            },
+            Options::default()
+                .max_background_compactions(0)
+                .merge_operator(Some(Arc::new(Append))),
         )
         .unwrap(),
     );

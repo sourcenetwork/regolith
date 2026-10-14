@@ -18,10 +18,8 @@ use super::{assert_range_present, opts, sst_format_versions, write_range};
 
 /// [`opts`] with one or more knobs overridden, so an option-change test
 /// reads as the single knob it varies.
-fn tuned(set: impl FnOnce(&mut Options)) -> Options {
-    let mut o = opts();
-    set(&mut o);
-    o
+fn tuned(set: impl FnOnce(Options) -> Options) -> Options {
+    set(opts())
 }
 
 /// A closed database directory holding keys `0..n`, written under
@@ -70,8 +68,8 @@ fn assert_option_change_preserves_data(label: &str, from: Options, to: Options) 
 /// that no longer fit.
 #[test]
 fn reopening_with_a_resized_write_buffer_keeps_every_key() {
-    let small = tuned(|o| o.write_buffer_size = 4 * 1024);
-    let large = tuned(|o| o.write_buffer_size = 8 * 1024 * 1024);
+    let small = tuned(|o| o.write_buffer_size(4 * 1024));
+    let large = tuned(|o| o.write_buffer_size(8 * 1024 * 1024));
     assert_option_change_preserves_data("4 KiB -> 8 MiB", small.clone(), large.clone());
     assert_option_change_preserves_data("8 MiB -> 4 KiB", large, small);
 }
@@ -83,14 +81,8 @@ fn reopening_with_a_resized_write_buffer_keeps_every_key() {
 /// of from the file it is reading.
 #[test]
 fn reopening_with_a_different_block_or_bloom_geometry_keeps_every_key() {
-    let tight = tuned(|o| {
-        o.block_size = 1024;
-        o.bloom_bits_per_key = 4;
-    });
-    let loose = tuned(|o| {
-        o.block_size = 64 * 1024;
-        o.bloom_bits_per_key = 20;
-    });
+    let tight = tuned(|o| o.block_size(1024).bloom_bits_per_key(4));
+    let loose = tuned(|o| o.block_size(64 * 1024).bloom_bits_per_key(20));
     assert_option_change_preserves_data(
         "1 KiB/4 bits -> 64 KiB/20 bits",
         tight.clone(),
@@ -115,7 +107,7 @@ fn reopening_with_a_different_compression_codec_keeps_every_key() {
             if from == to {
                 continue;
             }
-            let mk = |c| tuned(|o| o.compression = c);
+            let mk = |c| tuned(|o| o.compression(c));
             assert_option_change_preserves_data(&format!("{from:?} -> {to:?}"), mk(from), mk(to));
         }
     }
@@ -131,13 +123,13 @@ fn reopening_with_a_different_compression_codec_keeps_every_key() {
 /// must still see.
 #[test]
 fn reopening_under_a_different_compaction_style_keeps_every_key() {
-    let leveled = tuned(|o| o.compaction_style = CompactionStyle::Level);
-    let universal = tuned(|o| o.compaction_style = CompactionStyle::Universal);
+    let leveled = tuned(|o| o.compaction_style(CompactionStyle::Level));
+    let universal = tuned(|o| o.compaction_style(CompactionStyle::Universal));
     let fifo = tuned(|o| {
-        o.compaction_style = CompactionStyle::Fifo;
-        o.fifo_compaction_options = FifoCompactionOptions {
-            max_table_files_size: 1 << 30,
-        };
+        o.compaction_style(CompactionStyle::Fifo)
+            .fifo_compaction_options(FifoCompactionOptions {
+                max_table_files_size: 1 << 30,
+            })
     });
 
     // Precondition, checked rather than assumed: the leveled seed really
@@ -176,11 +168,11 @@ fn reopening_under_a_different_compaction_style_keeps_every_key() {
 /// the footer.
 #[test]
 fn reopening_that_toggles_the_partitioned_index_reads_both_layouts() {
-    let flat = tuned(|o| o.l0_compaction_trigger = 1000);
+    let flat = tuned(|o| o.l0_compaction_trigger(1000));
     let partitioned = tuned(|o| {
-        o.l0_compaction_trigger = 1000;
-        o.partitioned_index = true;
-        o.metadata_block_size = 512;
+        o.l0_compaction_trigger(1000)
+            .partitioned_index(true)
+            .metadata_block_size(512)
     });
 
     // 5 is the flat footer and 6 the partitioned one, both under the
@@ -218,8 +210,8 @@ fn reopening_that_toggles_the_partitioned_index_reads_both_layouts() {
 /// format that differs between the two modes.
 #[test]
 fn reopening_with_a_different_durability_mode_keeps_every_key() {
-    let eventual = tuned(|o| o.durability = DurabilityMode::Eventual);
-    let immediate = tuned(|o| o.durability = DurabilityMode::Immediate);
+    let eventual = tuned(|o| o.durability(DurabilityMode::Eventual));
+    let immediate = tuned(|o| o.durability(DurabilityMode::Immediate));
     assert_option_change_preserves_data(
         "eventual -> immediate",
         eventual.clone(),

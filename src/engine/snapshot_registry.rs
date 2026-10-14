@@ -21,7 +21,7 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use crate::sync::{AtomicUsize, Condvar, Mutex, Ordering};
+use crate::sync::internal::{AtomicUsize, Condvar, Mutex, Ordering};
 
 use crate::env::Env;
 

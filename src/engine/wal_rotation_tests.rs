@@ -29,11 +29,9 @@ impl Drop for SyncFault {
 /// Default `Eventual` durability, so no commit syncs the log and the only sync
 /// a test can see is the rotation's.
 fn small_db(dir: &TempDir) -> Db {
-    let options = Options {
-        write_buffer_size: 4096,
-        max_background_compactions: 0,
-        ..Options::default()
-    };
+    let options = Options::default()
+        .write_buffer_size(4096)
+        .max_background_compactions(0);
     Db::open(dir.path(), options).unwrap()
 }
 

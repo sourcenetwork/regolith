@@ -438,9 +438,9 @@ fn delete_then_compact_then_reopen_keeps_every_surviving_version() {
 #[test]
 fn an_iterator_survives_the_compaction_that_unlinks_its_files() {
     let dir = TempDir::new().unwrap();
-    let (mut opts, stats) = instrumented(4 * 1024);
+    let (opts, stats) = instrumented(4 * 1024);
     // Small output files so the iterator's view spans several of them.
-    opts.target_file_size = 16 * 1024;
+    let opts = opts.target_file_size(16 * 1024);
     let db = Db::open(dir.path(), opts).unwrap();
 
     let total = 1_200usize;

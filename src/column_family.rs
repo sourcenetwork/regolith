@@ -66,7 +66,7 @@
 
 use std::sync::Arc;
 
-use crate::sync::Mutex;
+use crate::sync::internal::Mutex;
 
 /// Reserved column-family id used to store the CF registry. Users
 /// cannot create a CF with this id; user-facing CFs start at
@@ -117,10 +117,13 @@ impl PartialEq for ColumnFamilyHandle {
 
 impl Eq for ColumnFamilyHandle {}
 
+/// Length of the big-endian CF id [`prefix_key`] puts in front of a key.
+pub(crate) const CF_PREFIX_LEN: usize = 4;
+
 /// Encode a user key for a given CF. Returns
 /// `cf_id_be(4) || user_key`.
 pub(crate) fn prefix_key(cf_id: u32, key: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(4 + key.len());
+    let mut out = Vec::with_capacity(CF_PREFIX_LEN + key.len());
     out.extend_from_slice(&cf_id.to_be_bytes());
     out.extend_from_slice(key);
     out

@@ -26,15 +26,13 @@ fn key_for(i: usize) -> Vec<u8> {
 }
 
 fn base(partitioned: bool) -> Options {
-    Options {
-        write_buffer_size: 64 * 1024,
-        block_size: 512,
-        metadata_block_size: 512,
-        target_file_size: 128 * 1024,
-        partitioned_index: partitioned,
-        block_cache_num_shard_bits: 0,
-        ..Options::default()
-    }
+    Options::default()
+        .write_buffer_size(64 * 1024)
+        .block_size(512)
+        .metadata_block_size(512)
+        .target_file_size(128 * 1024)
+        .partitioned_index(partitioned)
+        .block_cache_num_shard_bits(0)
 }
 
 /// Seed a database once and hand back its directory.
@@ -81,11 +79,9 @@ fn verify_everything(db: &Db, label: &str) {
 fn assert_cache_is_far_too_small(dir: &TempDir, partitioned: bool, cache_bytes: usize) {
     let pinned = Db::open(
         dir.path(),
-        Options {
-            block_cache_size: 32 * 1024 * 1024,
-            cache_index_and_filter_blocks: false,
-            ..base(partitioned)
-        },
+        base(partitioned)
+            .block_cache_size(32 * 1024 * 1024)
+            .cache_index_and_filter_blocks(false),
     )
     .unwrap();
     let metadata = pinned
@@ -106,11 +102,9 @@ fn assert_cache_is_far_too_small(dir: &TempDir, partitioned: bool, cache_bytes: 
 fn a_flat_index_stays_correct_when_the_cache_cannot_hold_it() {
     let dir = seeded(false);
     assert_cache_is_far_too_small(&dir, false, 8 * 1024);
-    let opts = Options {
-        block_cache_size: 8 * 1024,
-        cache_index_and_filter_blocks: true,
-        ..base(false)
-    };
+    let opts = base(false)
+        .block_cache_size(8 * 1024)
+        .cache_index_and_filter_blocks(true);
     let db = Db::open(dir.path(), opts).unwrap();
     verify_everything(&db, "flat index, 8 KiB cache");
 }
@@ -119,11 +113,9 @@ fn a_flat_index_stays_correct_when_the_cache_cannot_hold_it() {
 fn a_partitioned_index_stays_correct_when_the_cache_cannot_hold_it() {
     let dir = seeded(true);
     assert_cache_is_far_too_small(&dir, true, 4 * 1024);
-    let opts = Options {
-        block_cache_size: 4 * 1024,
-        cache_index_and_filter_blocks: true,
-        ..base(true)
-    };
+    let opts = base(true)
+        .block_cache_size(4 * 1024)
+        .cache_index_and_filter_blocks(true);
     let db = Db::open(dir.path(), opts).unwrap();
     verify_everything(&db, "partitioned index, 4 KiB cache");
 }
@@ -134,12 +126,10 @@ fn a_partitioned_index_stays_correct_when_the_cache_cannot_hold_it() {
 #[test]
 fn a_strict_capacity_cache_that_refuses_the_index_still_reads_correctly() {
     let dir = seeded(false);
-    let opts = Options {
-        block_cache_size: 4 * 1024,
-        strict_capacity_limit: true,
-        cache_index_and_filter_blocks: true,
-        ..base(false)
-    };
+    let opts = base(false)
+        .block_cache_size(4 * 1024)
+        .strict_capacity_limit(true)
+        .cache_index_and_filter_blocks(true);
     let db = Db::open(dir.path(), opts).unwrap();
     verify_everything(&db, "strict capacity, 4 KiB cache");
 }
@@ -153,11 +143,9 @@ fn evicted_metadata_answers_identically_to_pinned_metadata() {
 
         let pinned = Db::open(
             dir.path(),
-            Options {
-                block_cache_size: 32 * 1024 * 1024,
-                cache_index_and_filter_blocks: false,
-                ..base(partitioned)
-            },
+            base(partitioned)
+                .block_cache_size(32 * 1024 * 1024)
+                .cache_index_and_filter_blocks(false),
         )
         .unwrap();
         let pinned_scan = pinned.scan(None, None).unwrap();
@@ -169,11 +157,9 @@ fn evicted_metadata_answers_identically_to_pinned_metadata() {
 
         let evicting = Db::open(
             dir.path(),
-            Options {
-                block_cache_size: 8 * 1024,
-                cache_index_and_filter_blocks: true,
-                ..base(partitioned)
-            },
+            base(partitioned)
+                .block_cache_size(8 * 1024)
+                .cache_index_and_filter_blocks(true),
         )
         .unwrap();
         let evicting_scan = evicting.scan(None, None).unwrap();
@@ -200,11 +186,9 @@ fn concurrent_readers_survive_metadata_eviction() {
     let db = Arc::new(
         Db::open(
             dir.path(),
-            Options {
-                block_cache_size: 8 * 1024,
-                cache_index_and_filter_blocks: true,
-                ..base(true)
-            },
+            base(true)
+                .block_cache_size(8 * 1024)
+                .cache_index_and_filter_blocks(true),
         )
         .unwrap(),
     );
@@ -246,11 +230,9 @@ fn iteration_stays_correct_when_metadata_is_evicted() {
     let dir = seeded(true);
     let db = Db::open(
         dir.path(),
-        Options {
-            block_cache_size: 8 * 1024,
-            cache_index_and_filter_blocks: true,
-            ..base(true)
-        },
+        base(true)
+            .block_cache_size(8 * 1024)
+            .cache_index_and_filter_blocks(true),
     )
     .unwrap();
 

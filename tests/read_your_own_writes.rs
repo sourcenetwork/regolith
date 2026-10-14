@@ -37,14 +37,7 @@ fn a_writer_always_reads_back_at_least_its_own_write() {
 
     let dir = TempDir::new().expect("tempdir");
     let db = Arc::new(
-        Db::open(
-            dir.path(),
-            Options {
-                write_buffer_size: 8 * 1024,
-                ..Options::default()
-            },
-        )
-        .expect("open"),
+        Db::open(dir.path(), Options::default().write_buffer_size(8 * 1024)).expect("open"),
     );
 
     let bad: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
@@ -123,14 +116,7 @@ fn every_publisher_of_the_read_view_running_at_once_stays_live() {
     let secs = env("REGOLITH_LIVE_SECS", 8);
     let dir = TempDir::new().expect("tempdir");
     let db = Arc::new(
-        Db::open(
-            dir.path(),
-            Options {
-                write_buffer_size: 4 * 1024,
-                ..Options::default()
-            },
-        )
-        .expect("open"),
+        Db::open(dir.path(), Options::default().write_buffer_size(4 * 1024)).expect("open"),
     );
     let stop = Arc::new(AtomicBool::new(false));
     let progress = Arc::new(AtomicU64::new(0));

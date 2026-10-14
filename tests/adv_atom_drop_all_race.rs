@@ -44,14 +44,7 @@ fn readers_never_observe_a_freed_view_across_drop_all() {
 
     let dir = TempDir::new().expect("tempdir");
     let db = Arc::new(
-        Db::open(
-            dir.path(),
-            Options {
-                write_buffer_size: 8 * 1024,
-                ..Options::default()
-            },
-        )
-        .expect("open"),
+        Db::open(dir.path(), Options::default().write_buffer_size(8 * 1024)).expect("open"),
     );
 
     let bad: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));

@@ -17,7 +17,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
 
-use regolith::{IsolationLevel, OptimisticTransactionDb, Options, TransactionError};
+use regolith::{IsolationLevel, OptimisticTransactionDb, Options, TransactionError, TxnOptions};
 use tempfile::TempDir;
 
 /// Run the two-key write-skew schedule with both transactions
@@ -48,7 +48,7 @@ fn write_skew_pairs(isolation: IsolationLevel, rounds: usize) -> usize {
             let db = Arc::clone(&db);
             let barrier = Arc::clone(&barrier);
             handles.push(thread::spawn(move || {
-                let tx = db.begin_transaction();
+                let tx = db.begin(&TxnOptions::new());
                 // Read the key the *other* transaction is about to write.
                 // A plain read: this is the edge snapshot isolation does
                 // not validate.
@@ -59,7 +59,7 @@ fn write_skew_pairs(isolation: IsolationLevel, rounds: usize) -> usize {
                 if seen.as_deref() == Some(b"0".as_ref()) {
                     tx.put(&mine, b"1").expect("write");
                 }
-                matches!(tx.commit(), Ok(()))
+                tx.commit().is_ok()
             }));
         }
         let committed = handles
@@ -131,7 +131,7 @@ fn serializable_commits_transactions_that_do_not_conflict() {
         .with_isolation(IsolationLevel::Serializable);
 
     for i in 0..200u64 {
-        let tx = db.begin_transaction();
+        let tx = db.begin(&TxnOptions::new());
         let k = format!("k{i:04}");
         tx.get(k.as_bytes()).expect("read");
         tx.put(k.as_bytes(), b"v").expect("write");
@@ -158,7 +158,7 @@ fn serializable_read_only_transactions_commit_under_concurrent_writes() {
             .expect("seed");
     }
 
-    let tx = db.begin_transaction();
+    let tx = db.begin(&TxnOptions::new());
     for i in 0..50u64 {
         tx.get(format!("r{i:04}").as_bytes()).expect("read");
     }
@@ -182,7 +182,7 @@ fn the_level_can_be_chosen_per_transaction() {
     assert_eq!(db.isolation(), IsolationLevel::SnapshotIsolation);
 
     db.db().put(b"a", b"0").expect("seed");
-    let tx = db.begin_transaction_with(IsolationLevel::Serializable);
+    let tx = db.begin(&TxnOptions::new().isolation(IsolationLevel::Serializable));
     tx.get(b"a").expect("read");
     // A concurrent commit to the key this transaction read.
     db.db().put(b"a", b"1").expect("concurrent write");

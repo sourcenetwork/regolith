@@ -73,7 +73,7 @@ use std::ptr::NonNull;
 
 use super::arena::Arena;
 use super::internal_key::{INTERNAL_KEY_SUFFIX_LEN, compare_internal_keys, compare_internal_split};
-use crate::sync::{Arc, AtomicPtr, AtomicU64, AtomicUsize, Ordering};
+use crate::sync::internal::{Arc, AtomicPtr, AtomicU64, AtomicUsize, Ordering};
 
 #[cfg(test)]
 mod tests;
@@ -356,7 +356,7 @@ pub(crate) struct ArenaSkipList {
     rnd: AtomicU64,
     count: AtomicUsize,
     #[cfg(debug_assertions)]
-    inserting: crate::sync::AtomicBool,
+    inserting: crate::sync::internal::AtomicBool,
 }
 
 // SAFETY (S8): the only cross-thread communication is through the tower's
@@ -389,7 +389,7 @@ impl ArenaSkipList {
             rnd: AtomicU64::new(0x2545_F491_4F6C_DD1D),
             count: AtomicUsize::new(0),
             #[cfg(debug_assertions)]
-            inserting: crate::sync::AtomicBool::new(false),
+            inserting: crate::sync::internal::AtomicBool::new(false),
         })
     }
 
@@ -522,7 +522,7 @@ impl ArenaSkipList {
         hint: Option<&mut InsertHint<'a>>,
     ) -> bool {
         #[cfg(debug_assertions)]
-        let _writer = crate::sync::SingleWriterGuard::enter(
+        let _writer = crate::sync::internal::SingleWriterGuard::enter(
             &self.inserting,
             "ArenaSkipList::insert is single-writer (S2); the engine must serialize writers",
         );

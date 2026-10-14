@@ -1,4 +1,5 @@
-//! Lifecycle event callbacks for flush, compaction, and ingest.
+//! Lifecycle event callbacks for flush, compaction, ingest, and transaction
+//! conflicts.
 //!
 //! Callers register one or more [`EventListener`] implementations via
 //! [`crate::Options::listeners`] to react to engine lifecycle events.
@@ -13,8 +14,10 @@
 //! triggered them - flush events on the thread that ran the flush (a
 //! writer, or an ingest writing out the memtables written before it),
 //! compaction events on the compaction thread, ingest events on
-//! the ingest caller's thread. Listeners **MUST NOT block** or re-enter
-//! the database. The contract is "do a cheap thing or spawn a task."
+//! the ingest caller's thread, conflict events on the thread whose commit
+//! lost the race, once the commit has released its locks. Listeners
+//! **MUST NOT block** or re-enter the database. The contract is "do a
+//! cheap thing or spawn a task."
 //! Blocking inside a listener stalls the engine and will starve
 //! background compaction / flush pipelines.
 //!
@@ -27,15 +30,11 @@
 //! - Per-column-family filtering is out of scope. A listener sees
 //!   every event from every CF; callers that only care about a
 //!   subset should filter in the callback.
-//! - `on_wal_full` is declared so listener implementations can
-//!   target a common shape across storage backends, but regolith
-//!   itself never fires it - the WAL is rotated alongside every
-//!   memtable, so there's no separate "WAL-full" condition.
 
 use std::path::PathBuf;
 use std::time::Duration;
 
-use crate::Error;
+use crate::{Conflict, Error};
 
 /// Why the flush / compaction path chose to produce a file, used
 /// by [`TableFileCreationInfo::reason`].
@@ -51,6 +50,7 @@ pub enum TableFileCreationReason {
 
 /// Information about a flush that just completed.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct FlushJobInfo {
     /// Numeric id of the SSTable that now holds the flushed
     /// memtable's contents.
@@ -76,6 +76,7 @@ pub struct FlushJobInfo {
 /// [`EventListener::on_compaction_begin`] and
 /// [`EventListener::on_compaction_completed`].
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct CompactionJobInfo {
     /// Source level (the level compaction is reading from).
     pub input_level: usize,
@@ -101,6 +102,7 @@ pub struct CompactionJobInfo {
 /// both flush output and compaction output, distinguished by
 /// [`TableFileCreationReason`].
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct TableFileCreationInfo {
     /// Numeric id of the SSTable.
     pub file_id: u64,
@@ -121,6 +123,7 @@ pub struct TableFileCreationInfo {
 /// that removed the file from the live set and the physical
 /// `unlink(2)` has succeeded.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct TableFileDeletionInfo {
     /// Numeric id of the unlinked file.
     pub file_id: u64,
@@ -131,6 +134,7 @@ pub struct TableFileDeletionInfo {
 /// Information about a file ingested via
 /// [`crate::Db::ingest_external_files`].
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct ExternalFileIngestionInfo {
     /// Path the caller supplied to `ingest_external_files`.
     pub external_file_path: PathBuf,
@@ -144,21 +148,9 @@ pub struct ExternalFileIngestionInfo {
     pub file_size: u64,
 }
 
-/// Information about a full WAL. The struct is declared so that
-/// listener implementations can target a common shape across
-/// storage backends; regolith itself never fires this callback,
-/// because the engine rotates the WAL alongside every memtable
-/// and there is no separate "WAL-full" condition.
-#[derive(Debug, Clone)]
-pub struct WalFullInfo {
-    /// Numeric id of the full WAL file.
-    pub wal_id: u64,
-    /// Size of the full WAL file in bytes.
-    pub size: u64,
-}
-
 /// Reason passed to [`EventListener::on_background_error`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum BackgroundErrorReason {
     /// A background flush (memtable → L0) failed.
     Flush,
@@ -178,6 +170,10 @@ pub enum BackgroundErrorReason {
 ///
 /// **Listeners must not block or re-enter the database.** See the
 /// module-level docs for the dispatch contract.
+///
+/// A panic in this trait's code while a commit's memtable rotation runs it
+/// fails that commit with [`crate::Error::CallbackPanicked`] and latches the
+/// database read-only until it is reopened.
 pub trait EventListener: Send + Sync + 'static {
     /// Called after a memtable has been flushed to a new L0
     /// SSTable and the manifest edit has been applied.
@@ -227,11 +223,23 @@ pub trait EventListener: Send + Sync + 'static {
         let _ = (reason, err);
     }
 
-    /// Declared so listeners can target a common shape across
-    /// storage backends; regolith itself never fires this callback.
-    /// See the module-level docs.
-    fn on_wal_full(&self, info: &WalFullInfo) {
-        let _ = info;
+    /// Called once for each transaction commit that lost a race, on the
+    /// thread that committed, after the commit released its locks. The
+    /// [`Conflict`] says what the transaction did with the key and what the
+    /// newer write was, so a caller can count the reasons in its own
+    /// telemetry. A [`crate::OptimisticTransactionDb::transact`] retry that
+    /// conflicts again calls it again.
+    fn on_conflict(&self, conflict: &Conflict) {
+        let _ = conflict;
+    }
+
+    /// Called when a transaction callback panics after its transaction's
+    /// outcome was decided: `callback` is `"on_commit"`, `"on_abort"`,
+    /// `"TransactionHooks::on_commit"` or `"TransactionHooks::on_abort"`.
+    /// The panic is caught, the outcome stands, and the transaction's other
+    /// callbacks still run. Called on the thread that completed the outcome.
+    fn on_callback_panic(&self, callback: &'static str) {
+        let _ = callback;
     }
 }
 
@@ -247,9 +255,26 @@ where
     }
 }
 
+/// [`dispatch`] for a call that can run inside a commit's ordered step: there
+/// a listener's panic is caught and returned as
+/// [`Error::CallbackPanicked`](crate::Error::CallbackPanicked), and the
+/// listeners after it are not told.
+pub(crate) fn dispatch_contained<F>(
+    listeners: &[std::sync::Arc<dyn EventListener>],
+    f: F,
+) -> Result<(), crate::Error>
+where
+    F: Fn(&dyn EventListener),
+{
+    listeners
+        .iter()
+        .try_for_each(|l| crate::engine::callback::contain("EventListener", || f(l.as_ref())))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{Access, WriteKind};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -264,7 +289,6 @@ mod tests {
         files_deleted: AtomicUsize,
         ingests: AtomicUsize,
         bg_errors: AtomicUsize,
-        wal_fulls: AtomicUsize,
     }
 
     impl EventListener for CountingListener {
@@ -285,9 +309,6 @@ mod tests {
         }
         fn on_background_error(&self, _: BackgroundErrorReason, _: &Error) {
             self.bg_errors.fetch_add(1, Ordering::Relaxed);
-        }
-        fn on_wal_full(&self, _: &WalFullInfo) {
-            self.wal_fulls.fetch_add(1, Ordering::Relaxed);
         }
     }
 
@@ -322,7 +343,13 @@ mod tests {
         n.on_flush_completed(&sample_flush());
         n.on_compaction_begin(&sample_compaction());
         n.on_compaction_completed(&sample_compaction());
-        n.on_wal_full(&WalFullInfo { wal_id: 1, size: 0 });
+        n.on_conflict(&Conflict::new(
+            b"k".to_vec(),
+            Access::Read,
+            WriteKind::Put,
+            1,
+            2,
+        ));
         // No panic reaching here is the assertion.
     }
 

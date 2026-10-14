@@ -97,12 +97,10 @@ struct Fixture {
 
 fn fill(flush_to_sstables: bool) -> Fixture {
     let dir = TempDir::new().expect("tempdir");
-    let opts = Options {
+    let opts = Options::default()
         // Comfortably larger than the whole data set so the warm case
         // is genuinely warm and eviction never re-reads a block.
-        block_cache_size: 256 * 1024 * 1024,
-        ..Options::default()
-    };
+        .block_cache_size(256 * 1024 * 1024);
     let db = Db::open(dir.path(), opts).expect("open");
     let value = vec![b'v'; VALUE_LEN];
     for i in 0..OPS {

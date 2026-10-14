@@ -120,14 +120,14 @@ impl CompactionScheduler {
     // shared handles the workers would have taken unread.
     #[cfg_attr(target_arch = "wasm32", allow(unused_variables))]
     pub(crate) fn start(
-        compaction_lock: Arc<crate::sync::Gate>,
+        compaction_lock: Arc<crate::sync::internal::Gate>,
         snapshot_registry: Arc<SnapshotRegistry>,
         versions: Arc<VersionStore>,
         sst_dir: Arc<Path>,
         cache: Arc<BlockCache>,
         opts: CompactionOptions,
         stall_signal: Arc<crate::engine::StallSignal>,
-        in_progress: Arc<crate::sync::Mutex<HashSet<u64>>>,
+        in_progress: Arc<crate::sync::internal::Mutex<HashSet<u64>>>,
         health: Arc<BackgroundHealth>,
     ) -> std::io::Result<Self> {
         let shutdown = Arc::new(AtomicBool::new(false));
@@ -411,14 +411,14 @@ fn compaction_loop(
     shutdown: Arc<AtomicBool>,
     trigger: Receiver<()>,
     pending: Arc<AtomicBool>,
-    compaction_lock: Arc<crate::sync::Gate>,
+    compaction_lock: Arc<crate::sync::internal::Gate>,
     snapshot_registry: Arc<SnapshotRegistry>,
     versions: Arc<VersionStore>,
     sst_dir: Arc<Path>,
     cache: Arc<BlockCache>,
     opts: CompactionOptions,
     stall_signal: Arc<crate::engine::StallSignal>,
-    in_progress: Arc<crate::sync::Mutex<HashSet<u64>>>,
+    in_progress: Arc<crate::sync::internal::Mutex<HashSet<u64>>>,
     health: Arc<BackgroundHealth>,
 ) {
     let mut backoff = FailureBackoff::default();
@@ -475,8 +475,7 @@ fn compaction_loop(
                         // debuggers notice it - the scheduler
                         // itself keeps running.
                         if !opts.listeners.is_empty() {
-                            let err =
-                                crate::Error::from(std::io::Error::new(e.kind(), e.to_string()));
+                            let err = crate::Error::from(crate::Error::clone_io(&e));
                             crate::event_listener::dispatch(&opts.listeners, |l| {
                                 l.on_background_error(
                                     crate::event_listener::BackgroundErrorReason::Compaction,
@@ -553,7 +552,7 @@ const WHOLE_POOL_CLAIM: u64 = u64::MAX;
 /// empty set. The check and the claim have to be one critical section.
 fn claim_whole_pool(
     versions: &Arc<VersionStore>,
-    in_progress: &crate::sync::Mutex<HashSet<u64>>,
+    in_progress: &crate::sync::internal::Mutex<HashSet<u64>>,
 ) -> Option<Vec<u64>> {
     let mut ip = in_progress.lock();
     if !ip.is_empty() {
@@ -574,7 +573,7 @@ fn claim_whole_pool(
 
 /// Drop a claim. Always runs, including on a failed job, so a worker that
 /// errors does not strand the files it held.
-fn release_claim(in_progress: &crate::sync::Mutex<HashSet<u64>>, ids: &[u64]) {
+fn release_claim(in_progress: &crate::sync::internal::Mutex<HashSet<u64>>, ids: &[u64]) {
     let mut ip = in_progress.lock();
     for id in ids {
         ip.remove(id);
@@ -587,7 +586,7 @@ pub(crate) fn pick_and_run_compaction(
     cache: &BlockCache,
     opts: &CompactionOptions,
     snapshots: &SnapshotRegistry,
-    in_progress: &crate::sync::Mutex<HashSet<u64>>,
+    in_progress: &crate::sync::internal::Mutex<HashSet<u64>>,
 ) -> std::io::Result<CompactionOutcome> {
     match opts.compaction_style {
         crate::options::CompactionStyle::Level => {
@@ -803,7 +802,7 @@ fn pick_and_run_level_compaction(
     cache: &BlockCache,
     opts: &CompactionOptions,
     snapshots: &SnapshotRegistry,
-    in_progress: &crate::sync::Mutex<HashSet<u64>>,
+    in_progress: &crate::sync::internal::Mutex<HashSet<u64>>,
 ) -> std::io::Result<CompactionOutcome> {
     let version = versions.lock().current();
 
@@ -932,7 +931,7 @@ fn compact_l0(
     cache: &BlockCache,
     opts: &CompactionOptions,
     snapshots: &SnapshotRegistry,
-    in_progress: &crate::sync::Mutex<HashSet<u64>>,
+    in_progress: &crate::sync::internal::Mutex<HashSet<u64>>,
 ) -> std::io::Result<CompactionOutcome> {
     compact_level(versions, sst_dir, cache, opts, 0, snapshots, in_progress)
 }
@@ -947,7 +946,7 @@ fn compact_level(
     opts: &CompactionOptions,
     level: usize,
     snapshots: &SnapshotRegistry,
-    in_progress: &crate::sync::Mutex<HashSet<u64>>,
+    in_progress: &crate::sync::internal::Mutex<HashSet<u64>>,
 ) -> std::io::Result<CompactionOutcome> {
     let target_level = level + 1;
     if target_level >= MAX_LEVELS {
@@ -2084,14 +2083,14 @@ mod tests {
         let started = {
             let _guard = SpawnFailureGuard::allowing(2);
             CompactionScheduler::start(
-                Arc::new(crate::sync::Gate::new()),
+                Arc::new(crate::sync::internal::Gate::new()),
                 Arc::new(SnapshotRegistry::new()),
                 Arc::clone(&versions),
                 Arc::from(sst_dir.as_path()),
                 Arc::new(BlockCache::new(4096)),
                 opts,
                 Arc::new(crate::engine::StallSignal::new()),
-                Arc::new(crate::sync::Mutex::new(HashSet::new())),
+                Arc::new(crate::sync::internal::Mutex::new(HashSet::new())),
                 Arc::new(BackgroundHealth::default()),
             )
         };
@@ -2185,14 +2184,14 @@ mod tests {
         let started = {
             let _guard = SpawnFailureGuard::allowing(7);
             CompactionScheduler::start(
-                Arc::new(crate::sync::Gate::new()),
+                Arc::new(crate::sync::internal::Gate::new()),
                 Arc::new(SnapshotRegistry::new()),
                 Arc::clone(&versions),
                 Arc::from(sst_dir.as_path()),
                 Arc::new(BlockCache::new(4096)),
                 opts,
                 Arc::new(crate::engine::StallSignal::new()),
-                Arc::new(crate::sync::Mutex::new(HashSet::new())),
+                Arc::new(crate::sync::internal::Mutex::new(HashSet::new())),
                 Arc::new(BackgroundHealth::default()),
             )
         };

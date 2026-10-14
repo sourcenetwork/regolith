@@ -24,12 +24,10 @@ fn two_tables(compaction_style: CompactionStyle) -> (TempDir, Arc<Db>) {
     let dir = TempDir::new().unwrap();
     let db = Db::open(
         dir.path(),
-        Options {
-            compaction_style,
-            l0_compaction_trigger: 2,
-            max_background_compactions: 0,
-            ..Options::default()
-        },
+        Options::default()
+            .compaction_style(compaction_style)
+            .l0_compaction_trigger(2)
+            .max_background_compactions(0),
     )
     .unwrap();
     db.put(b"k", b"v").unwrap();

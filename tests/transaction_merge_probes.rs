@@ -17,7 +17,7 @@ use std::sync::Arc;
 
 use regolith::{
     IsolationLevel, MergeOperator, OptimisticTransactionDb, Options, Statistics, Ticker,
-    TransactionError,
+    TransactionError, TxnOptions,
 };
 
 /// Sums big-endian i64 deltas, so two `+1` operands make `+2` and the
@@ -51,11 +51,9 @@ fn a_key_merged_many_times_is_probed_once() {
 
     let dir = tempfile::tempdir().unwrap();
     let stats = Arc::new(Statistics::new());
-    let options = Options {
-        merge_operator: Some(Arc::new(CounterMerge)),
-        statistics: Some(stats.clone()),
-        ..Options::default()
-    };
+    let options = Options::default()
+        .merge_operator(Some(Arc::new(CounterMerge)))
+        .statistics(Some(stats.clone()));
     let db = OptimisticTransactionDb::open(dir.path(), options).unwrap();
 
     // Flush the base value so every probe below has to reach the SSTable
@@ -65,7 +63,7 @@ fn a_key_merged_many_times_is_probed_once() {
     db.db().flush().unwrap();
     stats.reset();
 
-    let tx = db.begin_transaction_with(IsolationLevel::SnapshotIsolation);
+    let tx = db.begin(&TxnOptions::new().isolation(IsolationLevel::SnapshotIsolation));
     for _ in 0..MERGES {
         tx.merge(b"counter", &1i64.to_be_bytes()).unwrap();
     }
@@ -89,11 +87,9 @@ fn keys_merged_in_an_interleaved_order_are_probed_once_each() {
 
     let dir = tempfile::tempdir().unwrap();
     let stats = Arc::new(Statistics::new());
-    let options = Options {
-        merge_operator: Some(Arc::new(CounterMerge)),
-        statistics: Some(stats.clone()),
-        ..Options::default()
-    };
+    let options = Options::default()
+        .merge_operator(Some(Arc::new(CounterMerge)))
+        .statistics(Some(stats.clone()));
     let db = OptimisticTransactionDb::open(dir.path(), options).unwrap();
 
     // Flushed, as above, so every probe has to consult the SSTable's bloom
@@ -104,7 +100,7 @@ fn keys_merged_in_an_interleaved_order_are_probed_once_each() {
     db.db().flush().unwrap();
     stats.reset();
 
-    let tx = db.begin_transaction_with(IsolationLevel::SnapshotIsolation);
+    let tx = db.begin(&TxnOptions::new().isolation(IsolationLevel::SnapshotIsolation));
     for i in 0..MERGES {
         tx.merge(KEYS[i % KEYS.len()], &1i64.to_be_bytes()).unwrap();
     }
@@ -148,13 +144,10 @@ fn operands_merged_in_an_interleaved_order_read_back_in_the_order_they_were_buff
     const OPERANDS: usize = 90;
 
     let dir = tempfile::tempdir().unwrap();
-    let options = Options {
-        merge_operator: Some(Arc::new(AppendMerge)),
-        ..Options::default()
-    };
+    let options = Options::default().merge_operator(Some(Arc::new(AppendMerge)));
     let db = OptimisticTransactionDb::open(dir.path(), options).unwrap();
 
-    let tx = db.begin_transaction_with(IsolationLevel::SnapshotIsolation);
+    let tx = db.begin(&TxnOptions::new().isolation(IsolationLevel::SnapshotIsolation));
     let mut expected: [Vec<u8>; KEYS.len()] = Default::default();
     for i in 0..OPERANDS {
         // An uneven walk over the keys, so no key's operands sit side by side.
@@ -198,15 +191,12 @@ fn a_newer_merge_operand_conflicts_a_point_read_wherever_it_is_stored() {
         OperandAt::SameTable,
     ] {
         let dir = tempfile::tempdir().unwrap();
-        let options = Options {
-            merge_operator: Some(Arc::new(CounterMerge)),
-            ..Options::default()
-        };
+        let options = Options::default().merge_operator(Some(Arc::new(CounterMerge)));
         let db = OptimisticTransactionDb::open(dir.path(), options).unwrap();
         db.db().put(b"counter", &0i64.to_be_bytes()).unwrap();
         db.db().flush().unwrap();
 
-        let tx = db.begin_transaction_with(IsolationLevel::RepeatableRead);
+        let tx = db.begin(&TxnOptions::new().isolation(IsolationLevel::RepeatableRead));
         assert_eq!(
             tx.get(b"counter").unwrap().as_deref(),
             Some(0i64.to_be_bytes().as_slice())

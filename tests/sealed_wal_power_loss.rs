@@ -63,10 +63,7 @@ fn cut_at(trigger: Trigger, tear: TearMode) -> usize {
     let report =
         fault::simulate_power_loss_with(&out.spec.db_path, &out.journal, CutPoint::End, &popts);
 
-    let opts = Options {
-        write_buffer_size,
-        ..Options::default()
-    };
+    let opts = Options::default().write_buffer_size(write_buffer_size);
     match fault::recover_and_validate(&db, opts, &out.history) {
         Recovery::Recovered(r) => r.k,
         Recovery::RefusedToOpen(e) => panic!(

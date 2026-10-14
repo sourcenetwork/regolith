@@ -25,7 +25,7 @@
 //! site behind an `Option::is_some` check plus an `Arc` clone at
 //! open time. The hot-path overhead is a single branch. Reaching
 //! for a non-`None` statistics object adds one `fetch_add` per
-//! ticker update and a short mutex for histogram updates.
+//! ticker update and a few atomic operations per histogram sample.
 //!
 //! # Histograms
 //!
@@ -43,6 +43,7 @@ use crate::portability::{AtomicU64, Ordering};
 /// up a ticker is `O(1)` and thread-safe.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(usize)]
+#[non_exhaustive]
 pub enum Ticker {
     /// Total key + value bytes written to the memtable. Counts
     /// raw user bytes; does not include internal encoding
@@ -139,46 +140,44 @@ pub enum Ticker {
 
 const NUM_TICKERS: usize = 32;
 
-/// Every defined ticker, in discriminant order. Used by
-/// [`Statistics::dump`] to iterate all slots. Keep this in sync
-/// with the [`Ticker`] enum - adding a variant without
-/// appending here will silently drop it from the dump output.
-const ALL_TICKERS: &[Ticker] = &[
-    Ticker::BytesWritten,
-    Ticker::BytesRead,
-    Ticker::KeysWritten,
-    Ticker::KeysRead,
-    Ticker::KeysDeleted,
-    Ticker::RangeDeletesWritten,
-    Ticker::MergesWritten,
-    Ticker::BlockCacheHit,
-    Ticker::BlockCacheMiss,
-    Ticker::BlockCacheAdd,
-    Ticker::BloomFilterUseful,
-    Ticker::BloomFilterFullPositive,
-    Ticker::CompactionBytesRead,
-    Ticker::CompactionBytesWritten,
-    Ticker::CompactionCount,
-    Ticker::FlushBytesWritten,
-    Ticker::FlushCount,
-    Ticker::WalBytesWritten,
-    Ticker::WalSyncCount,
-    Ticker::IterSeekCount,
-    Ticker::IterNextCount,
-    Ticker::WriteStallMicros,
-    Ticker::SnapshotsRegistered,
-    Ticker::SnapshotsReleased,
-    Ticker::WalTailDiscarded,
-    Ticker::CommitCount,
-    Ticker::CommitConflicts,
-    Ticker::CommitConflictsOnRead,
-    Ticker::CommitConflictsOnWrite,
-    Ticker::CommitWritesElided,
-    Ticker::PolicyBlindMergesCommuted,
-    Ticker::PolicyScanRunsDropped,
-];
-
 impl Ticker {
+    /// Every defined ticker, in discriminant order. Adding a variant
+    /// without appending it here would drop it from [`Statistics::dump`].
+    pub const ALL: &'static [Ticker] = &[
+        Ticker::BytesWritten,
+        Ticker::BytesRead,
+        Ticker::KeysWritten,
+        Ticker::KeysRead,
+        Ticker::KeysDeleted,
+        Ticker::RangeDeletesWritten,
+        Ticker::MergesWritten,
+        Ticker::BlockCacheHit,
+        Ticker::BlockCacheMiss,
+        Ticker::BlockCacheAdd,
+        Ticker::BloomFilterUseful,
+        Ticker::BloomFilterFullPositive,
+        Ticker::CompactionBytesRead,
+        Ticker::CompactionBytesWritten,
+        Ticker::CompactionCount,
+        Ticker::FlushBytesWritten,
+        Ticker::FlushCount,
+        Ticker::WalBytesWritten,
+        Ticker::WalSyncCount,
+        Ticker::IterSeekCount,
+        Ticker::IterNextCount,
+        Ticker::WriteStallMicros,
+        Ticker::SnapshotsRegistered,
+        Ticker::SnapshotsReleased,
+        Ticker::WalTailDiscarded,
+        Ticker::CommitCount,
+        Ticker::CommitConflicts,
+        Ticker::CommitConflictsOnRead,
+        Ticker::CommitConflictsOnWrite,
+        Ticker::CommitWritesElided,
+        Ticker::PolicyBlindMergesCommuted,
+        Ticker::PolicyScanRunsDropped,
+    ];
+
     /// Stable string name for exporting to monitoring systems.
     pub fn name(&self) -> &'static str {
         match self {
@@ -219,11 +218,12 @@ impl Ticker {
 }
 
 /// Enumerated histograms recorded by the engine. Every variant
-/// is backed by one histogram slot in [`Statistics`], guarded
-/// by its own short mutex so recording is non-contending
-/// across histograms.
+/// is backed by one histogram slot in [`Statistics`] updated with
+/// lock-free atomics, so recording never blocks a thread and
+/// histograms do not contend with each other.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(usize)]
+#[non_exhaustive]
 pub enum Histogram {
     /// Wall-clock microseconds per `Db::get` call.
     DbGet = 0,
@@ -251,7 +251,7 @@ pub enum Histogram {
 const NUM_HISTOGRAMS: usize = 9;
 
 /// Every defined histogram, in discriminant order. Same pattern
-/// as [`ALL_TICKERS`].
+/// as [`Ticker::ALL`].
 const ALL_HISTOGRAMS: &[Histogram] = &[
     Histogram::DbGet,
     Histogram::DbWrite,
@@ -438,7 +438,7 @@ impl Statistics {
     pub fn dump(&self) -> String {
         let mut out = String::new();
         out.push_str("-- tickers --\n");
-        for ticker in ALL_TICKERS {
+        for ticker in Ticker::ALL {
             out.push_str(&format!(
                 "{:40} {}\n",
                 ticker.name(),
@@ -584,6 +584,14 @@ mod tests {
     }
 
     #[test]
+    fn ticker_all_lists_every_ticker_in_discriminant_order() {
+        assert_eq!(Ticker::ALL.len(), NUM_TICKERS);
+        for (slot, ticker) in Ticker::ALL.iter().enumerate() {
+            assert_eq!(*ticker as usize, slot, "{} is out of order", ticker.name());
+        }
+    }
+
+    #[test]
     fn dump_contains_every_ticker_and_histogram_name() {
         let s = Statistics::new();
         let out = s.dump();
@@ -608,7 +616,7 @@ mod tests {
             "commit",
             "policy",
         ];
-        let mut names: Vec<&str> = ALL_TICKERS
+        let mut names: Vec<&str> = Ticker::ALL
             .iter()
             .map(|t| t.name())
             .chain(ALL_HISTOGRAMS.iter().map(|h| h.name()))

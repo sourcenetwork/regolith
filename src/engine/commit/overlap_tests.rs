@@ -40,11 +40,9 @@ fn concurrent_durable_writers_cost_far_fewer_fsyncs_than_writes() {
     let db = Arc::new(
         Db::open(
             dir.path(),
-            Options {
-                durability: DurabilityMode::Immediate,
-                statistics: Some(Arc::clone(&stats)),
-                ..Options::default()
-            },
+            Options::default()
+                .durability(DurabilityMode::Immediate)
+                .statistics(Some(Arc::clone(&stats))),
         )
         .unwrap(),
     );

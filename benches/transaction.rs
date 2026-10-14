@@ -17,6 +17,7 @@ use std::time::{Duration, Instant};
 
 use regolith::{
     IsolationLevel, OptimisticTransactionDb, Transaction, TransactionDb, TransactionError,
+    TxnOptions,
 };
 
 const COUNTER_KEY: &[u8] = b"txn/counter";
@@ -36,15 +37,15 @@ const MAX_ATTEMPTS: u32 = 10_000;
 /// written once against this local one and neither flavor gets its own
 /// subtly different copy of the loop.
 trait TxnDb: Sync {
-    fn begin(&self) -> Transaction<'_>;
+    fn begin(&self) -> Transaction;
     fn read(&self, key: &[u8]) -> Option<Vec<u8>>;
 }
 
 macro_rules! impl_txn_db {
     ($flavor:ty) => {
         impl TxnDb for $flavor {
-            fn begin(&self) -> Transaction<'_> {
-                self.begin_transaction()
+            fn begin(&self) -> Transaction {
+                self.begin(&TxnOptions::new())
             }
 
             fn read(&self, key: &[u8]) -> Option<Vec<u8>> {
@@ -115,7 +116,7 @@ struct Attempts {
     commits: u64,
     conflicts: u64,
     busy: u64,
-    io_errors: u64,
+    engine_errors: u64,
     other_errors: u64,
     abandoned: u64,
 }
@@ -125,7 +126,7 @@ impl Attempts {
         self.commits += o.commits;
         self.conflicts += o.conflicts;
         self.busy += o.busy;
-        self.io_errors += o.io_errors;
+        self.engine_errors += o.engine_errors;
         self.other_errors += o.other_errors;
         self.abandoned += o.abandoned;
     }
@@ -134,18 +135,18 @@ impl Attempts {
         match e {
             TransactionError::Conflict { .. } => self.conflicts += 1,
             TransactionError::Busy(_) => self.busy += 1,
-            TransactionError::Io(_) => self.io_errors += 1,
+            TransactionError::Engine(_) => self.engine_errors += 1,
             _ => self.other_errors += 1,
         }
     }
 
     fn json(&self) -> String {
         format!(
-            "{{\"commits\":{},\"conflicts\":{},\"busy\":{},\"io_errors\":{},\"other_errors\":{},\"abandoned\":{}}}",
+            "{{\"commits\":{},\"conflicts\":{},\"busy\":{},\"engine_errors\":{},\"other_errors\":{},\"abandoned\":{}}}",
             self.commits,
             self.conflicts,
             self.busy,
-            self.io_errors,
+            self.engine_errors,
             self.other_errors,
             self.abandoned
         )
@@ -192,7 +193,7 @@ fn bump(db: &dyn TxnDb, key: &[u8]) -> Attempts {
             continue;
         }
         match tx.commit() {
-            Ok(()) => {
+            Ok(_) => {
                 acc.commits += 1;
                 return acc;
             }

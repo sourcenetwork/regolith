@@ -108,17 +108,15 @@ fn adv_overhead_child() {
     let stats = Arc::new(Statistics::new());
     let db = Db::open(
         &dir,
-        Options {
-            block_cache_size: cache_bytes,
-            block_cache_num_shard_bits: 0,
-            block_size,
+        Options::default()
+            .block_cache_size(cache_bytes)
+            .block_cache_num_shard_bits(0)
+            .block_size(block_size)
             // A worker thread can hold a retired node back for as long as it
             // goes unscheduled, which no flush on this thread can reach, so
             // the measurement would move with machine load.
-            max_background_compactions: 0,
-            statistics: Some(Arc::clone(&stats)),
-            ..Options::default()
-        },
+            .max_background_compactions(0)
+            .statistics(Some(Arc::clone(&stats))),
     )
     .unwrap();
 
@@ -157,12 +155,10 @@ fn a_cached_entry_costs_no_more_heap_than_it_is_charged() {
         let dir = tempfile::TempDir::new().unwrap();
         let db = Db::open(
             dir.path(),
-            Options {
-                block_cache_size: 0,
-                block_size,
-                write_buffer_size: 4 * 1024 * 1024,
-                ..Options::default()
-            },
+            Options::default()
+                .block_cache_size(0)
+                .block_size(block_size)
+                .write_buffer_size(4 * 1024 * 1024),
         )
         .unwrap();
         for i in 0..KEYS {

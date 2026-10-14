@@ -17,7 +17,7 @@ use std::sync::Arc;
 
 use regolith::{
     IsolationLevel, KeyClass, KeyClassifier, MergeOperator, OptimisticTransactionDb, Options,
-    Statistics, Ticker, TransactionError, TxResult,
+    Statistics, Ticker, TransactionError, TxResult, TxnOptions,
 };
 
 /// Sums big-endian i64 deltas, so two `+1` operands make `+2` and the
@@ -59,17 +59,15 @@ impl KeyClassifier for HeadPrefix {
 }
 
 fn open(dir: &std::path::Path, stats: Arc<Statistics>) -> OptimisticTransactionDb {
-    let options = Options {
-        merge_operator: Some(Arc::new(CounterMerge)),
-        statistics: Some(stats),
-        ..Options::default()
-    };
+    let options = Options::default()
+        .merge_operator(Some(Arc::new(CounterMerge)))
+        .statistics(Some(stats));
     OptimisticTransactionDb::open(dir, options)
         .unwrap()
         .with_policy(Arc::new(HeadPrefix))
 }
 
-fn conflicted(result: TxResult<()>) -> bool {
+fn conflicted<T>(result: TxResult<T>) -> bool {
     matches!(result, Err(TransactionError::Conflict { .. }))
 }
 
@@ -80,7 +78,7 @@ fn a_clean_commit_counts_once_and_a_conflict_counts_once() {
     let db = open(dir.path(), Arc::clone(&stats));
     db.db().put(b"k", b"old").unwrap();
 
-    let tx = db.begin_transaction_with(IsolationLevel::SnapshotIsolation);
+    let tx = db.begin(&TxnOptions::new().isolation(IsolationLevel::SnapshotIsolation));
     tx.put(b"elsewhere", b"x").unwrap();
     tx.commit().unwrap();
     assert_eq!(stats.get_ticker(Ticker::CommitCount), 1);
@@ -88,7 +86,7 @@ fn a_clean_commit_counts_once_and_a_conflict_counts_once() {
 
     // A read overtaken by an external write conflicts once, whatever the
     // number of keys the transaction touched.
-    let tx = db.begin_transaction_with(IsolationLevel::RepeatableRead);
+    let tx = db.begin(&TxnOptions::new().isolation(IsolationLevel::RepeatableRead));
     tx.get(b"k").unwrap();
     db.db().put(b"k", b"new").unwrap();
     tx.put(b"elsewhere", b"y").unwrap();
@@ -108,7 +106,7 @@ fn a_conflict_on_a_written_key_is_counted_on_write() {
 
     // A blind put of a different value than the key now holds: the
     // conflict is on the written key, not on any read.
-    let tx = db.begin_transaction_with(IsolationLevel::SnapshotIsolation);
+    let tx = db.begin(&TxnOptions::new().isolation(IsolationLevel::SnapshotIsolation));
     tx.put(b"k", b"mine").unwrap();
     db.db().put(b"k", b"theirs").unwrap();
     assert!(conflicted(tx.commit()));
@@ -124,7 +122,7 @@ fn an_identical_blind_write_is_elided_not_counted_as_a_conflict() {
     let db = open(dir.path(), Arc::clone(&stats));
     db.db().put(b"k", b"same").unwrap();
 
-    let tx = db.begin_transaction_with(IsolationLevel::SnapshotIsolation);
+    let tx = db.begin(&TxnOptions::new().isolation(IsolationLevel::SnapshotIsolation));
     tx.put(b"k", b"same").unwrap();
     db.db().put(b"k", b"same").unwrap();
     tx.commit().unwrap();
@@ -141,7 +139,7 @@ fn a_blind_merge_past_a_newer_operand_commutes_once_per_key() {
     let db = open(dir.path(), Arc::clone(&stats));
     db.db().put(b"counter", &0i64.to_be_bytes()).unwrap();
 
-    let tx = db.begin_transaction_with(IsolationLevel::DefraLevel);
+    let tx = db.begin(&TxnOptions::new().isolation(IsolationLevel::DefraLevel));
     tx.merge(b"counter", &1i64.to_be_bytes()).unwrap();
     db.db().merge(b"counter", &1i64.to_be_bytes()).unwrap();
     tx.commit().unwrap();
@@ -159,7 +157,7 @@ fn a_scan_inside_a_commutative_prefix_drops_one_stretch() {
     db.db().put(b"h/a", b"cid").unwrap();
     db.db().put(b"h/z", b"cid").unwrap();
 
-    let tx = db.begin_transaction_with(IsolationLevel::DefraLevel);
+    let tx = db.begin(&TxnOptions::new().isolation(IsolationLevel::DefraLevel));
     let walked: Vec<_> = tx.scan_stream(Some(b"h/"), Some(b"h0")).collect();
     assert!(!walked.is_empty());
     tx.put(b"h/m", b"superseded").unwrap();
@@ -180,8 +178,8 @@ fn a_scan_leaving_the_prefix_keeps_its_stretch() {
     // Two transactions scan a stretch that leaves the commutative
     // prefix: the stretch is recorded, so the second commit conflicts
     // where a scan fully inside the prefix would not.
-    let first = db.begin_transaction_with(IsolationLevel::DefraLevel);
-    let second = db.begin_transaction_with(IsolationLevel::DefraLevel);
+    let first = db.begin(&TxnOptions::new().isolation(IsolationLevel::DefraLevel));
+    let second = db.begin(&TxnOptions::new().isolation(IsolationLevel::DefraLevel));
     for tx in [&first, &second] {
         let walked: Vec<_> = tx.scan_stream(Some(b"h/"), Some(b"j")).collect();
         assert!(!walked.is_empty());
@@ -197,16 +195,13 @@ fn a_scan_leaving_the_prefix_keeps_its_stretch() {
 #[test]
 fn without_statistics_nothing_panics_and_the_commit_still_runs() {
     let dir = tempfile::tempdir().unwrap();
-    let options = Options {
-        merge_operator: Some(Arc::new(CounterMerge)),
-        ..Options::default()
-    };
+    let options = Options::default().merge_operator(Some(Arc::new(CounterMerge)));
     let db = OptimisticTransactionDb::open(dir.path(), options)
         .unwrap()
         .with_policy(Arc::new(HeadPrefix));
     db.db().put(b"counter", &0i64.to_be_bytes()).unwrap();
 
-    let tx = db.begin_transaction_with(IsolationLevel::DefraLevel);
+    let tx = db.begin(&TxnOptions::new().isolation(IsolationLevel::DefraLevel));
     tx.merge(b"counter", &1i64.to_be_bytes()).unwrap();
     db.db().merge(b"counter", &1i64.to_be_bytes()).unwrap();
     tx.commit().unwrap();
@@ -232,7 +227,7 @@ fn commuted_blind_merges_count_once_per_key() {
         db.db().put(key, &0i64.to_be_bytes()).unwrap();
     }
 
-    let tx = db.begin_transaction_with(IsolationLevel::DefraLevel);
+    let tx = db.begin(&TxnOptions::new().isolation(IsolationLevel::DefraLevel));
     for key in [b"a", b"a", b"b", b"c", b"d"] {
         tx.merge(key, &1i64.to_be_bytes()).unwrap();
     }
@@ -255,7 +250,7 @@ fn elided_writes_count_once_per_overtaken_key() {
     let stats = Arc::new(Statistics::new());
     let db = open(dir.path(), stats.clone());
 
-    let tx = db.begin_transaction_with(IsolationLevel::SnapshotIsolation);
+    let tx = db.begin(&TxnOptions::new().isolation(IsolationLevel::SnapshotIsolation));
     for key in [b"a", b"b", b"c", b"d", b"e"] {
         tx.put(key, b"same").unwrap();
     }
@@ -277,7 +272,7 @@ fn an_uncontended_commit_moves_only_the_commit_count() {
     let db = open(dir.path(), stats.clone());
     db.db().put(b"counter", &0i64.to_be_bytes()).unwrap();
 
-    let tx = db.begin_transaction_with(IsolationLevel::DefraLevel);
+    let tx = db.begin(&TxnOptions::new().isolation(IsolationLevel::DefraLevel));
     tx.merge(b"counter", &1i64.to_be_bytes()).unwrap();
     tx.put(b"k", b"v").unwrap();
     let _: Vec<_> = tx.scan_stream(Some(b"a"), Some(b"z")).collect();
@@ -305,7 +300,7 @@ fn an_aborted_commit_counts_no_elided_writes() {
     let stats = Arc::new(Statistics::new());
     let db = open(dir.path(), stats.clone());
 
-    let tx = db.begin_transaction_with(IsolationLevel::SnapshotIsolation);
+    let tx = db.begin(&TxnOptions::new().isolation(IsolationLevel::SnapshotIsolation));
     tx.put(b"a", b"same").unwrap();
     tx.put(b"b", b"mine").unwrap();
     db.db().put(b"a", b"same").unwrap();
@@ -328,7 +323,7 @@ fn an_aborted_commit_counts_no_commuted_blind_merges() {
     db.db().put(b"a", &0i64.to_be_bytes()).unwrap();
     db.db().put(b"b", &0i64.to_be_bytes()).unwrap();
 
-    let tx = db.begin_transaction_with(IsolationLevel::DefraLevel);
+    let tx = db.begin(&TxnOptions::new().isolation(IsolationLevel::DefraLevel));
     tx.merge(b"a", &1i64.to_be_bytes()).unwrap();
     tx.merge(b"b", &1i64.to_be_bytes()).unwrap();
     db.db().merge(b"a", &1i64.to_be_bytes()).unwrap();
@@ -351,7 +346,7 @@ fn an_aborted_commit_counts_no_dropped_scan_stretches() {
     let db = open(dir.path(), stats.clone());
     db.db().put(b"h/a", b"cid").unwrap();
 
-    let tx = db.begin_transaction_with(IsolationLevel::DefraLevel);
+    let tx = db.begin(&TxnOptions::new().isolation(IsolationLevel::DefraLevel));
     let walked: Vec<_> = tx.scan_stream(Some(b"h/"), Some(b"h0")).collect();
     assert!(!walked.is_empty());
     tx.put(b"k", b"mine").unwrap();
@@ -364,10 +359,7 @@ fn an_aborted_commit_counts_no_dropped_scan_stretches() {
 }
 
 fn pessimistic(dir: &std::path::Path, stats: Arc<Statistics>) -> regolith::TransactionDb {
-    let options = Options {
-        statistics: Some(stats),
-        ..Options::default()
-    };
+    let options = Options::default().statistics(Some(stats));
     regolith::TransactionDb::open(dir, options)
         .unwrap()
         .with_lock_timeout(std::time::Duration::from_millis(50))
@@ -381,12 +373,12 @@ fn pessimistic_commits_and_conflicts_are_counted() {
     db.db().put(b"k", b"old").unwrap();
     stats.reset();
 
-    let tx = db.begin_transaction_with(IsolationLevel::RepeatableRead);
+    let tx = db.begin(&TxnOptions::new().isolation(IsolationLevel::RepeatableRead));
     tx.put(b"a", b"1").unwrap();
     tx.commit().unwrap();
     assert_eq!(count(&stats, Ticker::CommitCount), 1);
 
-    let tx = db.begin_transaction_with(IsolationLevel::RepeatableRead);
+    let tx = db.begin(&TxnOptions::new().isolation(IsolationLevel::RepeatableRead));
     tx.get(b"k").unwrap();
     db.db().put(b"k", b"new").unwrap();
     tx.put(b"b", b"1").unwrap();
@@ -403,9 +395,9 @@ fn a_busy_lock_counts_as_neither_commit_nor_conflict() {
     let stats = Arc::new(Statistics::new());
     let db = pessimistic(dir.path(), stats.clone());
 
-    let holder = db.begin_transaction_with(IsolationLevel::RepeatableRead);
+    let holder = db.begin(&TxnOptions::new().isolation(IsolationLevel::RepeatableRead));
     holder.put(b"k", b"held").unwrap();
-    let waiter = db.begin_transaction_with(IsolationLevel::RepeatableRead);
+    let waiter = db.begin(&TxnOptions::new().isolation(IsolationLevel::RepeatableRead));
     assert!(matches!(
         waiter.put(b"k", b"blocked"),
         Err(TransactionError::Busy(_))

@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use crate::env::{BufferedWriter, Env, WriteMode};
 
-use crate::sync::RwLock;
+use crate::sync::internal::RwLock;
 
 use super::checksum;
 use super::sstable::{

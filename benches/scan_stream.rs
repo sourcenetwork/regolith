@@ -127,10 +127,7 @@ fn num(x: f64) -> String {
 }
 
 fn build(keys: &[Vec<u8>]) -> (common::TempDb, Db) {
-    let opts = Options {
-        block_cache_size: BLOCK_CACHE,
-        ..Options::default()
-    };
+    let opts = Options::default().block_cache_size(BLOCK_CACHE);
     let (tmp, db) = common::open("scan_stream", opts);
     let wopts = WriteOptions {
         disable_wal: true,
@@ -158,7 +155,8 @@ fn is_test_run() -> bool {
 /// Consume the whole range through the streaming API.
 fn stream_all(db: &Db) -> u64 {
     let mut seen = 0u64;
-    for (key, value) in db.scan_stream(None, None).expect("scan_stream") {
+    for entry in db.scan_stream(None, None).expect("scan_stream") {
+        let (key, value) = entry.expect("scan row");
         black_box((key.len(), value.len()));
         seen += 1;
     }
@@ -215,7 +213,8 @@ fn scan_stream(c: &mut Criterion) {
                 .scan_stream(None, None)
                 .expect("scan_stream")
                 .next()
-                .expect("a first row");
+                .expect("a first row")
+                .expect("scan row");
             black_box(first.0.len())
         })
     });
@@ -236,7 +235,10 @@ fn scan_stream(c: &mut Criterion) {
                 .scan_stream(None, None)
                 .expect("scan_stream")
                 .take(PAGE)
-                .map(|(key, value)| key.len() + value.len())
+                .map(|entry| {
+                    let (key, value) = entry.expect("scan row");
+                    key.len() + value.len()
+                })
                 .sum();
             black_box(taken)
         })

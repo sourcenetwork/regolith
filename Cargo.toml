@@ -27,6 +27,10 @@ categories = ["database-implementations"]
 
 [features]
 fuzzing = []
+# `regolith::testing`: property checks a caller runs in its own test suite
+# against its own trait implementations. Not built for wasm, which has no
+# `proptest`.
+testing = ["dep:proptest"]
 # Atomics for a target with no hardware compare-and-swap, such as
 # `thumbv6m-none-eabi`. `portable-atomic` then implements the missing
 # operations inside a critical section. The *binary* must also depend
@@ -43,7 +47,6 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }
 [dependencies]
 kovan = "0.1.22"
 kovan-map = "0.1.22"
-kovan-mvcc = "0.1.22"
 kovan-queue = "0.1.22"
 kovan-channel = "0.1.22"
 
@@ -63,6 +66,9 @@ thiserror = "1.0"
 
 [target.'cfg(unix)'.dependencies]
 rustix = { version = "1.1", features = ["fs"] }
+
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+proptest = { version = "1", optional = true }
 
 [target.'cfg(loom)'.dependencies]
 loom = "0.7"
@@ -100,6 +106,11 @@ wasm-bindgen-test = "0.3"
 [target.'cfg(not(target_family = "wasm"))'.dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
 proptest = "1"
+
+# `tests/sync_no_syscall.rs` installs a seccomp filter around the
+# `regolith::sync` hot loops; seccomp is Linux-only.
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+libc = "0.2"
 
 # The test suite is compute-bound: compaction merges, checksums, bloom
 # hashing and skip-list walks, driven millions of times by the
@@ -164,7 +175,19 @@ name = "transaction"
 harness = false
 
 [[bench]]
+name = "append"
+harness = false
+
+[[bench]]
+name = "txn_callbacks"
+harness = false
+
+[[bench]]
 name = "scan_commit"
+harness = false
+
+[[bench]]
+name = "read_rules"
 harness = false
 
 [[bench]]
@@ -185,4 +208,8 @@ harness = false
 
 [[bench]]
 name = "collect"
+harness = false
+
+[[bench]]
+name = "sync"
 harness = false

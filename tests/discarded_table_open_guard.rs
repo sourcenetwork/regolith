@@ -50,10 +50,7 @@ fn crash_child() {
 }
 
 fn opts(write_buffer_size: usize) -> Options {
-    Options {
-        write_buffer_size,
-        ..Options::default()
-    }
+    Options::default().write_buffer_size(write_buffer_size)
 }
 
 fn cut_first_flush(db: &std::path::Path, tear: TearMode) -> ChildOutcome {

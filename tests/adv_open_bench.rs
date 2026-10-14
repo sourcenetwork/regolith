@@ -194,14 +194,12 @@ impl Env for CountingEnv {
 }
 
 fn bench_opts(env: Arc<dyn Env>) -> Options {
-    Options {
-        env,
-        max_background_compactions: 0,
-        l0_compaction_trigger: 1_000_000,
-        level0_slowdown_writes_trigger: 1_000_000,
-        level0_stop_writes_trigger: 1_000_000,
-        ..Options::default()
-    }
+    Options::default()
+        .env(env)
+        .max_background_compactions(0)
+        .l0_compaction_trigger(1_000_000)
+        .level0_slowdown_writes_trigger(1_000_000)
+        .level0_stop_writes_trigger(1_000_000)
 }
 
 /// Deterministic, poorly-compressible bytes: a seeded xorshift denies
