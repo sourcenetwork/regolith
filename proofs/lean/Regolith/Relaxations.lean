@@ -7,7 +7,11 @@ import Regolith.Validation
 This file continues `Regolith/Validation.lean` and backs the same TLA+ model,
 `proofs/tla/RepeatableRead.tla`. Validation.lean proves that every class's
 rule gives a history serial in commit order. Here each class's declared
-relaxation is stated exactly, with the RED cases as counterexamples:
+relaxation is stated exactly, with the RED cases as counterexamples. (In the
+TLA+ model a GREEN configuration runs the rule as the engine has it and must
+break no promise in any order of events; a RED one plants one bug or misuse
+and must break the promise it names. A RED case here is the small worked
+counterexample that shows, in numbers, why that promise breaks.)
 
 * `blindMerge_commutes` (configuration `MC_DefraLevel_Green_Counters`,
   invariant `INV_IncrementsCommitUnlessReplaced`): with commuting operands, a
