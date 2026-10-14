@@ -18,7 +18,9 @@ use super::raw_semaphore::{PermitWait, RawSemaphore};
 /// Uncontended, [`try_lock`](Self::try_lock) and a guard's drop are one
 /// atomic read-modify-write each and allocate nothing. A caller takes the
 /// lock whenever it is free, even while others wait; under contention
-/// [`lock`](Self::lock) queues and returns `Pending`.
+/// [`lock`](Self::lock) spins briefly within the poll (see the
+/// [module docs](super#what-every-primitive-guarantees)), then queues and
+/// returns `Pending`.
 /// An unlock wakes the oldest waiter to try again; a waiter that loses
 /// [`MAX_BYPASS`](super::MAX_BYPASS) times is handed the lock directly,
 /// and `try_lock` fails until it has had it.
@@ -68,8 +70,10 @@ impl<T: ?Sized> Mutex<T> {
         }
     }
 
-    /// Waits for the lock. Uncontended, the first poll is one atomic
-    /// read-modify-write. Contended, it is lock-free, not wait-free: see
+    /// Waits for the lock. Uncontended, the first poll is one load and one
+    /// atomic read-modify-write. Contended, a poll may spin for up to the
+    /// lock's spin budget before it queues, and again after a retry it lost,
+    /// before it returns `Pending`; it is lock-free, not wait-free: see
     /// [Progress](super#progress).
     #[inline]
     pub fn lock(&self) -> Lock<'_, T> {
