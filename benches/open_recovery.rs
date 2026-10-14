@@ -19,6 +19,8 @@
 //! Environment: `TABLES` (default 256), `LOGS` (default 64), `TAIL_KIB`
 //! (default 64), `REPS` (default 7).
 
+mod common;
+
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -43,18 +45,6 @@ fn opts() -> Options {
         .l0_compaction_trigger(1 << 20)
         .level0_slowdown_writes_trigger(0)
         .level0_stop_writes_trigger(0)
-}
-
-fn copy_db(from: &Path, to: &Path) {
-    for sub in ["wal", "sst"] {
-        fs::create_dir_all(to.join(sub)).expect("mkdir");
-        for e in fs::read_dir(from.join(sub)).expect("read_dir").flatten() {
-            fs::copy(e.path(), to.join(sub).join(e.file_name())).expect("copy");
-        }
-    }
-    for file in ["MANIFEST", "LOCK"] {
-        fs::copy(from.join(file), to.join(file)).expect("copy");
-    }
 }
 
 fn logs(db: &Path) -> Vec<PathBuf> {
@@ -114,7 +104,7 @@ fn time_opens(label: &str, shape: &Path, scratch: &Path, reps: u64, puts: u64) {
     let mut micros = Vec::new();
     for rep in 0..reps {
         let dir = scratch.join(format!("{label}-{rep}"));
-        copy_db(shape, &dir);
+        common::copy_db(shape, &dir);
         let start = Instant::now();
         let opened = Db::open(&dir, opts());
         let elapsed = start.elapsed().as_micros() as u64;
@@ -125,7 +115,12 @@ fn time_opens(label: &str, shape: &Path, scratch: &Path, reps: u64, puts: u64) {
                     db.get(last.as_bytes()).expect("get").is_some(),
                     "{label}: the last put did not survive"
                 );
-                std::mem::forget(db);
+                // Every copy is opened once and never again: closed here, its
+                // descriptors, lock and worker are given back, so a later
+                // repetition is not refused for the files earlier ones held.
+                db.close().expect("close");
+                drop(db);
+                fs::remove_dir_all(&dir).expect("remove the copy");
                 micros.push(elapsed);
             }
             Err(e) => {
@@ -159,7 +154,7 @@ fn main() {
     time_opens("clean", &clean, scratch.path(), reps, puts);
 
     let with_logs = scratch.path().join("leftover_logs");
-    copy_db(&clean, &with_logs);
+    common::copy_db(&clean, &with_logs);
     let header = empty_log(scratch.path());
     // Below every live log, as a flush leaves the logs it could not remove.
     let live = logs(&clean)
@@ -185,7 +180,7 @@ fn main() {
     time_opens("leftover_logs", &with_logs, scratch.path(), reps, puts);
 
     let torn = scratch.path().join("torn_manifest");
-    copy_db(&clean, &torn);
+    common::copy_db(&clean, &torn);
     let manifest = torn.join("MANIFEST");
     let mut bytes = fs::read(&manifest).expect("read");
     bytes.extend_from_slice(&garbage((tail_kib * 1024) as usize, 0x5EED));

@@ -17,6 +17,7 @@
 //! smallest shape that still has every publisher running at once; the
 //! soak shape is 900 and 400, which is hours of CPU and tens of GB of
 //! scratch space, not a gate.
+#![cfg(not(target_arch = "wasm32"))]
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Barrier, Mutex};

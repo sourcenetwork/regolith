@@ -73,7 +73,6 @@
 //!
 //! ```sh
 //! cargo test --test proptest_durability
-//! cargo test --test proptest_durability -- --ignored --skip crash_child
 //! PROPTEST_CASES=512 cargo test --test proptest_durability
 //! ```
 

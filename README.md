@@ -297,6 +297,17 @@ check sees it.
 `TransactionDb` is the pessimistic flavour: it takes key locks, so contention waits
 instead of retrying. `OptimisticTransactionDb` validates at commit and retries.
 
+The key locks live in a lock-free table: taking a free lock is one compare-and-swap, and no
+call takes a mutex or waits on a condition variable. A free lock goes to whoever asks first,
+even while others wait; a waiter passed over `regolith::sync::MAX_BYPASS` times is handed the
+lock, so none starves. `get_for_update`, `put`, `delete` and `merge` wait for a lock another
+transaction holds, up to `with_lock_timeout`, and then fail with `TransactionError::Busy`,
+which is also what ends a deadlock. `try_get_for_update` never waits: it returns
+`WouldBlock::Locked` with a `LockWait`, completed on the transaction's own `IoQueue` at
+that queue's poll once the lock may be free, and the call is then run again. A
+`commit_nowait` releases its locks when the commit lands, not when its ticket is delivered,
+so another transaction never waits for this one's owner to poll.
+
 A commit that loses a race returns `TransactionError::Conflict`. Its `Conflict` names the
 key, what the transaction did with it (`Access`) and the newer write that won
 (`WriteKind`), with the two sequences. Its message gives the key's length and a short hash,
@@ -380,7 +391,14 @@ log cannot be told from a torn write, so it is dropped the same way: reported, n
 silent.
 
 A database written by 0.1.x opens, and the open rewrites its log in format 2, which 0.1.x
-refuses to open: the upgrade is one-way.
+refuses to open: the upgrade is one-way. A database a 0.1.x release left with tables of
+overlapping key ranges in one level opens too: the first open moves that level and the
+levels above it into level 0 and logs one warning (the `regolith.manifest.tables_demoted`
+ticker and property count the tables moved). A database a 0.1.x release left with a range
+delete below older keys it deletes reads them as deleted: the first open copies every range
+delete that may sit behind such a key in front of every key, logs one warning, and records
+the check so no later open repeats it (`regolith.manifest.range_deletes_copied` counts the
+copies).
 
 ## Encryption at rest
 
@@ -482,6 +500,8 @@ just elle       # Elle consistency checking of transaction histories
 just chaos      # the full-size read-view chaos workload
 just wasm       # the wasm32-wasip1 lifecycle under wasmtime
 ```
+
+`just test` and the other recipes that run under a limit need GNU `timeout` (coreutils).
 
 Each badge above is a workflow of its own, so a red one names exactly which property
 regressed.

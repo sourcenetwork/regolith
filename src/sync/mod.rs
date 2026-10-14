@@ -12,7 +12,21 @@
 //!
 //! - **No runtime.** A contended acquire queues a waiter, registers the
 //!   caller's `Waker` and returns `Pending`. What a wake does belongs to
-//!   the caller's executor.
+//!   the caller's executor. Within one poll, a contended acquire of a lock
+//!   or a semaphore may first spin for a short while (up to the lock's
+//!   spin budget, a count of pause instructions it adapts to how long holds
+//!   last, about 5 microseconds at most on the cores it was tuned on):
+//!   before it queues, and again after a retry it lost. The spin makes no
+//!   system call, reads no clock, and ends in the same queueing or the same
+//!   `Pending` as before. Locks whose holders keep them across long waits
+//!   of their own do not spin, and their contended callers queue at once:
+//!   the transaction lock table, the once-cell's initializer turn, the
+//!   bounded channel's send slots, and, in the engine, the compaction gate
+//!   (held for a pass, a job or a checkpoint copy), the flush exclusion
+//!   (held for a memtable flush), the close lock (held for a whole close)
+//!   and the serial log's lock (held across an append's device calls). The
+//!   engine's census and a late commit's snapshot pin are only ever tried,
+//!   never waited for, so they never spin either.
 //! - **Fast under contention.** The locks and the semaphore let a caller
 //!   take what is free even while others wait, so a release never waits
 //!   for a suspended task to run: the thread that released takes the lock
@@ -40,11 +54,31 @@
 //! touch the state word only, one atomic read-modify-write each. Anything
 //! that can make a waiter runnable (a release, a new waiter, a
 //! cancellation) takes the drain role with one compare-and-swap, or, when
-//! another thread holds it, marks the state dirty and returns, so no call
-//! ever waits for another. The holder wakes what the state allows (or,
-//! while a handoff is owed, grants it in queue order), rechecks until
+//! another thread holds it, leaves a mark for the holder and returns, so
+//! no call ever waits for another. The holder wakes what the state allows
+//! (or, while a handoff is owed, grants it in queue order), rechecks until
 //! nothing changed while it worked, and calls the wakers after it has
 //! given the role up.
+//!
+//! # Progress
+//!
+//! Every operation is lock-free, not wait-free. No call waits for another
+//! thread, and some call always completes; but a call may do work on
+//! behalf of others, and how much depends on them.
+//!
+//! - Uncontended, an acquire and a release are one atomic
+//!   read-modify-write each.
+//! - A call that can make a waiter runnable (a release with waiters, a new
+//!   waiter, a cancellation) may serve the queue itself. It returns after
+//!   one pass over the queue, plus at most one more pass for each of these
+//!   that lands while it works: a waiter that queues, a waiter that
+//!   withdraws, a waiter that claims the handoff it is owed, and a release
+//!   that finds a node queued.
+//! - A release over an empty queue earns no pass; a release that finds a
+//!   node queued earns one. So releases alone never keep a thread at work.
+//!   Waiters that keep queueing or withdrawing can, one pass each: every
+//!   such pass is another thread's own operation getting done, which is
+//!   what lock-free means, and there is no cap on the passes of one call.
 //!
 //! Besides the primitives, this module re-exports kovan's lock-free
 //! channels (their non-blocking half), map, queues and [`Atom`], so one
@@ -79,6 +113,7 @@ pub mod loom_model;
 mod mutex;
 mod notify;
 mod once_cell;
+mod owned_lock;
 mod owner;
 mod queue;
 mod raw_rwlock;
@@ -87,8 +122,9 @@ mod reentrant_mutex;
 mod reentrant_rwlock;
 mod rwlock;
 mod semaphore;
+mod spin;
 #[cfg(all(test, not(loom)))]
-mod test_support;
+pub(crate) mod test_support;
 mod waiter;
 
 pub use barrier::{Barrier, BarrierWait, BarrierWaitResult};
@@ -102,6 +138,9 @@ pub use lazy::Lazy;
 pub use mutex::{Lock, LockOwned, Mutex, MutexGuard, OwnedMutexGuard};
 pub use notify::{Notified, Notify};
 pub use once_cell::OnceCell;
+#[cfg(test)]
+pub(crate) use owned_lock::between_take_and_grant;
+pub(crate) use owned_lock::{OwnedLock, OwnedWait, OwnerId, TryLock};
 pub use owner::{Owner, ThreadOwner};
 pub use reentrant_mutex::{ReentrantMutex, ReentrantMutexGuard, ReentrantMutexLock};
 pub use reentrant_rwlock::{
@@ -109,8 +148,8 @@ pub use reentrant_rwlock::{
     ReentrantWriteGuard,
 };
 pub use rwlock::{
-    Read, RwLock, RwLockReadGuard, RwLockUpgradableReadGuard, RwLockWriteGuard, UpgradableRead,
-    Upgrade, Write,
+    OwnedRwLockWriteGuard, Read, RwLock, RwLockReadGuard, RwLockUpgradableReadGuard,
+    RwLockWriteGuard, UpgradableRead, Upgrade, Write, WriteOwned,
 };
 pub use semaphore::{Acquire, AcquireOwned, OwnedSemaphorePermit, Semaphore, SemaphorePermit};
 
@@ -139,6 +178,8 @@ mod tests {
         send_sync::<Write<'static, u8>>();
         send_sync::<RwLockReadGuard<'static, u8>>();
         send_sync::<RwLockWriteGuard<'static, u8>>();
+        send_sync::<WriteOwned<u8>>();
+        send_sync::<OwnedRwLockWriteGuard<u8>>();
         send_sync::<RwLockUpgradableReadGuard<'static, u8>>();
         send_sync::<UpgradableRead<'static, u8>>();
         send_sync::<Upgrade<'static, u8>>();
@@ -166,9 +207,14 @@ mod tests {
         send_sync::<BoundedReceiver<u8>>();
         // An owner moves with its task but is never shared (see `Owner`).
         send::<Owner>();
+        // A value that may be shared but not moved: the upgradable read
+        // can still be shared, and its doc test pins that it cannot move.
+        sync::<RwLockUpgradableReadGuard<'static, Option<std::sync::MutexGuard<'static, ()>>>>();
     }
 
     fn send<T: Send>() {}
+
+    fn sync<T: Sync>() {}
 
     #[test]
     fn async_entry_points_return_send_and_sync_futures() {

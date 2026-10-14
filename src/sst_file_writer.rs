@@ -38,9 +38,13 @@ pub struct SstFileWriter {
 pub struct SstFileMeta {
     /// Path the file was written to.
     pub path: PathBuf,
-    /// Smallest user key in the file.
+    /// Lower bound of the file in storage order. A file can hold entries of
+    /// several column families ([`SstFileWriter::put_cf`]), so this is not
+    /// a key as the caller wrote it: it is the 4-byte big-endian id of a
+    /// column family, then the caller's key in that family.
     pub smallest_user_key: Vec<u8>,
-    /// Largest user key in the file.
+    /// Upper bound of the file in storage order, in the form of
+    /// [`SstFileMeta::smallest_user_key`].
     pub largest_user_key: Vec<u8>,
     /// Number of point entries written (puts + deletes).
     pub num_entries: u64,

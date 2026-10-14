@@ -4,6 +4,7 @@
 //! became an iterator: a corrupt log fails the open loud, an intact log
 //! recovers every acknowledged write, and no corruption is ever silently
 //! skipped. "Opened with the wrong data" is the failure these tests hunt.
+#![cfg(not(target_arch = "wasm32"))]
 
 use std::fs;
 use std::fs::OpenOptions;

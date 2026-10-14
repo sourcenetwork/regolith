@@ -301,6 +301,38 @@ fn a_backup_taken_across_a_key_rotation_restores_under_the_keys_it_names() {
     assert!(files_holding(root.path(), b"user-key-").is_empty());
 }
 
+/// Right bytes for the metadata's key and the current key, wrong bytes for
+/// the key older tables are sealed under: the metadata opens and every key
+/// is there, but those tables' footers do not verify. The restore refuses
+/// before it writes anything, so the target opens nothing broken and takes
+/// a restore with the right keys afterwards.
+#[test]
+fn a_restore_refuses_wrong_bytes_for_an_older_tables_key_before_writing() {
+    let dir = TempDir::new().unwrap();
+    let keys = Keys::new(&[1, 2]);
+    // Tables under key 1.
+    let db = populated(dir.path(), &keys);
+    keys.set_current(2);
+    fill(&db, 420, 800);
+    let backups = TempDir::new().unwrap();
+    let mut engine = BackupEngine::open(backups.path()).unwrap();
+    // Metadata under key 2, tables under both.
+    let across = engine.create_backup(&db).unwrap();
+    drop(db);
+
+    let root = TempDir::new().unwrap();
+    let target = root.path().join("restored");
+    // Key 2 current and right, key 1 present with the wrong bytes.
+    let older_wrong = Keys::wrong_for(&[2, 1], &[1]);
+    assert_refused(&engine, across, &target, provider(&older_wrong), |e| {
+        matches!(e, Error::Corruption(_)) && e.to_string().contains("key id 1")
+    });
+
+    let both = Keys::new(&[2, 1]);
+    engine.restore(across, &target, provider(&both)).unwrap();
+    check(&Db::open(&target, options(&both)).unwrap(), 0, 800);
+}
+
 #[test]
 fn listing_deleting_and_purging_need_no_key_and_keep_what_sealed_backups_share() {
     let dir = TempDir::new().unwrap();
@@ -313,9 +345,13 @@ fn listing_deleting_and_purging_need_no_key_and_keep_what_sealed_backups_share()
     let second = engine.create_backup(&db).unwrap();
     drop(db);
 
-    // An engine that holds no key, as every engine does.
+    // An engine that holds no key, as every engine does: every sealed
+    // backup lists, and reads.
     let mut engine = BackupEngine::open(backups.path()).unwrap();
-    let infos = engine.list_backups();
+    let infos: Vec<_> = engine
+        .list_backups()
+        .map(|entry| entry.unwrap().unwrap())
+        .collect();
     assert_eq!(
         infos.iter().map(|i| i.id).collect::<Vec<_>>(),
         vec![first, second]
@@ -333,7 +369,7 @@ fn listing_deleting_and_purging_need_no_key_and_keep_what_sealed_backups_share()
     check(&Db::open(&target, options(&keys)).unwrap(), 0, 600);
 
     engine.purge_old_backups(0).unwrap();
-    assert!(engine.list_backups().is_empty());
+    assert_eq!(engine.list_backups().count(), 0);
     assert_eq!(shared_count(backups.path()), 0);
 }
 
@@ -361,6 +397,13 @@ fn a_backup_that_cannot_be_read_stops_a_delete_from_removing_shared_files() {
         shared_before,
         "a shared file the unreadable backup lists was removed"
     );
+    // The first is gone, and the second is listed with its reason, not
+    // left out.
+    let listed: Vec<_> = engine
+        .list_backups()
+        .map(|entry| entry.unwrap().map(|info| info.id).map_err(|bad| bad.id))
+        .collect();
+    assert_eq!(listed, [Err(second)]);
 }
 
 #[test]

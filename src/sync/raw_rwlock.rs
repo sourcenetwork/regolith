@@ -106,6 +106,17 @@ impl RawRwLock {
         }
     }
 
+    loom_const_fn! {
+        /// A lock whose contended acquires never spin (see
+        /// `spin::Budget::never`).
+        pub(super) fn without_spin() -> Self {
+            Self {
+                queue: WaitQueue::without_spin(0),
+                waiting: UnsafeCell::new(Waiting { list: List::new(), upgrade: None }),
+            }
+        }
+    }
+
     pub(super) fn try_kind(&self, kind: usize) -> bool {
         self.try_take(kind).is_ok()
     }
@@ -211,6 +222,13 @@ impl RawRwLock {
         // A node withdrawn meanwhile takes no grant, and leaves the slot too.
         woken.grant(node);
         true
+    }
+}
+
+#[cfg(all(test, not(loom)))]
+impl RawRwLock {
+    pub(super) fn spin_rounds(&self) -> u32 {
+        self.queue.spin.rounds()
     }
 }
 

@@ -5,7 +5,7 @@
 //!
 //! Two places have to agree about this number and they are on opposite
 //! sides of a memory-ordering argument: the commit pipeline publishes it
-//! after a group's WAL bytes are synced and every operation is in the
+//! after a commit's WAL bytes are synced and every operation is in the
 //! memtable, and every snapshot reads it before walking the memtable. If
 //! either side used the wrong ordering, a snapshot could observe a
 //! sequence whose memtable insert it cannot yet see, and report a
@@ -16,17 +16,22 @@
 //! # Invariants
 //!
 //! - **H1 (release).** [`ReadHorizon::publish`] is an `AcqRel`
-//!   read-modify-write, so every write the publishing thread performed
-//!   first - the WAL append, the sync, the memtable inserts -
-//!   happens-before any `Acquire` load that observes the new value.
+//!   read-modify-write, so everything that happened before the publisher
+//!   called it - the WAL write, the sync, the memtable inserts -
+//!   happens-before any `Acquire` load that observes the new value. In the
+//!   lock-free pipeline those may be other threads' work: the publisher
+//!   learned of them through the slot's stage flags and the ring's decided
+//!   frontier, each set after the work it stands for and read with an
+//!   acquiring load, so the chain reaches the reader all the same.
 //! - **H2 (acquire).** [`ReadHorizon::visible`] loads with `Acquire`, so
 //!   a reader that observes sequence `s` also observes every memtable
 //!   insert that the publisher of `s` had already made.
 //! - **H3 (monotonic).** `publish` is a `fetch_max`, never a `store`, so
-//!   two writers finishing out of order can never move the horizon
-//!   backwards and expose a hole. [`ReadHorizon::reset`] is the one
-//!   exception and it is only reachable from `drop_all`, which holds the
-//!   pipeline mutex and has already discarded every memtable.
+//!   two threads publishing out of order can never move the horizon
+//!   backwards and expose a hole. Nothing lowers it: `drop_all` empties the
+//!   database and leaves the sequence where it was, because a thread that
+//!   published a commit before the drop may raise the horizon to that
+//!   commit's sequence after it.
 
 use crate::sync::internal::{AtomicU64, Ordering};
 
@@ -53,11 +58,5 @@ impl ReadHorizon {
     /// faster one cannot re-hide the faster one's data.
     pub(crate) fn publish(&self, seq: u64) {
         self.0.fetch_max(seq, Ordering::AcqRel);
-    }
-
-    /// Drop the horizon back to `0` after every memtable and file has
-    /// been discarded (H3).
-    pub(crate) fn reset(&self) {
-        self.0.store(0, Ordering::Release);
     }
 }

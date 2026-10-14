@@ -11,7 +11,9 @@
 use std::sync::Arc;
 
 use regolith::prelude::*;
-use regolith::{PerfContext, PerfLevel, TransactionError, TxnOptions, WouldBlock};
+use regolith::{PerfContext, PerfLevel, TransactionError, TxnOptions};
+
+mod common;
 
 /// Sums big-endian i64 deltas.
 struct CounterMerge;
@@ -130,7 +132,7 @@ fn concurrent_blind_merges_commit_where_repeatable_read_aborts() {
             }
             let second = second.commit();
             assert_eq!(
-                second.is_ok(),
+                common::committed(&second),
                 both_commit,
                 "{level:?} flush={flush}: {second:?}"
             );
@@ -151,18 +153,10 @@ fn eight_threads_of_blind_merges_never_conflict_and_lose_nothing() {
         for _ in 0..THREADS {
             scope.spawn(|| {
                 for i in 0..MERGES {
-                    loop {
-                        let tx = db.begin(&TxnOptions::new().isolation(IsolationLevel::DefraLevel));
-                        tx.merge(b"counter", &1i64.to_be_bytes()).unwrap();
-                        match tx.commit() {
-                            Ok(_) => break,
-                            // A write stall stopped the commit before it
-                            // applied anything: wait it out and run it again.
-                            Err(TransactionError::WouldBlock(WouldBlock::Stall(stall))) => {
-                                stall.wait()
-                            }
-                            Err(e) => panic!("a blind merge never conflicts: {e:?}"),
-                        }
+                    let tx = db.begin(&TxnOptions::new().isolation(IsolationLevel::DefraLevel));
+                    tx.merge(b"counter", &1i64.to_be_bytes()).unwrap();
+                    if let Err(e) = tx.commit() {
+                        panic!("a blind merge never conflicts: {e:?}");
                     }
                     if i % 50 == 0 {
                         db.db().flush().unwrap();
@@ -268,7 +262,11 @@ fn an_identical_write_inside_a_scanned_commutative_prefix_commits() {
         supersede(&second, b"h/", b"h0");
         first.commit().unwrap();
         let second = second.commit();
-        assert_eq!(second.is_ok(), both_commit, "{level:?}: {second:?}");
+        assert_eq!(
+            common::committed(&second),
+            both_commit,
+            "{level:?}: {second:?}"
+        );
     }
 }
 

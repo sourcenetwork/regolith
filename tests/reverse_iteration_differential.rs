@@ -7,6 +7,7 @@
 //! binary keys of length 0..24. Each set is checked in three storage
 //! states (memtable only, flushed to L0, fully compacted), through the
 //! default CF, a named CF, and a snapshot.
+#![cfg(not(target_arch = "wasm32"))]
 
 use std::collections::BTreeMap;
 

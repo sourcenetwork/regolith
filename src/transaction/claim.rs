@@ -13,17 +13,20 @@
 //!   owner by rollback or drop, or `close`. The winner runs the abort
 //!   callbacks and the database hook; a loser runs neither.
 //!
-//! The `on_abort` callbacks live here, in a lock-free [`Handoff`]: the owner
-//! pushes, and whoever ends the transaction takes the whole list once and runs
-//! it, so each runs once however many threads reach for it. One registered
-//! after the winner took the list stays in it, and the owner takes it at the
-//! end of the transaction.
+//! The `on_abort` callbacks live here, in a lock-free [`FirstFour`]: the
+//! owner pushes, and whoever ends the transaction takes what is in the list
+//! and runs it, so each runs once however many threads reach for it. One
+//! registered after the winner took the list stays in it, and the owner
+//! takes it at the end of the transaction. The first four sit in the claim
+//! itself, so registering them allocates nothing beyond the claim.
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use super::TransactionHooks;
-use super::callbacks::{AbortReason, OnAbort, survive_after};
-use super::handoff::Handoff;
+use super::callbacks::{AbortReason, survive_after};
+use super::first_four::FirstFour;
+use super::in_place::OnAbort;
+use super::lock_table::LockOwner;
 use crate::engine::RegolithEngine;
 use crate::portability::{AtomicU8, Ordering};
 
@@ -35,7 +38,10 @@ const ABORTED: u8 = 2;
 pub(crate) struct Claim {
     pub(crate) id: u64,
     state: AtomicU8,
-    on_abort: Handoff<OnAbort>,
+    on_abort: FirstFour<OnAbort>,
+    /// The name a pessimistic transaction's key locks carry, once it has
+    /// one: `close` releases the locks of the transactions it aborts.
+    lock_owner: OnceLock<Arc<LockOwner>>,
 }
 
 impl Claim {
@@ -50,12 +56,23 @@ impl Claim {
         let claim = Arc::new(Self {
             id: engine.open_transactions().next_id(),
             state: AtomicU8::new(if committing { COMMITTING } else { OPEN }),
-            on_abort: Handoff::default(),
+            on_abort: FirstFour::default(),
+            lock_owner: OnceLock::new(),
         });
         if !committing && !engine.is_closed() {
             engine.open_transactions().insert(Arc::clone(&claim));
         }
         claim
+    }
+
+    /// Record the name the transaction's key locks carry.
+    pub(super) fn hold_locks_of(&self, owner: Arc<LockOwner>) {
+        let _ = self.lock_owner.set(owner);
+    }
+
+    /// The name the transaction's key locks carry, if it took any.
+    pub(crate) fn lock_owner(&self) -> Option<&Arc<LockOwner>> {
+        self.lock_owner.get()
     }
 
     fn win(&self, to: u8) -> bool {
@@ -93,11 +110,11 @@ impl Claim {
     }
 
     /// Run the `on_abort` callbacks still registered, oldest first, each at
-    /// most once: this call took them, so no other thread has them. A panic
-    /// is reported to `report`'s listeners.
+    /// most once: this call takes each before it runs it, so no other thread
+    /// has it. A panic is reported to `report`'s listeners.
     pub(super) fn run_callbacks(&self, report: Option<&RegolithEngine>, reason: &AbortReason<'_>) {
         for f in self.on_abort.take() {
-            survive_after(report, "on_abort", || f(reason));
+            survive_after(report, "on_abort", || f.call(reason));
         }
     }
 
@@ -119,14 +136,16 @@ impl Claim {
     }
 
     /// `close` ends the transaction if it is still open, on the closing
-    /// thread.
-    pub(crate) fn abort_for_close(&self, engine: &RegolithEngine) {
-        if self.abort() {
+    /// thread. `true` when this call ended it.
+    pub(crate) fn abort_for_close(&self, engine: &RegolithEngine) -> bool {
+        let won = self.abort();
+        if won {
             self.run_abort(
                 Some(engine),
                 engine.transaction_hooks(),
                 &AbortReason::Closed,
             );
         }
+        won
     }
 }

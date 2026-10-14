@@ -3,15 +3,14 @@
 //! completes when the stall clears, on the writer's own queue when it has
 //! one; with no worker, inline compaction runs the stall's step as a job on
 //! the writer's queue, or inline for a writer with no queue.
+//!
+//! A transaction's commit is the exception, since it cannot be run again:
+//! it waits the stall out (`tests/commit_through_stall.rs`).
 #![cfg(not(target_arch = "wasm32"))]
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
 
-use regolith::{
-    AbortReason, Db, Error, IoBudget, OptimisticTransactionDb, Options, StallWait,
-    TransactionError, TxnOptions, WouldBlock,
-};
+use regolith::{Db, Error, IoBudget, Options, StallWait, WouldBlock};
 use tempfile::TempDir;
 
 /// Writes stop once L0 holds two tables, and nothing compacts on its own.
@@ -49,7 +48,13 @@ fn a_stopped_write_returns_its_wait_and_applies_nothing() {
     let dir = TempDir::new().unwrap();
     let db = Db::open(dir.path(), stop_options()).unwrap();
     stop(&db);
-    let wait = stalled(db.put(b"k", b"v"));
+    let stopped = db.put(b"k", b"v");
+    assert_eq!(
+        stopped.as_ref().unwrap_err().to_string(),
+        "writes are stalled behind background work (stop: too many L0 files); wait for the \
+         stall to clear and run the write again"
+    );
+    let wait = stalled(stopped);
     assert_eq!(wait.reason(), "stop: too many L0 files");
     assert_eq!(wait.queue(), None);
     assert!(!wait.is_ready());
@@ -154,8 +159,8 @@ fn with_no_worker_and_no_queue_the_writer_relieves_the_stall_inline() {
     assert!(l0(&db) < 2);
 }
 
-/// With no worker and inline compaction off, nothing clears a stall until a
-/// caller compacts: the stopped write's wait completes then.
+/// With no worker and inline compaction turned off, nothing clears a stall
+/// until a caller compacts: the stopped write's wait completes then.
 #[test]
 fn with_no_worker_and_inline_off_a_caller_clears_the_stall() {
     let dir = TempDir::new().unwrap();
@@ -163,6 +168,7 @@ fn with_no_worker_and_inline_off_a_caller_clears_the_stall() {
         dir.path(),
         stop_options()
             .max_background_compactions(0)
+            .inline_compaction(false)
             .l0_compaction_trigger(2),
     )
     .unwrap();
@@ -174,37 +180,6 @@ fn with_no_worker_and_inline_off_a_caller_clears_the_stall() {
     db.compact_step().unwrap();
     assert!(wait.is_ready());
     regolith::through_stalls(|| db.put(b"k", b"v")).unwrap();
-}
-
-/// A `commit_nowait` a stall stops resolves its ticket with the stall's wait
-/// and runs its `on_abort` callbacks; nothing is written.
-#[test]
-fn a_nowait_commit_under_a_stall_resolves_its_ticket_with_the_wait() {
-    let dir = TempDir::new().unwrap();
-    let db = OptimisticTransactionDb::open(dir.path(), stop_options()).unwrap();
-    stop(db.db());
-    let mut queue = db.db().io_queue();
-    let mut txn = db.begin(&TxnOptions::new().io_queue(queue.id()));
-    txn.put(b"k", b"v").unwrap();
-    let aborted = Arc::new(AtomicUsize::new(0));
-    let count = Arc::clone(&aborted);
-    txn.on_abort(move |reason| {
-        assert!(matches!(
-            reason,
-            AbortReason::Error(TransactionError::WouldBlock(WouldBlock::Stall(_)))
-        ));
-        count.fetch_add(1, Ordering::SeqCst);
-    });
-    let ticket = txn.commit_nowait();
-    assert!(ticket.is_ready());
-    let wait = match queue.block_on(ticket) {
-        Err(TransactionError::WouldBlock(WouldBlock::Stall(wait))) => wait,
-        other => panic!("{other:?}"),
-    };
-    assert_eq!(aborted.load(Ordering::SeqCst), 1);
-    assert_eq!(db.db().get(b"k").unwrap(), None);
-    db.db().compact_range(None, None).wait().unwrap();
-    queue.block_on(wait);
 }
 
 /// `no_slowdown` still answers any stall with `Busy` at once.

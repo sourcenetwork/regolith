@@ -431,6 +431,59 @@ fn a_busy_lock_names_its_key_by_length_and_hash_and_never_by_bytes() {
     holder.rollback();
 }
 
+/// A merge the operator declines is reported with its key as data. Neither
+/// the message nor the `Debug` output prints the key's bytes, from a plain
+/// read or from a transaction's.
+#[test]
+fn a_failed_merge_names_its_key_by_length_and_hash_and_never_by_bytes() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = open(dir.path());
+    let key = b"SECRET-user-key-merge";
+    let declined = b"not eight bytes";
+    db.db().put(key, &zero()).unwrap();
+    db.db().merge(key, declined).unwrap();
+
+    let plain = db.db().get(key).unwrap_err();
+    let regolith::Error::MergeFailed(ref reported) = plain else {
+        panic!("expected a failed merge, got {plain:?}");
+    };
+    assert_eq!(
+        reported.as_slice(),
+        key,
+        "the bytes stay reachable on purpose"
+    );
+    let in_txn = db.begin(&TxnOptions::new()).get(key).unwrap_err();
+    assert!(matches!(
+        &in_txn,
+        TransactionError::Engine(regolith::Error::MergeFailed(reported)) if reported == key
+    ));
+
+    let hex: String = key.iter().map(|b| format!("{b:02x}")).collect();
+    let bytes = format!("{:?}", key.to_vec());
+    // The first bytes as a list prints them, on one line or one per line.
+    let listed = "83,69,67,82,69,84";
+    let texts = [
+        plain.to_string(),
+        format!("{plain:?}"),
+        format!("{plain:#?}"),
+        in_txn.to_string(),
+        format!("{in_txn:?}"),
+        format!("{in_txn:#?}"),
+    ];
+    for text in &texts {
+        for leaked in ["SECRET", "user-key", hex.as_str(), bytes.as_str()] {
+            assert!(!text.contains(leaked), "{leaked:?} leaked into: {text}");
+        }
+        let squeezed: String = text.chars().filter(|c| !c.is_whitespace()).collect();
+        assert!(!squeezed.contains(listed), "the bytes leaked into: {text}");
+        assert!(text.contains("21-byte key (hash "), "{text}");
+    }
+    // The same key shows the same hash, a different one does not.
+    assert_eq!(db.db().get(key).unwrap_err().to_string(), texts[0]);
+    db.db().merge(b"another", declined).unwrap();
+    assert_ne!(db.db().get(b"another").unwrap_err().to_string(), texts[0]);
+}
+
 /// Runs `work` on another thread, and says whether it finished in time. Work
 /// that waits for something the calling thread still holds never does.
 fn finishes(work: impl FnOnce() + Send + 'static) -> bool {

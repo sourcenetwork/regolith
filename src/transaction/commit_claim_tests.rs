@@ -12,7 +12,10 @@ use std::sync::{Arc, Mutex};
 
 use tempfile::TempDir;
 
-use super::{AbortReason, OptimisticTransactionDb, Options, TransactionDb, TxnOptions};
+use super::{
+    AbortReason, OptimisticTransactionDb, Options, TransactionDb, TransactionError, TxnOptions,
+};
+use crate::Error;
 
 type Log = Arc<Mutex<Vec<String>>>;
 
@@ -126,6 +129,10 @@ fn a_transaction_that_has_not_begun_to_commit_is_still_swept() {
     let engine = Arc::clone(&txn.engine);
     engine.open_transactions().abort_all(&engine);
     assert_eq!(entries(&log), ["abort"]);
-    assert!(txn.commit().is_err(), "a swept transaction cannot commit");
+    let refused = txn.commit();
+    assert!(
+        matches!(refused, Err(TransactionError::Engine(Error::Closed))),
+        "a swept transaction cannot commit: {refused:?}"
+    );
     assert_eq!(entries(&log), ["abort"], "nothing runs twice");
 }

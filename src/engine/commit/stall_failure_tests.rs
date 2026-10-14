@@ -37,7 +37,7 @@ use crate::{
 pub(super) const DEADLINE: Duration = Duration::from_secs(60);
 
 /// One 1 KiB put, applied below the stall admission as an admitted write is.
-fn fill(engine: &RegolithEngine, key: &[u8]) -> std::io::Result<u64> {
+pub(super) fn fill(engine: &RegolithEngine, key: &[u8]) -> std::io::Result<u64> {
     let ops = vec![WriteBatchOp::Put {
         key: prefix_key(DEFAULT_CF_ID, key),
         value: vec![7u8; 1024],
@@ -278,13 +278,11 @@ fn a_latched_engine_tells_the_write_a_flush_in_flight_holds_off() {
 }
 
 /// The memtable frozen under a full active one, with nothing owed for it: a
-/// rotation at the memtable cap flushes it under the commit pipeline.
+/// rotation at the memtable cap flushes it in its turn of the commit
+/// pipeline.
 fn freeze_one_and_fill_the_next(engine: &RegolithEngine) {
     fill(engine, b"a").unwrap();
-    {
-        let _pipeline = engine.lock_pipeline();
-        engine.seal_active().unwrap();
-    }
+    engine.seal_active().unwrap();
     fill(engine, b"b").unwrap();
     fill(engine, b"c").unwrap();
     assert_eq!(engine.view.load().frozen.len(), 1);
@@ -335,7 +333,7 @@ fn a_rotation_that_latches_after_its_flush_tells_the_write_it_held_off() {
 /// latching anything: its name is taken by a directory. The rotation's flush
 /// takes the next file id and its seal the one after.
 fn block_the_next_log(engine: &RegolithEngine) {
-    let next = engine.versions.lock().current().next_file_id;
+    let next = engine.versions.current().next_file_id;
     std::fs::create_dir(engine.wal_dir.join(wal_filename(next + 1))).unwrap();
 }
 
@@ -436,7 +434,7 @@ fn a_wait_registered_after_the_latch_is_told_the_latch_and_leaves_no_unit() {
 /// a limiter that panics fails the background job that asked
 /// (`rate_limiter::throttle_background`). The engine asks it on a worker
 /// only, so a flush on the test's own thread goes through.
-struct HeldRelief {
+pub(super) struct HeldRelief {
     armed: AtomicBool,
     failing: AtomicBool,
     entered: Mutex<mpsc::Sender<()>>,
@@ -453,21 +451,11 @@ impl RateLimiter for HeldRelief {
             panic!("the relief fails: a test's rate limiter");
         }
     }
-
-    fn set_bytes_per_second(&self, _bytes_per_second: u64) {}
-
-    fn get_bytes_per_second(&self) -> u64 {
-        0
-    }
-
-    fn get_total_bytes_through(&self, _pri: Priority) -> u64 {
-        0
-    }
 }
 
 /// A relief holder, the channel that says the worker entered it, and the
 /// one that lets the worker go.
-fn held_relief() -> (Arc<HeldRelief>, mpsc::Receiver<()>, mpsc::Sender<()>) {
+pub(super) fn held_relief() -> (Arc<HeldRelief>, mpsc::Receiver<()>, mpsc::Sender<()>) {
     let (entered, when_entered) = mpsc::channel();
     let (release, when_released) = mpsc::channel();
     let held = Arc::new(HeldRelief {
@@ -482,7 +470,7 @@ fn held_relief() -> (Arc<HeldRelief>, mpsc::Receiver<()>, mpsc::Sender<()>) {
 impl HeldRelief {
     /// Hold the worker's next background job, and fail it and every one
     /// after it.
-    fn hold_and_fail(&self) {
+    pub(super) fn hold_and_fail(&self) {
         self.failing.store(true, Ordering::Release);
         self.armed.store(true, Ordering::Release);
     }
@@ -538,7 +526,11 @@ fn stopped_with_the_compaction_held(
 /// Let the held job go, and return once the worker has recorded its failure
 /// and re-classified the stall after it: everything the failure does to the
 /// stall's unit is done by then.
-fn fail_the_held_relief(engine: &RegolithEngine, release: &mpsc::Sender<()>, relief: Job) {
+pub(super) fn fail_the_held_relief(
+    engine: &RegolithEngine,
+    release: &mpsc::Sender<()>,
+    relief: Job,
+) {
     let before = engine.stall_signal().progress();
     release.send(()).unwrap();
     let deadline = Instant::now() + DEADLINE;
@@ -622,7 +614,6 @@ fn a_failing_flush_tells_the_write_that_waited_for_the_worker() {
     // Three memtables sealed under the active one: the stop of four.
     for key in [b"a", b"b", b"c"] {
         fill(&engine, key).unwrap();
-        let _pipeline = engine.lock_pipeline();
         engine.seal_active().unwrap();
     }
     engine.refresh_stall_level();

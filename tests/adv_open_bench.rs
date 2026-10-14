@@ -54,7 +54,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use regolith::env::{
-    Capabilities, DirEntry, Env, FileLock, FileMeta, JoinHandle, ReadFile, StdEnv, WriteFile,
+    Capabilities, Env, FileLock, FileMeta, JoinHandle, ReadDir, ReadFile, StdEnv, WriteFile,
     WriteMode,
 };
 use regolith::{Db, Options};
@@ -140,7 +140,7 @@ impl Env for CountingEnv {
     fn create_dir_all(&self, p: &Path) -> io::Result<()> {
         self.inner.create_dir_all(p)
     }
-    fn read_dir(&self, p: &Path) -> io::Result<Vec<DirEntry>> {
+    fn read_dir(&self, p: &Path) -> io::Result<ReadDir<'_>> {
         self.inner.read_dir(p)
     }
     fn open_read(&self, p: &Path) -> io::Result<Box<dyn ReadFile>> {
@@ -150,6 +150,9 @@ impl Env for CountingEnv {
             path: p.to_path_buf(),
             counters: Arc::clone(&self.counters),
         }))
+    }
+    fn open_log(&self, p: &Path, mode: WriteMode) -> io::Result<Box<dyn regolith::env::LogFile>> {
+        self.inner.open_log(p, mode)
     }
     fn open_write(&self, p: &Path, mode: WriteMode) -> io::Result<Box<dyn WriteFile>> {
         self.inner.open_write(p, mode)

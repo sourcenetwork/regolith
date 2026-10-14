@@ -1,31 +1,41 @@
 //! The acquire every lock-like primitive shares: take what is free at
-//! once, otherwise wait in the queue with a bounded bypass.
+//! once, otherwise spin briefly, then wait in the queue with a bounded
+//! bypass.
 //!
 //! A caller takes what it asks for whenever it is free and no handoff is
 //! owed, even past queued waiters: the thread that has just released a
 //! lock and asks again takes it straight back, with no context switch.
-//! When that one attempt fails, the caller queues and returns `Pending`;
-//! it does not spin first. A release wakes the front waiter, whatever it
-//! asks for, and the waiters behind it the free permits could serve; a
-//! woken waiter tries again when polled. Each time it cannot take its
-//! whole request it counts one bypass. The attempt that would be its
-//! [`MAX_BYPASS`]th loss is owed a handoff in the same compare-and-swap
-//! that finds it short, so barging stops before anything more is freed,
-//! and released permits gather for it until its request is met. No clock
-//! is read: fairness is counted, not timed.
+//! When that one attempt fails, the caller spins on the state word for up
+//! to the lock's budget (see `spin`), taking what is freed meanwhile, and
+//! stops at once when a handoff is owed or waiters sit queued with nobody
+//! changing the queue; then it queues and returns `Pending`. A release
+//! wakes the front waiter, whatever it asks for, and the waiters behind it
+//! the free permits could serve; a woken waiter tries again when polled.
+//! Each time it cannot take its whole request it counts one bypass, and
+//! after a loss it spins on its own node before it sleeps, so a release
+//! that comes meanwhile marks it without a wake. The attempt that would be
+//! its [`MAX_BYPASS`]th loss is owed a handoff in the same
+//! compare-and-swap that finds it short, so barging stops before anything
+//! more is freed, and released permits gather for it until its request is
+//! met. No clock is read: fairness is counted, not timed, and a spin is
+//! counted in rounds.
 //!
-//! Why no spin before queueing, measured with `benches/sync.rs`: spinning
-//! on every contended poll, at 16 or 64 rounds, cost two to five times the
-//! throughput in every shape. Spinning 16 rounds only while nobody was
-//! queued measured within 6% of not spinning across threads in every
-//! shape (medians of six runs on a loaded host, less than the run-to-run
-//! spread), and 9% slower with two tasks on one thread, where the holder
-//! cannot run until the spinner gives up.
+//! Why the spin looks seldom and stops behind a settled queue, measured
+//! with `benches/sync.rs` (E48): a spin that loaded the word on every
+//! round pulled the line from the holder on every round, and two tasks ran
+//! at under half the throughput they reach with loads spaced by doubling
+//! gaps; a spin that went on past queued waiters doubled two tasks' gain
+//! again but halved eight and thirty-two tasks' throughput, where every
+//! newcomer then spun on the shared line instead of waiting on its own
+//! node. Queue-at-once (the design before) measured within 6% of a short
+//! spin at eight and thirty-two tasks, and two tasks ran at 40% of
+//! `std::sync::Mutex` with it.
 
 use core::task::{Poll, Waker};
 
 use super::internal::Ordering;
-use super::queue::{HANDOFF, Policy};
+use super::queue::{HANDOFF, Policy, stops_spin};
+use super::spin::Gaps;
 use super::waiter::{Cancel, Park, Wait};
 
 /// How many times a waiter can be passed over before it is owed a
@@ -40,6 +50,11 @@ pub const MAX_BYPASS: u32 = 2;
 
 /// A primitive whose waits take something and give it back.
 pub(super) trait Lock: Policy {
+    /// Whether a contended acquire spins before it queues, and after a
+    /// lost retry before it sleeps (see `spin`). A primitive whose holders
+    /// keep it across long waits of their own opts out.
+    const SPINS: bool = true;
+
     /// `state` with `need` taken, when `state` has room for it; the owed
     /// bit aside.
     fn admit(&self, state: usize, need: usize) -> Option<usize>;
@@ -71,13 +86,29 @@ pub(super) trait Lock: Policy {
 /// One compare-and-swap loop taking `need` through [`Lock::admit`]; past
 /// an owed handoff only for the drain that hands it out.
 pub(super) fn take<L: Lock + ?Sized>(lock: &L, need: usize, for_waiter: bool) -> Result<(), usize> {
+    let failure = if for_waiter {
+        Ordering::Acquire
+    } else {
+        Ordering::Relaxed
+    };
+    take_from(lock, need, for_waiter, lock.queue().state.load(failure))
+}
+
+/// [`take`] from a state the caller has just read, saving the load: the
+/// first compare-and-swap expects `current`, and a stale value only fails it
+/// once.
+pub(super) fn take_from<L: Lock + ?Sized>(
+    lock: &L,
+    need: usize,
+    for_waiter: bool,
+    mut current: usize,
+) -> Result<(), usize> {
     let (success, failure) = if for_waiter {
         (Ordering::AcqRel, Ordering::Acquire)
     } else {
         (Ordering::Acquire, Ordering::Relaxed)
     };
     let state = &lock.queue().state;
-    let mut current = state.load(failure);
     loop {
         let next = match lock.admit(current, need) {
             Some(next) if for_waiter || current & HANDOFF == 0 => next,
@@ -88,6 +119,51 @@ pub(super) fn take<L: Lock + ?Sized>(lock: &L, need: usize, for_waiter: bool) ->
             Err(actual) => current = actual,
         }
     }
+}
+
+/// The spin before queueing: read the state word in gaps that double from
+/// one pause (see `spin::Gaps`), for up to the lock's budget, and try the
+/// compare-and-swap only when a read shows room. `seen` is the state the
+/// caller's failed attempt saw. Stops at once when a handoff is owed, or
+/// when waiters are queued and nobody holds the drain role
+/// (`queue::stops_spin`): the caller then queues behind them, and the
+/// budget is left as it was. A spin that runs out without ever seeing room
+/// halves the budget; one that saw room but lost every swap keeps it. The
+/// swap expects exactly the state it read, so it takes nothing a fresh
+/// caller's attempt would not.
+fn spin_take<L: Lock>(lock: &L, need: usize, mut seen: usize) -> bool {
+    let queue = lock.queue();
+    let rounds = queue.spin.rounds();
+    if rounds == 0 {
+        return false;
+    }
+    let mut gaps = Gaps::new(rounds);
+    let mut freed = false;
+    while gaps.wait() {
+        if stops_spin(seen) {
+            return false;
+        }
+        seen = queue.state.load(Ordering::Relaxed);
+        if !stops_spin(seen)
+            && let Some(next) = lock.admit(seen, need)
+        {
+            freed = true;
+            match queue
+                .state
+                .compare_exchange(seen, next, Ordering::Acquire, Ordering::Relaxed)
+            {
+                Ok(_) => {
+                    queue.spin.won(rounds);
+                    return true;
+                }
+                Err(actual) => seen = actual,
+            }
+        }
+    }
+    if !freed {
+        queue.spin.ran_out(rounds);
+    }
+    false
 }
 
 /// A future's contended acquire.
@@ -104,6 +180,7 @@ impl Contend {
         }
     }
 
+    #[inline]
     pub(super) fn is_queued(&self) -> bool {
         self.wait.is_queued()
     }
@@ -111,14 +188,37 @@ impl Contend {
     /// Ready once `need` is taken, by the caller's own attempt or by a
     /// handoff.
     pub(super) fn poll<L: Lock>(&mut self, lock: &L, need: usize, waker: &Waker) -> Poll<()> {
+        self.poll_from(lock, need, waker, None)
+    }
+
+    /// [`poll`](Self::poll) for a caller that has just read the state word
+    /// itself and found it `seen` (a Mutex's inline attempt): a first poll
+    /// starts its attempt from that state instead of loading it again.
+    pub(super) fn poll_from<L: Lock>(
+        &mut self,
+        lock: &L,
+        need: usize,
+        waker: &Waker,
+        seen: Option<usize>,
+    ) -> Poll<()> {
         let queue = lock.queue();
         let mut park = if self.wait.is_queued() {
             self.wait.park(queue, Some(waker))
         } else {
             // Losing this first attempt is not a bypass: nobody has passed
-            // the caller yet, the holder was simply there first.
-            if lock.try_take(need).is_ok() {
-                return Poll::Ready(());
+            // the caller yet, the holder was simply there first. Nor is
+            // losing the spin that follows it, before the caller queues.
+            let first = match seen {
+                Some(seen) => take_from(lock, need, false, seen),
+                None => lock.try_take(need),
+            };
+            match first {
+                Ok(()) => return Poll::Ready(()),
+                Err(seen) => {
+                    if L::SPINS && spin_take(lock, need, seen) {
+                        return Poll::Ready(());
+                    }
+                }
             }
             lock.enqueue(&mut self.wait, need, waker);
             self.wait.park(queue, None)
@@ -145,6 +245,12 @@ impl Contend {
                     };
                     match attempt {
                         Ok(()) => {
+                            // A retry that wins after a wake says holds can
+                            // end soon after a release: a lock that stopped
+                            // spinning tries again.
+                            if L::SPINS && queue.spin.rounds() == 0 {
+                                queue.spin.won(0);
+                            }
                             self.cancel(lock, need);
                             return Poll::Ready(());
                         }
@@ -157,7 +263,11 @@ impl Contend {
                         }
                         Err(_) => {}
                     }
-                    park = self.wait.park(queue, Some(waker));
+                    park = if L::SPINS {
+                        self.wait.spin_park(queue, waker)
+                    } else {
+                        self.wait.park(queue, Some(waker))
+                    };
                 }
             }
         }
@@ -556,5 +666,227 @@ mod tests {
             "a release that found the drain role taken was lost"
         );
         assert!(!sem.try_acquire(1), "the waiter holds it");
+    }
+
+    /// A semaphore watched by a contender: `looks` counts the times the
+    /// contender judged a state word (each first attempt, retry and spin
+    /// round does), and `at_look` runs, just after that judgement, what
+    /// another thread does at that instant.
+    struct Watched<'a> {
+        sem: &'a RawSemaphore,
+        looks: Cell<u32>,
+        at_look: Box<dyn Fn(u32) + 'a>,
+    }
+
+    impl<'a> Watched<'a> {
+        fn new(sem: &'a RawSemaphore, at_look: impl Fn(u32) + 'a) -> Self {
+            Self {
+                sem,
+                looks: Cell::new(0),
+                at_look: Box::new(at_look),
+            }
+        }
+    }
+
+    impl Policy for Watched<'_> {
+        fn queue(&self) -> &WaitQueue {
+            self.sem.queue()
+        }
+
+        fn pass(&self, arrivals: Arrivals, woken: &mut WakeList<'_>, wake_front: bool) -> usize {
+            self.sem.pass(arrivals, woken, wake_front)
+        }
+    }
+
+    impl Lock for Watched<'_> {
+        fn admit(&self, state: usize, need: usize) -> Option<usize> {
+            let admitted = self.sem.admit(state, need);
+            let look = self.looks.get() + 1;
+            self.looks.set(look);
+            (self.at_look)(look);
+            admitted
+        }
+
+        fn give_back(&self, need: usize) {
+            self.sem.give_back(need);
+        }
+    }
+
+    /// B, the spin before queueing. The holder lets go while a contender
+    /// spins (just after the contender's second look): the contender takes
+    /// the lock in its first poll, never queues, is never woken, and the
+    /// lock's budget doubles.
+    #[test]
+    fn a_contender_takes_a_lock_let_go_during_its_spin_without_queueing() {
+        let sem = RawSemaphore::new(1);
+        assert!(sem.try_acquire(1), "the holder takes it");
+        let budget = sem.queue().spin.rounds();
+        assert!(budget > 0, "a fresh lock spins");
+        let watched = Watched::new(&sem, |look| {
+            if look == 2 {
+                sem.release(1);
+            }
+        });
+        let mut contend = Contend::new();
+        let mut contender = Polled::new(core::future::poll_fn(|cx| {
+            contend.poll(&watched, 1, cx.waker())
+        }));
+        assert!(contender.poll().is_ready(), "the spin took the freed lock");
+        assert_eq!(contender.wakes(), 0, "a spinner needs no wake");
+        drop(contender);
+        assert!(!contend.is_queued(), "the contender never queued");
+        assert!(
+            watched.looks.get() >= 3,
+            "it looked again after the release"
+        );
+        assert_eq!(
+            sem.queue().spin.rounds(),
+            (2 * budget).min(u32::from(super::super::spin::MAX)),
+            "a won spin doubles the budget"
+        );
+        assert!(!sem.try_acquire(1), "the contender holds it");
+    }
+
+    /// B. A spin that never sees room runs out, halves the budget, and the
+    /// contender queues and is served by the release as before.
+    #[test]
+    fn a_spin_that_never_sees_room_halves_the_budget_and_queues() {
+        let sem = RawSemaphore::new(1);
+        assert!(sem.try_acquire(1));
+        let budget = sem.queue().spin.rounds();
+        let watched = Watched::new(&sem, |_| {});
+        let mut contend = Contend::new();
+        let mut waiter = Polled::new(core::future::poll_fn(|cx| {
+            contend.poll(&watched, 1, cx.waker())
+        }));
+        waiter.pending();
+        assert!(watched.looks.get() > 1, "it spun before queueing");
+        assert_eq!(
+            sem.queue().spin.rounds(),
+            budget / 2,
+            "a spin that ran out halves"
+        );
+        sem.release(1);
+        assert_eq!(waiter.wakes(), 1, "the release reaches the queued waiter");
+        assert!(waiter.poll().is_ready());
+    }
+
+    /// B. A spin that saw the lock free but lost every swap to a barger keeps
+    /// the budget: the holders are short, the lock is only busy.
+    #[test]
+    fn a_spin_that_saw_room_but_lost_keeps_the_budget() {
+        let sem = RawSemaphore::new(1);
+        assert!(sem.try_acquire(1));
+        let budget = sem.queue().spin.rounds();
+        let watched = Watched::new(&sem, |look| match look {
+            // The holder lets go just after the contender's second look ...
+            2 => sem.release(1),
+            // ... and a barger takes the lock right after the contender saw
+            // it free, before the contender's swap.
+            3 => assert!(sem.try_acquire(1), "the barger takes it"),
+            _ => {}
+        });
+        let mut contend = Contend::new();
+        let mut waiter = Polled::new(core::future::poll_fn(|cx| {
+            contend.poll(&watched, 1, cx.waker())
+        }));
+        waiter.pending();
+        assert_eq!(
+            sem.queue().spin.rounds(),
+            budget,
+            "a busy lock keeps its budget"
+        );
+        drop(waiter);
+        contend.cancel(&watched, 1);
+        sem.release(1);
+    }
+
+    /// B. The spin stops at once behind a settled queue (waiters queued and
+    /// nobody changing the queue): the contender looks once and queues, and
+    /// the budget is left alone. The owed handoff, the spin's other stop, is
+    /// pinned for every state word by
+    /// `the_spin_takes_only_what_a_fresh_caller_may`.
+    #[test]
+    fn a_contender_queues_at_once_behind_a_settled_queue() {
+        let sem = RawSemaphore::new(1);
+        assert!(sem.try_acquire(1));
+        let budget = sem.queue().spin.rounds();
+        let plain = Watched::new(&sem, |_| {});
+        let mut first = Contend::new();
+        let mut first_waiter = Polled::new(core::future::poll_fn(|cx| {
+            first.poll(&plain, 1, cx.waker())
+        }));
+        first_waiter.pending();
+        let after_first = sem.queue().spin.rounds();
+        let watched = Watched::new(&sem, |_| {});
+        let mut second = Contend::new();
+        let mut second_waiter = Polled::new(core::future::poll_fn(|cx| {
+            second.poll(&watched, 1, cx.waker())
+        }));
+        second_waiter.pending();
+        assert_eq!(watched.looks.get(), 1, "it looked once and did not spin");
+        assert_eq!(
+            sem.queue().spin.rounds(),
+            after_first,
+            "the budget is untouched"
+        );
+        assert!(after_first <= budget);
+        drop((first_waiter, second_waiter));
+        first.cancel(&plain, 1);
+        second.cancel(&watched, 1);
+        sem.release(1);
+        assert!(sem.try_acquire(1), "nothing is left held or owed");
+    }
+
+    /// B, the spin's rule for every state word with up to two permits and
+    /// every combination of the queue's six bits: one round takes a permit
+    /// exactly when a fresh caller may (a permit free and no handoff owed)
+    /// and the queue is not settled (waiters queued with nobody holding the
+    /// drain role), and leaves the word as that take would; otherwise it
+    /// changes nothing. A spin that ignored an owed handoff fails here at
+    /// the word with one permit and HANDOFF up.
+    #[test]
+    fn the_spin_takes_only_what_a_fresh_caller_may() {
+        const SHIFT: u32 = super::super::queue::FIRST_BIT;
+        const DRAINING_BIT: usize = 1;
+        const QUEUED_BIT: usize = 1 << 2;
+        for permits in 0..=2usize {
+            for flags in 0..(1usize << SHIFT) {
+                let state = (permits << SHIFT) | flags;
+                let sem = RawSemaphore::new(0);
+                sem.queue().state.store(state, Ordering::Relaxed);
+                let took = spin_take(&sem, 1, state);
+                let settled = flags & (QUEUED_BIT | DRAINING_BIT) == QUEUED_BIT;
+                let may = permits >= 1 && flags & HANDOFF == 0 && !settled;
+                assert_eq!(took, may, "state {state:#x}: the spin took the wrong thing");
+                let after = sem.queue().state.load(Ordering::Relaxed);
+                let expected = if took { state - (1 << SHIFT) } else { state };
+                assert_eq!(
+                    after, expected,
+                    "state {state:#x}: the spin left the wrong word"
+                );
+            }
+        }
+    }
+
+    /// B. A queued waiter whose retry wins after a nudge brings a spent
+    /// budget back to one, so a lock whose holds turned short spins again.
+    #[test]
+    fn a_won_retry_revives_a_spent_budget() {
+        let sem = RawSemaphore::new(1);
+        let spin = &sem.queue().spin;
+        while spin.rounds() > 0 {
+            spin.ran_out(spin.rounds());
+        }
+        assert!(sem.try_acquire(1));
+        let mut contend = Contend::new();
+        let mut waiter = Polled::new(core::future::poll_fn(|cx| {
+            contend.poll(&sem, 1, cx.waker())
+        }));
+        waiter.pending();
+        assert_eq!(spin.rounds(), 0, "a spent budget queues at once");
+        sem.release(1);
+        assert!(waiter.poll().is_ready(), "the retry wins");
+        assert_eq!(spin.rounds(), 1, "the won retry revives the budget");
     }
 }

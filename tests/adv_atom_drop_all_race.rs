@@ -7,6 +7,7 @@
 //! removes it - but "whatever comes back is a value this workload ever
 //! wrote". A freed view reads as garbage or crashes; it does not read
 //! as a well-formed older value.
+#![cfg(not(target_arch = "wasm32"))]
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Barrier, Mutex};
