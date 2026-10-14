@@ -294,7 +294,7 @@ loom-debug:
     RUSTFLAGS="--cfg loom" timeout 10m cargo test --test loom_memtable
 
 # Loom models for `regolith::sync`: every primitive's wait protocol,
-# with five calibrations that must fail. Release only: the larger models
+# with seven calibrations that must fail. Release only: the larger models
 # explore 0.1 to 0.4 million interleavings each (about four minutes in
 # all), which a debug build multiplies several times over.
 loom-sync:
@@ -1101,6 +1101,12 @@ tla:
     check MC_Sync_Red_ReleaseDirties                   RED DrainBounded
     check MC_Sync_Red_ExitIgnoresRequest               RED NoLostWakeup
     check MC_Sync_Green_PassesGrow                     RED FewPasses
+    # E48: the spin before queueing and the spin on the waiter's own node.
+    # The spin must stop for an owed handoff, and a spin that runs out must
+    # read its node's marks as it arms the waker again: a release that found
+    # it spinning called no waker.
+    check MC_Sync_Red_SpinNoRecheck                    RED NoLostWakeup
+    check MC_Sync_Red_SpinIgnoresOwed                  RED HandoffExclusive
     # regolith::sync::Notify, which keeps FIFO handoff. Lean:
     # Regolith/SyncFifo.lean, fifo_served, no_stranded_waiter.
     spec=SyncNotify
@@ -1131,6 +1137,9 @@ tla:
     # reads UPGRADING and takes the write for the node in its slot.
     check MC_SyncRwLock_Green_UpgradeDropped           GREEN
     check MC_SyncRwLock_Red_PassTakesWrite             RED GuardsCounted
+    # E48: a spin on the node that runs out must read the marks as it arms
+    # the waker again, for the RwLock's waits too.
+    check MC_SyncRwLock_Red_SpinNoRecheck              RED NoLostWakeup
     # The compaction gate (4.6, E28): a pass shares it, a job holds it
     # alone, no waiter is passed over more than Bound times either way, the
     # worker takes turns between jobs and passes, and a job parked on its

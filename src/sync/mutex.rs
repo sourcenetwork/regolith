@@ -18,7 +18,9 @@ use super::raw_semaphore::{PermitWait, RawSemaphore};
 /// Uncontended, [`try_lock`](Self::try_lock) and a guard's drop are one
 /// atomic read-modify-write each and allocate nothing. A caller takes the
 /// lock whenever it is free, even while others wait; under contention
-/// [`lock`](Self::lock) queues and returns `Pending`.
+/// [`lock`](Self::lock) spins briefly within the poll (see the
+/// [module docs](super#what-every-primitive-guarantees)), then queues and
+/// returns `Pending`.
 /// An unlock wakes the oldest waiter to try again; a waiter that loses
 /// [`MAX_BYPASS`](super::MAX_BYPASS) times is handed the lock directly,
 /// and `try_lock` fails until it has had it.
@@ -57,13 +59,23 @@ impl<T> Mutex<T> {
 
 impl<T: ?Sized> Mutex<T> {
     /// Locks the mutex if it is free and no handoff is owed.
+    #[inline]
     pub fn try_lock(&self) -> Option<MutexGuard<'_, T>> {
-        self.sem.try_acquire(1).then(|| MutexGuard::new(self))
+        match self.sem.take_one() {
+            Ok(()) => Some(MutexGuard::new(self)),
+            Err(seen) => self
+                .sem
+                .try_acquire_one_from(seen)
+                .then(|| MutexGuard::new(self)),
+        }
     }
 
-    /// Waits for the lock. Uncontended, the first poll is one atomic
-    /// read-modify-write. Contended, it is lock-free, not wait-free: see
+    /// Waits for the lock. Uncontended, the first poll is one load and one
+    /// atomic read-modify-write. Contended, a poll may spin for up to the
+    /// lock's spin budget before it queues, and again after a retry it lost,
+    /// before it returns `Pending`; it is lock-free, not wait-free: see
     /// [Progress](super#progress).
+    #[inline]
     pub fn lock(&self) -> Lock<'_, T> {
         Lock {
             mutex: self,
@@ -139,6 +151,7 @@ impl<T: ?Sized> DerefMut for MutexGuard<'_, T> {
 }
 
 impl<T: ?Sized> Drop for MutexGuard<'_, T> {
+    #[inline]
     fn drop(&mut self) {
         self.mutex.sem.release(1);
     }
@@ -186,6 +199,7 @@ impl<T: ?Sized> DerefMut for OwnedMutexGuard<T> {
 }
 
 impl<T: ?Sized> Drop for OwnedMutexGuard<T> {
+    #[inline]
     fn drop(&mut self) {
         self.mutex.sem.release(1);
     }
@@ -207,15 +221,17 @@ pub struct Lock<'a, T: ?Sized> {
 impl<'a, T: ?Sized> Future for Lock<'a, T> {
     type Output = MutexGuard<'a, T>;
 
+    #[inline]
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<MutexGuard<'a, T>> {
         let this = self.get_mut();
         this.wait
-            .poll(&this.mutex.sem, 1, cx.waker())
+            .poll_one(&this.mutex.sem, cx.waker())
             .map(|()| MutexGuard::new(this.mutex))
     }
 }
 
 impl<T: ?Sized> Drop for Lock<'_, T> {
+    #[inline]
     fn drop(&mut self) {
         self.wait.cancel(&self.mutex.sem, 1);
     }
@@ -237,10 +253,11 @@ pub struct LockOwned<T: ?Sized> {
 impl<T: ?Sized> Future for LockOwned<T> {
     type Output = OwnedMutexGuard<T>;
 
+    #[inline]
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<OwnedMutexGuard<T>> {
         let this = self.get_mut();
         this.wait
-            .poll(&this.mutex.sem, 1, cx.waker())
+            .poll_one(&this.mutex.sem, cx.waker())
             .map(|()| OwnedMutexGuard {
                 mutex: Arc::clone(&this.mutex),
                 _value: PhantomData,
@@ -249,6 +266,7 @@ impl<T: ?Sized> Future for LockOwned<T> {
 }
 
 impl<T: ?Sized> Drop for LockOwned<T> {
+    #[inline]
     fn drop(&mut self) {
         self.wait.cancel(&self.mutex.sem, 1);
     }

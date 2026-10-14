@@ -47,6 +47,17 @@
 //!   `src/sync/loom_model.rs`, each with a calibration that writes its step
 //!   the wrong way and must fail.
 //!
+//! - **The spins (E48)**: under loom a spin has one round. Every model here
+//!   runs the spin before queueing; the spin on the waiter's node is
+//!   reached only where a model makes sure of it, because a spin that runs
+//!   out halves the budget to zero rounds. Two models check the spins
+//!   directly on the production semaphore: the Mutex's inline first attempt
+//!   refuses a lock owed to a queued waiter, and a nudge that lands while
+//!   the waiter spins on its node, calling no waker, or just after the
+//!   spin's last read, is never lost; the second counts the spins on the
+//!   node and the marks each way and fails if any count is below its floor.
+//!   Each has a calibration that takes the guard away and must fail.
+//!
 //! The waiter-node free list is a pass-through to the allocator under loom
 //! (see `Pool`), so node recycling itself is covered by miri and the unit
 //! tests rather than here. The calibration models deliberately expect
@@ -983,6 +994,36 @@ fn a_waiter_serving_the_queue_is_served_while_the_holder_barges() {
 #[should_panic(expected = "the drain ran")]
 fn calibration_a_marker_lowered_on_a_pending_nudge_keeps_the_drain_passing() {
     regolith::loom_exports::sync::calibration_a_marker_lowered_on_a_pending_nudge_keeps_the_drain_passing();
+}
+
+/// E48. The Mutex's inline first attempt never takes a lock owed to a
+/// queued waiter (TLA+ HandoffExclusive and BoundedBypass, with the spins);
+/// its calibration drops the attempt's HANDOFF test and must fail.
+#[test]
+fn the_first_attempt_refuses_a_lock_owed_to_a_waiter() {
+    regolith::loom_exports::sync::the_first_attempt_refuses_a_lock_owed_to_a_waiter();
+}
+
+#[test]
+#[should_panic(expected = "the holder took a lock owed to the queued waiter")]
+fn calibration_a_first_attempt_that_ignores_handoff_barges_past_an_owed_waiter() {
+    regolith::loom_exports::sync::calibration_a_first_attempt_that_ignores_handoff_barges_past_an_owed_waiter();
+}
+
+/// E48. A release that nudges a waiter spinning on its node calls no waker,
+/// and the waiter is served all the same (TLA+ NoLostWakeup and
+/// Lean `no_lost_wakeup_spinning`), with floors on the spins it must reach;
+/// the calibration is the production spin with its look taken away and
+/// must leave the waiter armed beside an unread mark.
+#[test]
+fn a_nudge_while_the_waiter_spins_is_never_lost() {
+    regolith::loom_exports::sync::a_nudge_while_the_waiter_spins_is_never_lost();
+}
+
+#[test]
+#[should_panic(expected = "the waiter armed and slept beside an unread mark")]
+fn calibration_a_node_spin_that_skips_its_look_sleeps_beside_the_mark() {
+    regolith::loom_exports::sync::calibration_a_node_spin_that_skips_its_look_sleeps_beside_the_mark();
 }
 
 /// E33. An upgrade waits for a reader and is dropped. While its drop is

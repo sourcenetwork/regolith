@@ -12,7 +12,15 @@
 //!
 //! - **No runtime.** A contended acquire queues a waiter, registers the
 //!   caller's `Waker` and returns `Pending`. What a wake does belongs to
-//!   the caller's executor.
+//!   the caller's executor. Within one poll, a contended acquire of a lock
+//!   or a semaphore may first spin for a short while (up to the lock's
+//!   spin budget, a count of pause instructions it adapts to how long holds
+//!   last, about 5 microseconds at most on the cores it was tuned on):
+//!   before it queues, and again after a retry it lost. The spin makes no
+//!   system call, reads no clock, and ends in the same queueing or the same
+//!   `Pending` as before. The transaction lock table, the once-cell's
+//!   initializer turn and the bounded channel's send slots, whose holders
+//!   keep them across long waits of their own, do not spin.
 //! - **Fast under contention.** The locks and the semaphore let a caller
 //!   take what is free even while others wait, so a release never waits
 //!   for a suspended task to run: the thread that released takes the lock
@@ -108,6 +116,7 @@ mod reentrant_mutex;
 mod reentrant_rwlock;
 mod rwlock;
 mod semaphore;
+mod spin;
 #[cfg(all(test, not(loom)))]
 pub(crate) mod test_support;
 mod waiter;
