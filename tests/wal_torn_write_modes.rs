@@ -60,7 +60,7 @@ fn probe(tear: TearMode, nth: u64) -> Result<usize, String> {
     }
     match fault::recover_and_validate(&db, opts(), &out.history) {
         Recovery::Recovered(r) => {
-            fault::assert_acked_survived(&r, &out.acked);
+            fault::assert_acked_survived(&r, &out.acked());
             Ok(r.k)
         }
         Recovery::RefusedToOpen(e) => Err(format!(

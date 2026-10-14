@@ -12,6 +12,8 @@ pub struct Keys {
     /// Which bytes each id names: two providers with different variants
     /// name the same ids but hold different keys under them.
     variant: u8,
+    /// Ids whose bytes are the wrong ones whatever the variant.
+    wrong: Vec<u32>,
 }
 
 impl Keys {
@@ -25,11 +27,23 @@ impl Keys {
         Self::variant(ids, 1)
     }
 
+    /// Keys `ids`, the first current, with the right bytes except under
+    /// the ids in `wrong`.
+    pub fn wrong_for(ids: &[u32], wrong: &[u32]) -> Arc<Self> {
+        Arc::new(Self {
+            current: AtomicU32::new(ids[0]),
+            provided: ids.to_vec(),
+            variant: 0,
+            wrong: wrong.to_vec(),
+        })
+    }
+
     fn variant(ids: &[u32], variant: u8) -> Arc<Self> {
         Arc::new(Self {
             current: AtomicU32::new(ids[0]),
             provided: ids.to_vec(),
             variant,
+            wrong: Vec::new(),
         })
     }
 
@@ -48,12 +62,17 @@ impl KeyProvider for Keys {
         if !self.provided.contains(&id.0) {
             return None;
         }
+        let variant = if self.wrong.contains(&id.0) {
+            self.variant.wrapping_add(1)
+        } else {
+            self.variant
+        };
         let mut bytes = [0u8; 32];
         for (i, b) in bytes.iter_mut().enumerate() {
             *b = (id.0 as u8)
                 .wrapping_mul(29)
                 .wrapping_add(i as u8)
-                .wrapping_add(self.variant.wrapping_mul(101));
+                .wrapping_add(variant.wrapping_mul(101));
         }
         Some(KeyMaterial::new(bytes))
     }

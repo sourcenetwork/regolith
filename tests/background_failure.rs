@@ -8,6 +8,7 @@
 //! stopped behind failing work must get that failure back rather than
 //! wait forever, one that was already waiting when the work failed
 //! included, and writes must resume once the fault clears.
+#![cfg(not(target_arch = "wasm32"))]
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -16,7 +17,7 @@ use std::sync::{Arc, Mutex, mpsc};
 use std::time::Duration;
 
 use regolith::env::{
-    Capabilities, DirEntry, Env, FileLock, FileMeta, JoinHandle, ReadFile, StdEnv, WriteFile,
+    Capabilities, Env, FileLock, FileMeta, JoinHandle, ReadDir, ReadFile, StdEnv, WriteFile,
     WriteMode,
 };
 use regolith::{Db, Options};
@@ -101,7 +102,7 @@ impl Env for SstBudgetEnv {
     fn create_dir_all(&self, path: &Path) -> io::Result<()> {
         self.inner.create_dir_all(path)
     }
-    fn read_dir(&self, path: &Path) -> io::Result<Vec<DirEntry>> {
+    fn read_dir(&self, path: &Path) -> io::Result<ReadDir<'_>> {
         self.inner.read_dir(path)
     }
     fn open_read(&self, path: &Path) -> io::Result<Box<dyn ReadFile>> {
@@ -109,6 +110,13 @@ impl Env for SstBudgetEnv {
             return Err(io::Error::other("Too many open files (os error 24)"));
         }
         self.inner.open_read(path)
+    }
+    fn open_log(
+        &self,
+        path: &Path,
+        mode: WriteMode,
+    ) -> io::Result<Box<dyn regolith::env::LogFile>> {
+        self.inner.open_log(path, mode)
     }
     fn open_write(&self, path: &Path, mode: WriteMode) -> io::Result<Box<dyn WriteFile>> {
         if is_sst(path) {

@@ -74,7 +74,7 @@ fn probe_opens(tear: TearMode) {
 
     match fault::recover_and_validate(&db, opts(8 * 1024), &out.history) {
         Recovery::Recovered(r) => {
-            fault::assert_acked_survived(&r, &out.acked);
+            fault::assert_acked_survived(&r, &out.acked());
             println!("{tear:?}: opened, {} writes recovered", r.k);
         }
         Recovery::RefusedToOpen(e) => panic!("{tear:?} must not block the open: {e}"),
@@ -96,7 +96,7 @@ fn probe_opens_and_sweeps(tear: TearMode) {
     assert!(out.acked_count() > 0, "no write was acknowledged");
 
     match fault::recover_and_validate(&db, opts(8 * 1024), &out.history) {
-        Recovery::Recovered(r) => fault::assert_acked_survived(&r, &out.acked),
+        Recovery::Recovered(r) => fault::assert_acked_survived(&r, &out.acked()),
         Recovery::RefusedToOpen(e) => {
             panic!("{tear:?}: a first-flush cut is a crash's doing and must open: {e}")
         }
@@ -149,7 +149,7 @@ fn an_open_that_dismissed_a_zero_length_orphan_converges_over_repeated_reopens()
     let baseline = tmp.path().join("baseline");
     fault::copy_tree(&db, &baseline);
     match fault::recover_and_validate(&baseline, opts(8 * 1024), &out.history) {
-        Recovery::Recovered(r) => fault::assert_acked_survived(&r, &out.acked),
+        Recovery::Recovered(r) => fault::assert_acked_survived(&r, &out.acked()),
         Recovery::RefusedToOpen(e) => panic!("the dismissed orphan still refused the open: {e}"),
     }
 

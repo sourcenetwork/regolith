@@ -22,7 +22,7 @@ use std::thread::JoinHandle as StdJoinHandle;
 use std::time::{Duration, Instant};
 
 use regolith::env::{
-    Capabilities, DirEntry, Env, FileLock, FileMeta, JoinHandle, ReadFile, StdEnv, WriteFile,
+    Capabilities, Env, FileLock, FileMeta, JoinHandle, ReadDir, ReadFile, StdEnv, WriteFile,
     WriteMode,
 };
 use regolith::{Db, IngestOptions, Options, SstFileWriter, WriteBatch};
@@ -161,6 +161,13 @@ impl NthSstOpen {
 }
 
 impl Env for NthSstOpen {
+    fn open_log(
+        &self,
+        path: &Path,
+        mode: WriteMode,
+    ) -> io::Result<Box<dyn regolith::env::LogFile>> {
+        self.inner.open_log(path, mode)
+    }
     fn open_write(&self, path: &Path, mode: WriteMode) -> io::Result<Box<dyn WriteFile>> {
         if path.parent() == Some(self.sst_dir.as_path()) {
             let n = self.count.fetch_add(1, Ordering::AcqRel) + 1;
@@ -181,7 +188,7 @@ impl Env for NthSstOpen {
     fn create_dir_all(&self, p: &Path) -> io::Result<()> {
         self.inner.create_dir_all(p)
     }
-    fn read_dir(&self, p: &Path) -> io::Result<Vec<DirEntry>> {
+    fn read_dir(&self, p: &Path) -> io::Result<ReadDir<'_>> {
         self.inner.read_dir(p)
     }
     fn open_read(&self, p: &Path) -> io::Result<Box<dyn ReadFile>> {
@@ -365,18 +372,23 @@ fn a_write_issued_during_an_ingest_lands_above_the_ingested_file() {
 /// own file, or the older value, still in the frozen list, answers the
 /// read.
 ///
-/// Deterministic: it runs on one thread. `Db::open` opens no SST, so
-/// the first SST open is M1's flush, which fails. The ingest copies its
-/// file (the second open), then retries that flush (the third) before it
-/// allocates: M1 lands at L0, the ingest overlaps it and lands above it,
-/// and the read returns "new". Without the flush the ingest lands at the
-/// deepest level while M1 stays frozen, and the read returns "old" from
-/// the frozen list.
+/// Deterministic: it runs on one thread, on a database with no worker.
+/// (With one, the worker's first round, the one that runs the disk check
+/// of the open, may reach the sealed memtable before this thread's flush
+/// does and take the injected failure in its place, and the flush here
+/// then goes through.) `Db::open` opens no SST, so the first SST open is
+/// M1's flush, which fails. The ingest copies its file (the second open),
+/// then retries that flush (the third) before it allocates: M1 lands at
+/// L0, the ingest overlaps it and lands above it, and the read returns
+/// "new". Without the flush the ingest lands at the deepest level while M1
+/// stays frozen, and the read returns "old" from the frozen list.
 #[test]
 fn an_ingest_drains_a_memtable_left_frozen_by_a_failed_flush() {
     let dir = TempDir::new().unwrap();
     let staging = TempDir::new().unwrap();
-    let opts = Options::default().env(NthSstOpen::new(dir.path(), 0, 1));
+    let opts = Options::default()
+        .max_background_compactions(0)
+        .env(NthSstOpen::new(dir.path(), 0, 1));
     let db = Db::open(dir.path(), opts.clone()).unwrap();
 
     regolith::through_stalls(|| db.put(b"k", b"old")).unwrap();

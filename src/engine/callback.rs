@@ -1,11 +1,11 @@
 //! Containing a panic in code the caller supplied while regolith runs it on
 //! its own account.
 //!
-//! A commit is the ordered step: the validation that precedes the write
-//! pipeline and the group the pipeline's leader writes. A panic that unwinds
-//! out of a caller's implementation there leaves the shared state of that step
-//! half done, so [`contain`] catches it, names the trait, and the step's
-//! boundary latches the database read-only.
+//! A commit is the ordered step: the check a slot of the commit ring runs
+//! when it is decided, and what the thread that decides it applies and
+//! writes. A panic that unwinds out of a caller's implementation there leaves
+//! the shared state of that step half done, so [`contain`] catches it, names
+//! the trait, and the step's boundary latches the database read-only.
 //!
 //! A background step, a flush regolith runs off any caller's call (on a
 //! worker, or as the step a write owes on a database with no worker, E9), is

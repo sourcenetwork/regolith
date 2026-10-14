@@ -408,3 +408,168 @@ fn a_busy_lock_counts_as_neither_commit_nor_conflict() {
     holder.commit().unwrap();
     assert_eq!(count(&stats, Ticker::CommitCount), 1);
 }
+
+/// What the commit of a transaction that did `mine` with `k` counts after
+/// another writer did `theirs` to it: whether it conflicted, the conflicts,
+/// and the conflicts counted as following a delete.
+fn after_delete_count(
+    level: IsolationLevel,
+    mine: impl FnOnce(&regolith::Transaction),
+    theirs: impl FnOnce(&regolith::Db),
+) -> (bool, u64, u64) {
+    let dir = tempfile::tempdir().unwrap();
+    let stats = Arc::new(Statistics::new());
+    let db = open(dir.path(), Arc::clone(&stats));
+    db.db().put(b"k", &7i64.to_be_bytes()).unwrap();
+    let tx = db.begin(&TxnOptions::new().isolation(level));
+    mine(&tx);
+    theirs(db.db());
+    stats.reset();
+    let lost = conflicted(tx.commit());
+    (
+        lost,
+        count(&stats, Ticker::CommitConflicts),
+        count(&stats, Ticker::CommitConflictsAfterDelete),
+    )
+}
+
+/// A commit refused because the key it read or wrote was deleted after its
+/// snapshot counts once in `regolith.commit.conflicts_after_delete`, whatever
+/// it did with the key and whichever delete removed it.
+#[test]
+fn a_conflict_with_a_delete_is_counted_after_delete() {
+    let delete = |db: &regolith::Db| db.delete(b"k").unwrap();
+    let range_delete = |db: &regolith::Db| db.delete_range(b"a", b"z").unwrap();
+    let read = |tx: &regolith::Transaction| {
+        tx.get(b"k").unwrap();
+        tx.put(b"elsewhere", b"x").unwrap();
+    };
+    let read_for_update = |tx: &regolith::Transaction| {
+        tx.get_for_update(b"k").unwrap();
+    };
+    let put = |tx: &regolith::Transaction| tx.put(b"k", b"mine").unwrap();
+    let read_then_delete = |tx: &regolith::Transaction| {
+        tx.get(b"k").unwrap();
+        tx.delete(b"k").unwrap();
+    };
+
+    let level = IsolationLevel::RepeatableRead;
+    assert_eq!(after_delete_count(level, read, delete), (true, 1, 1));
+    assert_eq!(after_delete_count(level, read, range_delete), (true, 1, 1));
+    assert_eq!(
+        after_delete_count(level, read_for_update, delete),
+        (true, 1, 1)
+    );
+    assert_eq!(after_delete_count(level, put, delete), (true, 1, 1));
+    assert_eq!(after_delete_count(level, put, range_delete), (true, 1, 1));
+    assert_eq!(
+        after_delete_count(level, read_then_delete, delete),
+        (true, 1, 1),
+        "a delete after a delete conflicts when the deleter read the key first"
+    );
+    assert_eq!(
+        after_delete_count(IsolationLevel::DefraLevel, read, delete),
+        (true, 1, 1)
+    );
+}
+
+/// A conflict with a put or a merge operand is a conflict, and is not counted
+/// as following a delete. Neither is a commit that did not conflict at all.
+#[test]
+fn a_plain_conflict_is_not_counted_after_delete() {
+    let overwrite = |db: &regolith::Db| db.put(b"k", &8i64.to_be_bytes()).unwrap();
+    let operand = |db: &regolith::Db| db.merge(b"k", &1i64.to_be_bytes()).unwrap();
+    let delete = |db: &regolith::Db| db.delete(b"k").unwrap();
+    let read = |tx: &regolith::Transaction| {
+        tx.get(b"k").unwrap();
+        tx.put(b"elsewhere", b"x").unwrap();
+    };
+    let put = |tx: &regolith::Transaction| tx.put(b"k", b"mine").unwrap();
+    let blind_delete = |tx: &regolith::Transaction| tx.delete(b"k").unwrap();
+    let elsewhere = |tx: &regolith::Transaction| tx.put(b"elsewhere", b"x").unwrap();
+
+    let level = IsolationLevel::RepeatableRead;
+    assert_eq!(after_delete_count(level, read, overwrite), (true, 1, 0));
+    assert_eq!(after_delete_count(level, read, operand), (true, 1, 0));
+    assert_eq!(after_delete_count(level, put, overwrite), (true, 1, 0));
+    assert_eq!(after_delete_count(level, put, operand), (true, 1, 0));
+    // A put that came back after the delete decides the race, not the delete.
+    let delete_then_put = |db: &regolith::Db| {
+        db.delete(b"k").unwrap();
+        db.put(b"k", &9i64.to_be_bytes()).unwrap();
+    };
+    assert_eq!(
+        after_delete_count(level, read, delete_then_put),
+        (true, 1, 0)
+    );
+    // A blind delete of a key already deleted is elided: no conflict at all.
+    assert_eq!(
+        after_delete_count(level, blind_delete, delete),
+        (false, 0, 0)
+    );
+    // A key the transaction never touched was deleted: no conflict at all.
+    assert_eq!(after_delete_count(level, elsewhere, delete), (false, 0, 0));
+}
+
+/// The count belongs to a refused commit. A write that early validation
+/// refuses before any commit, for the same deleted key, counts nothing.
+#[test]
+fn only_a_commit_is_counted_after_delete() {
+    let dir = tempfile::tempdir().unwrap();
+    let stats = Arc::new(Statistics::new());
+    let db = open(dir.path(), Arc::clone(&stats));
+    db.db().put(b"k", b"old").unwrap();
+
+    let tx = db.begin(
+        &TxnOptions::new()
+            .isolation(IsolationLevel::RepeatableRead)
+            .early_validation(true),
+    );
+    db.db().delete(b"k").unwrap();
+    stats.reset();
+    assert!(conflicted(tx.put(b"k", b"mine")));
+    assert_eq!(count(&stats, Ticker::CommitConflicts), 0);
+    assert_eq!(count(&stats, Ticker::CommitConflictsAfterDelete), 0);
+}
+
+/// A commit whose outcome comes through a ticket, and a pessimistic commit,
+/// are counted where a blocking optimistic commit is.
+#[test]
+fn a_ticket_and_a_pessimistic_commit_are_counted_after_delete() {
+    let dir = tempfile::tempdir().unwrap();
+    let stats = Arc::new(Statistics::new());
+    let db = open(dir.path(), Arc::clone(&stats));
+    db.db().put(b"k", b"old").unwrap();
+    let tx = db.begin(&TxnOptions::new().isolation(IsolationLevel::RepeatableRead));
+    tx.get(b"k").unwrap();
+    tx.put(b"elsewhere", b"x").unwrap();
+    db.db().delete(b"k").unwrap();
+    stats.reset();
+    let ticket = tx.commit_nowait();
+    let mut queue = db.db().io_queue();
+    assert!(conflicted(queue.block_on(ticket)));
+    assert_eq!(count(&stats, Ticker::CommitConflicts), 1);
+    assert_eq!(count(&stats, Ticker::CommitConflictsAfterDelete), 1);
+
+    let dir = tempfile::tempdir().unwrap();
+    let stats = Arc::new(Statistics::new());
+    let db = pessimistic(dir.path(), Arc::clone(&stats));
+    db.db().put(b"k", b"old").unwrap();
+    let tx = db.begin(&TxnOptions::new().isolation(IsolationLevel::RepeatableRead));
+    tx.get(b"k").unwrap();
+    db.db().delete(b"k").unwrap();
+    tx.put(b"elsewhere", b"x").unwrap();
+    stats.reset();
+    assert!(conflicted(tx.commit()));
+    assert_eq!(count(&stats, Ticker::CommitConflicts), 1);
+    assert_eq!(count(&stats, Ticker::CommitConflictsAfterDelete), 1);
+}
+
+#[test]
+fn the_after_delete_ticker_is_exported_by_name() {
+    assert!(Ticker::ALL.contains(&Ticker::CommitConflictsAfterDelete));
+    assert_eq!(
+        Ticker::CommitConflictsAfterDelete.name(),
+        "regolith.commit.conflicts_after_delete"
+    );
+}

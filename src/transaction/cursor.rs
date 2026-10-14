@@ -41,7 +41,7 @@ const CF_PREFIX_LEN: usize = 4;
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum ScanCheck {
-    /// Today's scan: each unbroken stretch of snapshot keys it yields is
+    /// The plain scan: each unbroken stretch of snapshot keys it yields is
     /// recorded, and a key the transaction later writes inside a stretch is
     /// validated as a read from the begin snapshot, so it is never taken for
     /// a blind write. The keys it yielded and the range itself are not
@@ -71,9 +71,18 @@ pub enum ScanCheck {
     /// A write-free optimistic transaction at DefraLevel validates nothing,
     /// this included: its snapshot is consistent on its own.
     ///
-    /// The check reads every block of the range at commit, while the commit
-    /// holds the write pipeline, so a range that is large against the writes
-    /// since the snapshot makes every writer wait for it.
+    /// When anything at all was committed since the snapshot, the commit
+    /// reads every block of the range once more, so a range that is large
+    /// against the writes since the snapshot costs about a second scan of
+    /// it. That walk runs on the committing thread before the commit enters
+    /// the pipeline and holds up no other writer; a transaction that writes
+    /// nothing never enters it, and that walk is its whole check. When the
+    /// commit's turn in
+    /// the pipeline comes, it searches only the memtables for what landed in
+    /// the range in between. It reads the tables of the range again, with
+    /// the writes behind it in the pipeline waiting, only when a flush or an
+    /// ingest landed since the first walk, or when that walk found a write
+    /// while an earlier check of the same commit was still open.
     Range,
 }
 
@@ -212,6 +221,55 @@ impl Transaction {
     /// the order changes. Reverse starts at the highest key below `end` and
     /// walks down to `start` inclusive, both sides of the merge reversed
     /// together.
+    ///
+    /// # Example
+    ///
+    /// A transaction counts the rows of a range and stores the count. With
+    /// [`ScanCheck::Range`] the count is a validated read of the whole
+    /// range, so a row that appears in it before the commit is a conflict.
+    ///
+    /// ```
+    /// use regolith::{
+    ///     Access, OptimisticTransactionDb, Options, ScanCheck, ScanDirection, TransactionError,
+    ///     TxnOptions,
+    /// };
+    ///
+    /// let db = OptimisticTransactionDb::open("seats", Options::memory())?;
+    /// db.db().put(b"seat/1", b"taken")?;
+    /// let (first, end) = (Some(&b"seat/"[..]), Some(&b"seat0"[..]));
+    ///
+    /// let txn = db.begin(&TxnOptions::new());
+    /// let mut cursor = txn.cursor(first, end, ScanDirection::Forward, ScanCheck::Range);
+    /// let mut taken = 0;
+    /// loop {
+    ///     // A page holds the entries that fit its byte budget, one at least.
+    ///     let page = cursor.next_page(&txn, 64 * 1024)?;
+    ///     taken += page.entries.len();
+    ///     if page.done {
+    ///         break;
+    ///     }
+    /// }
+    /// assert_eq!(taken, 1);
+    ///
+    /// // Another writer takes a seat inside the counted range.
+    /// db.db().put(b"seat/2", b"taken")?;
+    ///
+    /// txn.put(b"seats-taken", b"1")?;
+    /// let Err(TransactionError::Conflict(lost)) = txn.commit() else {
+    ///     panic!("a seat appeared in the counted range");
+    /// };
+    /// assert_eq!(lost.mine(), Access::ScannedRange);
+    /// assert_eq!(lost.key(), b"seat/2");
+    ///
+    /// // The same steps through a plain scan commit a count that is stale.
+    /// let txn = db.begin(&TxnOptions::new());
+    /// let taken = txn.scan_stream(first, end).count();
+    /// db.db().put(b"seat/3", b"taken")?;
+    /// txn.put(b"seats-taken", b"2")?;
+    /// txn.commit()?;
+    /// assert_eq!(taken, 2);
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
     pub fn cursor(
         &self,
         start: Option<&[u8]>,

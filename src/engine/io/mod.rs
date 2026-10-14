@@ -31,15 +31,36 @@
 //!   right now.
 //! - **No unit outlives close.** A read checks that the database is open
 //!   when it starts, and close may come between that check and its miss
-//!   (group commit's close flushes and joins its workers after it releases
-//!   the units, while reads still in flight go on). Every miss is counted in
+//!   (close flushes and joins its workers after it releases the units,
+//!   while reads still in flight go on). Every miss is counted in
 //!   one atomic word that close marks with one read-modify-write: a miss
 //!   that starts after the mark answers `Closed`, one under way when the mark
 //!   lands releases its own unit when it ends, and one that ended before it
 //!   inserted its unit where close's sweep, which comes after the mark,
-//!   finds it. So once close returns, no unit is left in the table, and every
+//!   finds it. So once close has returned and every miss under way when it
+//!   marked the gate has ended, no unit is left in the table, and every
 //!   queue waiting on one has its completion (`NonBlocking.tla`, Release;
-//!   the loom model `no_unit_outlives_close`).
+//!   the loom model `no_unit_outlives_close`). Close does not wait for
+//!   those misses: at the instant it returns, one of them may still hold its
+//!   unit in the table, and releases it when it ends.
+//! - **A unit never waits for an open-file slot** (D60). Its reopen under
+//!   `max_open_files` sweeps the slot table once; finding every slot in use
+//!   by running reads, it parks the unit on the queue running it and the
+//!   poll goes on. The read that next frees a slot the park marked wanted
+//!   pushes a message to that queue, and its poll unparks and runs the unit
+//!   again (`env::open_file_limit::slots`, `OpenFileTable.tla`). A parked
+//!   unit stays in the table, so reads of its block join it. Close releases
+//!   it like any unit nobody runs; a park that comes after close's sweep sees
+//!   the mark (one read-modify-write after the park) and releases the unit
+//!   itself.
+//!
+//! - **A read run again finds what it found before.** What landed for a
+//!   queue is bounded by its bytes, but a landing a call run again still
+//!   needs is held past the bound until that run: the blocks the call read
+//!   before its wait, and the block it waited for (`io_queue::ledger`). So a
+//!   call that needs more blocks at once than the bound (a `multi_get`, a
+//!   collecting scan, a merge read) still finishes when it is run again after
+//!   each poll (`LandingHold.tla`).
 //!
 //! - **A poll waits for no other thread.** A job that needs something
 //!   another thread holds parks on its queue instead of waiting, and is
@@ -50,7 +71,7 @@
 //!   step a write left owing, a foreground job with no worker) is listed in
 //!   the job table here, through the same close gate as a miss, so close
 //!   finds and settles every one ([`IoRuntime::submit`]). A job many queues
-//!   share (a commit group's fsync, a stall) is owned elsewhere, and close
+//!   share (a sync round of the commit pipeline, a stall) is owned elsewhere, and close
 //!   settles it there; a queue only waits on it ([`IoRuntime::wait_on`]).
 //!
 //! `scope` carries a handle's mode to the device seam, `bind` remembers each
@@ -61,6 +82,7 @@ pub(crate) mod atomic_waker;
 pub(crate) mod bind;
 pub(crate) mod flight;
 pub(crate) mod job;
+pub(crate) mod parked;
 pub(crate) mod scope;
 pub(crate) mod shared;
 pub(crate) mod stack;
@@ -68,6 +90,7 @@ pub(crate) mod unit;
 
 use std::io;
 use std::sync::Arc;
+use std::task::Waker;
 
 use kovan_map::HashMap;
 
@@ -77,9 +100,9 @@ use super::filter_block::FilterBlock;
 use super::index_block::IndexBlock;
 use crate::io_queue::{IoWait, QueueId};
 use crate::sync::internal::{AtomicUsize, Ordering};
-use job::{Delivery, Job};
+use job::{Delivery, Job, Stir};
 use shared::{Landing, Message, QueueShared, WaitSlot};
-use unit::{Unit, UnitKey, Work};
+use unit::{Ran, Unit, UnitKey, Work};
 
 /// Buckets the unit table starts with; it grows past this on demand.
 const UNIT_BUCKETS: usize = 256;
@@ -125,6 +148,15 @@ impl CloseGate {
     /// Mark close, before its sweep.
     pub(crate) fn close(&self) {
         self.0.fetch_or(CLOSED, Ordering::AcqRel);
+    }
+
+    /// Whether close began, read by a unit just parked. A read-modify-write,
+    /// not a load: either it comes after close's mark and sees it, or the
+    /// mark reads it and so close's sweep comes after the park and finds the
+    /// unit parked. A plain load could miss the mark while the sweep missed
+    /// the park.
+    pub(crate) fn closing(&self) -> bool {
+        self.0.fetch_or(0, Ordering::AcqRel) & CLOSED != 0
     }
 
     /// A close that failed: misses make units again.
@@ -191,13 +223,20 @@ fn aliased() -> io::Error {
 pub(crate) struct IoRuntime {
     units: HashMap<UnitKey, Arc<Unit>>,
     queues: HashMap<QueueId, Arc<QueueShared>>,
-    /// The jobs a single queue owns, by address, until they land. What bounds
-    /// it: each entry is a step a write owes (at most one per database at a
-    /// time, `background_owed`) or a foreground job its caller asked for and
-    /// holds a ticket on.
-    jobs: HashMap<usize, Arc<Job>>,
+    /// The jobs a single queue owns, by address, each with its queue, until
+    /// they land. What bounds it: each entry is a step a write owes (at
+    /// most one per database at a time, `background_owed`) or a foreground
+    /// job its caller asked for and holds a ticket on.
+    jobs: HashMap<usize, Listed>,
     /// Where close and the misses meet, so no unit outlives close.
     gate: CloseGate,
+}
+
+/// A job in the job table, and the queue whose owner runs it.
+#[derive(Clone)]
+struct Listed {
+    queue: QueueId,
+    job: Arc<Job>,
 }
 
 /// The `jobs` key of `job`: its address, unique while the table holds it.
@@ -232,6 +271,29 @@ impl IoRuntime {
         self.queues.get(&id)
     }
 
+    /// Record a timed wait on `queue`: the slot handed back is ready at the
+    /// first poll of that queue that finds its clock at `due` microseconds
+    /// or later, and only there. A queue whose owner idles is woken for the
+    /// record, once, so it learns how long it may idle
+    /// ([`crate::IoProgress::wake_in`]).
+    ///
+    /// When the queue is not open on this database, or was dropped, nothing
+    /// would ever complete the wait, so the slot comes back ready.
+    pub(crate) fn timer(&self, queue: QueueId, due: u64) -> Arc<WaitSlot> {
+        let slot = Arc::new(WaitSlot::new());
+        let recorded = self.queues.get(&queue).is_some_and(|queue| {
+            let timer = Message::Timer {
+                due,
+                slot: Arc::clone(&slot),
+            };
+            queue.deliver(timer).is_ok()
+        });
+        if !recorded {
+            slot.complete();
+        }
+        slot
+    }
+
     /// Remember `id` as the calling thread's queue on this database.
     pub(crate) fn bind_current(&self, id: QueueId) {
         bind::bind(std::ptr::from_ref(self).addr(), id);
@@ -261,7 +323,13 @@ impl IoRuntime {
         if !self.gate.enter() {
             return Err(job);
         }
-        self.jobs.insert(job_key(&job), Arc::clone(&job));
+        self.jobs.insert(
+            job_key(&job),
+            Listed {
+                queue: queue.id(),
+                job: Arc::clone(&job),
+            },
+        );
         let pushed = queue.deliver(Message::Job {
             job: Arc::clone(&job),
             waiter,
@@ -281,7 +349,7 @@ impl IoRuntime {
     }
 
     /// Make `queue`'s owner wait on `job`, which others own (a commit
-    /// group's fsync, a stall). `false` when the queue was dropped.
+    /// pipeline's sync round, a stall). `false` when the queue was dropped.
     pub(crate) fn wait_on(
         &self,
         queue: &QueueShared,
@@ -309,14 +377,91 @@ impl IoRuntime {
     /// sweeps, or after close began, is settled here instead of left parked
     /// on a closed database.
     pub(crate) fn step_job(&self, job: &Arc<Job>, queue: &Arc<QueueShared>) -> bool {
+        self.step_with(job, &job::unpark_waker(job, queue))
+    }
+
+    /// [`Self::step_job`] with the waker the job parks with.
+    fn step_with(&self, job: &Arc<Job>, waker: &Waker) -> bool {
         let _device = scope::blocking();
         let counted = self.gate.enter();
-        let landed = job.step(&job::unpark_waker(job, queue));
+        let landed = job.step(waker);
         let closing = !counted || self.gate.leave();
         if landed {
             self.forget_job(job);
         } else if closing {
             self.release_job(job);
+        }
+        landed
+    }
+
+    /// One pass over the jobs `queue` owns, for its owner blocked in a call:
+    /// each one nobody is running is stepped once, as the queue's poll steps
+    /// it, never waiting for another thread. A job that parks wakes `stir`
+    /// once it may go on, and its queue is told as always, so the owner's
+    /// next poll steps it if this call has returned by then.
+    ///
+    /// Only `queue`'s own jobs: a call never runs a job another caller left
+    /// on another queue. The pass reads the whole job table, whose size the
+    /// field says.
+    fn step_own(&self, queue: &Arc<QueueShared>, stir: &Waker) {
+        for listed in self.jobs.values() {
+            if listed.queue == queue.id() && listed.job.claim() {
+                self.step_with(&listed.job, &job::nested_waker(&listed.job, stir));
+            }
+        }
+    }
+
+    /// Whether `job` is one the calling thread's own queue owns.
+    pub(crate) fn is_own(&self, job: &Arc<Job>) -> bool {
+        self.current_queue().is_some_and(|queue| {
+            self.jobs
+                .get(&job_key(job))
+                .is_some_and(|listed| listed.queue == queue.id())
+        })
+    }
+
+    /// Block the calling thread until `job` lands: what a call that chose
+    /// to block does about a job it waits for (a stall's unit, a job whose
+    /// ticket it holds).
+    ///
+    /// A thread that owns a queue would otherwise sleep here for work only
+    /// its own poll runs: a job on its queue may hold what `job` waits for
+    /// (a foreground job parked under the compaction gate, the step that
+    /// relieves a stall). So it steps its own queue's jobs meanwhile.
+    pub(crate) fn wait_landed(&self, job: &Arc<Job>) {
+        let Some(queue) = self.current_queue() else {
+            return job.wait_landed();
+        };
+        let stir = Stir::new();
+        // Told once, by whoever lands the job; refused when it has landed.
+        if !job.listen(Arc::clone(&stir) as Arc<dyn Delivery>) {
+            return;
+        }
+        let waker = Waker::from(Arc::clone(&stir));
+        // As in `Job::wait_landed`: a wait for another thread.
+        super::read_view::idle();
+        while !job.is_done() {
+            // Bounded: one pass a wake. A pass steps each of this queue's
+            // jobs at most once, and then the thread sleeps until `job`
+            // lands or a job stepped here may go on (a job that parked
+            // registered `waker` where its wait ends, and one whose wait
+            // ended during the pass has stirred already). So the loop never
+            // spins while another thread holds what the jobs need.
+            self.step_own(&queue, &waker);
+            if !job.is_done() {
+                stir.sleep();
+            }
+        }
+        super::read_view::idle();
+    }
+
+    /// [`Self::step_job`] for a job claimed inside the step of another one,
+    /// which found it in its way: stepped with the waker that step chose,
+    /// in its device scope and its count through the close gate.
+    pub(crate) fn step_within(&self, job: &Arc<Job>, waker: &std::task::Waker) -> bool {
+        let landed = job.step(waker);
+        if landed {
+            self.forget_job(job);
         }
         landed
     }
@@ -333,7 +478,7 @@ impl IoRuntime {
 
     fn forget_job(&self, job: &Arc<Job>) {
         self.jobs
-            .remove_if(&job_key(job), |held| Arc::ptr_eq(held, job));
+            .remove_if(&job_key(job), |held| Arc::ptr_eq(&held.job, job));
     }
 
     /// A read in a `CacheOnly` scope on `queue` missed the block cache for
@@ -374,11 +519,16 @@ impl IoRuntime {
             return Err(queue_gone());
         };
         match queue.landed(&key) {
-            Some(Landing::Ready(landed)) => return Ok(landed),
+            Some(Landing::Ready(landed)) => {
+                scope::note_hit(&queue, key);
+                return Ok(landed);
+            }
             Some(Landing::Failed(err)) => return Err(crate::Error::clone_io(&err)),
             None => {}
         }
-        let slot = Arc::new(WaitSlot::new());
+        // The call will be run again: its wait carries the landed blocks it
+        // read so far, which its queue keeps for that run.
+        let slot = Arc::new(WaitSlot::holding(scope::note_wait()));
         if !queue.admit(bytes) {
             // The queue owes its whole bound: wait for room instead of adding
             // a unit, and record the read when it is run again.
@@ -436,12 +586,33 @@ impl IoRuntime {
         }
     }
 
-    /// Run a unit this thread claimed, reading the device whatever scope the
-    /// caller is in, then drop it from the table.
-    pub(crate) fn run(&self, unit: &Arc<Unit>, cache: &BlockCache) {
-        let _device = scope::blocking();
-        unit.run(cache);
-        self.forget(unit);
+    /// Run a unit this thread claimed for `queue`, reading the device
+    /// whatever scope the caller is in, then drop it from the table. A
+    /// reopen in it that finds every open-file slot busy parks it on
+    /// `queue` instead of waiting (D60): it stays in the table, and the
+    /// queue runs it again once told a slot freed.
+    pub(crate) fn run(
+        &self,
+        unit: &Arc<Unit>,
+        queue: &Arc<QueueShared>,
+        cache: &BlockCache,
+    ) -> Ran {
+        let ran = {
+            let run = scope::unit_run(queue);
+            unit.run(cache, || run.parked())
+        };
+        match ran {
+            Ran::Finished => self.forget(unit),
+            // Close marks its gate and then sweeps the table: a park that
+            // landed after the sweep passed this unit finds the mark here
+            // and lets the unit go itself (the module docs).
+            Ran::Parked if self.gate.closing() => {
+                self.release(unit);
+                return Ran::Finished;
+            }
+            Ran::Parked => {}
+        }
+        ran
     }
 
     /// Close `unit` without reading, unless another thread is running it,
@@ -469,8 +640,8 @@ impl IoRuntime {
         }
         // A job a queue owns is settled the same way: its waiters are told
         // now, with the outcome its body gives a closed database.
-        for job in self.jobs.values() {
-            self.release_job(&job);
+        for listed in self.jobs.values() {
+            self.release_job(&listed.job);
         }
     }
 
@@ -484,6 +655,12 @@ impl IoRuntime {
     #[cfg(test)]
     pub(crate) fn units_in_flight(&self) -> usize {
         self.units.len()
+    }
+
+    /// The unit in the table for `key`.
+    #[cfg(test)]
+    pub(crate) fn unit(&self, key: &UnitKey) -> Option<Arc<Unit>> {
+        self.units.get(key)
     }
 
     /// Jobs in the table now.
@@ -501,3 +678,7 @@ fn queue_gone() -> io::Error {
         "the I/O queue this read names is not open on this database",
     )
 }
+
+#[cfg(all(test, not(loom)))]
+#[path = "own_jobs_tests.rs"]
+mod own_jobs_tests;

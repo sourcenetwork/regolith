@@ -14,6 +14,7 @@
 //! keys present for writer `w` must be a *prefix* of its sequence: a hole
 //! means the engine acknowledged `i` as durable, then lost it while
 //! keeping the later `i + 1`.
+#![cfg(not(target_arch = "wasm32"))]
 
 use std::collections::BTreeMap;
 use std::path::Path;

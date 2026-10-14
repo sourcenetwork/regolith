@@ -16,19 +16,25 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::task::Waker;
 
 use super::background_health::{BackgroundHealth, Job};
 use super::callback::{self, InBackground};
 use super::commit::StallSignal;
+use super::io::parked::Parked;
+use super::io::scope;
+use super::io::shared::thread_token;
 use super::log_retirement::{self, RetiredLogs};
 use super::manifest::VersionEdit;
 use super::memtable::MemTable;
 use super::pending_outputs::PendingOutputs;
-use super::read_view::{ReadViewCell, VersionStore};
+use super::range_tombstone::RangeTombstoneSet;
+use super::read_view::ReadViewCell;
 use super::sstable::{LiveSst, SsTableMeta, SsTableReader, SsTableWriter, sst_filename};
+use super::version_store::VersionStore;
 use super::{EngineOptions, event_listener};
 use crate::env::Env;
-use crate::sync::internal::wait_here;
+use crate::sync::internal::{AtomicUsize, Ordering, wait_here};
 use crate::sync::{Mutex, MutexGuard};
 
 /// What a flush needs, shared by the engine and its compaction workers.
@@ -69,8 +75,44 @@ pub(crate) struct Flusher {
     /// it ([`Flusher::try_flushing`]); what must have a memtable flushed
     /// before it goes on (a worker, a job's drain, close, a rotation at the
     /// memtable cap) waits for the flush in flight on its own thread
-    /// ([`Flusher::flushing`]).
+    /// ([`Flusher::flushing`]). An ordered unit a queue's poll runs may not
+    /// wait: the poll takes the exclusion before the unit's body begins, or
+    /// parks ([`Flusher::hold_or_park`]). Built without spin (E48): it is
+    /// held for a whole memtable flush, table writes and syncs included, so
+    /// a caller that waits for it queues at once.
     flushing: Mutex<()>,
+    /// The thread whose poll took the exclusion for a unit's body, as its
+    /// thread token; zero otherwise. That thread's own calls for the
+    /// exclusion, inside the body, find it held here and go on.
+    held_by: AtomicUsize,
+    /// The jobs that found the exclusion held and parked, woken each time
+    /// it is released (`io::parked`, PK1).
+    parked: Parked,
+}
+
+/// The flush exclusion, held: what [`Flusher::flush_oldest`] is called
+/// with. Released when dropped, unless it only stands for a hold further up
+/// this thread's stack.
+pub(crate) struct Flushing<'a> {
+    flusher: &'a Flusher,
+    /// `None` when the exclusion is held further up this thread's stack, by
+    /// the poll running the unit this call is part of.
+    guard: Option<MutexGuard<'a, ()>>,
+    /// The hold of [`Flusher::hold_or_park`], which `held_by` names.
+    for_unit: bool,
+}
+
+impl Drop for Flushing<'_> {
+    fn drop(&mut self) {
+        let Some(guard) = self.guard.take() else {
+            return;
+        };
+        if self.for_unit {
+            self.flusher.held_by.store(0, Ordering::Release);
+        }
+        drop(guard);
+        self.flusher.parked.released();
+    }
 }
 
 impl Flusher {
@@ -93,19 +135,60 @@ impl Flusher {
             options,
             health,
             stall_signal,
-            flushing: Mutex::new(()),
+            flushing: Mutex::new_without_spin(()),
+            held_by: AtomicUsize::new(0),
+            parked: Parked::new(),
+        }
+    }
+
+    /// The exclusion as this thread's poll already holds it for the unit it
+    /// is running, if it does.
+    fn held_here(&self) -> Option<Flushing<'_>> {
+        (self.held_by.load(Ordering::Acquire) == thread_token()).then_some(Flushing {
+            flusher: self,
+            guard: None,
+            for_unit: false,
+        })
+    }
+
+    fn held<'a>(&'a self, guard: MutexGuard<'a, ()>, for_unit: bool) -> Flushing<'a> {
+        Flushing {
+            flusher: self,
+            guard: Some(guard),
+            for_unit,
         }
     }
 
     /// The flush exclusion, waited for on this thread. Fails only on
     /// `wasm32`, when this same thread is already inside a flush.
-    pub(crate) fn flushing(&self) -> std::io::Result<MutexGuard<'_, ()>> {
-        wait_here(self.flushing.lock())
+    pub(crate) fn flushing(&self) -> std::io::Result<Flushing<'_>> {
+        if let Some(held) = self.held_here() {
+            return Ok(held);
+        }
+        scope::waits("the flush exclusion, taken without holding it");
+        if let Some(guard) = self.flushing.try_lock() {
+            return Ok(self.held(guard, false));
+        }
+        Ok(self.held(wait_here(self.flushing.lock())?, false))
     }
 
     /// The flush exclusion if no flush is in flight, without waiting.
-    pub(crate) fn try_flushing(&self) -> Option<MutexGuard<'_, ()>> {
-        self.flushing.try_lock()
+    pub(crate) fn try_flushing(&self) -> Option<Flushing<'_>> {
+        self.held_here()
+            .or_else(|| Some(self.held(self.flushing.try_lock()?, false)))
+    }
+
+    /// The flush exclusion for the body of an ordered unit a queue's poll
+    /// is about to run, which may not wait for it once it began. `None`
+    /// when a flush is in flight: `waker` is then woken when the exclusion
+    /// is next released, and the unit parks. Until the hold is dropped,
+    /// this thread's own calls for the exclusion find it held and go on.
+    pub(crate) fn hold_or_park(&self, waker: &Waker) -> Option<Flushing<'_>> {
+        let guard = self
+            .parked
+            .take_or_park(waker, || self.flushing.try_lock())?;
+        self.held_by.store(thread_token(), Ordering::Release);
+        Some(self.held(guard, true))
     }
 
     /// Flush every frozen memtable, oldest first, as a background step: what
@@ -118,6 +201,9 @@ impl Flusher {
     pub(crate) fn flush_all_frozen(&self) {
         let _background = InBackground::enter();
         loop {
+            // The worker may wait here on a writer's or a checkpoint's
+            // flush, a whole table write. The wait releases the views its
+            // last read holds back before it parks.
             let Ok(flushing) = self.flushing() else {
                 break;
             };
@@ -177,7 +263,7 @@ impl Flusher {
     /// sequence of its own and recency is install order. Two flushes
     /// racing would install a newer file under an older one, and a read
     /// that had seen the newer version would then see the older one.
-    pub(crate) fn flush_oldest(&self, flushing: &MutexGuard<'_, ()>) -> std::io::Result<bool> {
+    pub(crate) fn flush_oldest(&self, flushing: &Flushing<'_>) -> std::io::Result<bool> {
         match self.flush_oldest_inner(flushing) {
             Ok(flushed) => {
                 self.health.record_success(Job::Flush);
@@ -201,7 +287,7 @@ impl Flusher {
         }
     }
 
-    fn flush_oldest_inner(&self, _flushing: &MutexGuard<'_, ()>) -> std::io::Result<bool> {
+    fn flush_oldest_inner(&self, _flushing: &Flushing<'_>) -> std::io::Result<bool> {
         // Through the env: a target with no monotonic clock reports
         // nothing measured rather than a fabricated duration.
         let flush_start = self.env.now_micros();
@@ -218,13 +304,7 @@ impl Flusher {
             return Ok(true);
         }
 
-        let file_id = {
-            let mut versions = self.versions.lock();
-            let version = versions.current();
-            let id = version.next_file_id;
-            versions.apply(&[VersionEdit::SetNextFileId(id + 1)])?;
-            id
-        };
+        let file_id = self.versions.take_file_id()?;
 
         let sst_path = self.sst_dir.join(sst_filename(file_id));
         // Until the edit below is offered to the manifest, nothing else
@@ -245,6 +325,14 @@ impl Flusher {
             self.options.metadata_block_size,
             self.options.keyring.as_deref(),
         )?;
+
+        // The table carries the memtable's range tombstones, so the entries
+        // they hide are counted with its deletions as they are written.
+        if !range_tombstones.is_empty() {
+            writer.hidden_by(Arc::new(RangeTombstoneSet::from_vec(
+                range_tombstones.clone(),
+            )));
+        }
 
         // Walk the memtable in internal-key order and copy every version
         // and tombstone into the SSTable unchanged, preserving MVCC.
@@ -300,6 +388,7 @@ impl Flusher {
                 file_size,
                 num_entries,
                 global_seq: None,
+                deletions: Some(summary.deletions),
             },
             reader,
         );
@@ -321,15 +410,15 @@ impl Flusher {
         // when the table is durable (E30).
         edits.extend(log_retirement::min_wal_id_after(&memtable).map(VersionEdit::SetMinWalId));
         pending.offered_to_manifest();
-        {
-            let mut versions = self.versions.lock();
+        self.versions.run(|versions| -> std::io::Result<()> {
             versions.apply(&edits)?;
             // Retired in the publication of the version holding its table,
             // not after it: until that version is published the flushed data
             // lives in this memtable alone, and a view holding both would
             // apply the memtable's merge operands twice.
             versions.retire_with_version(&memtable);
-        }
+            Ok(())
+        })?;
         #[cfg(test)]
         if let Some(hook) = AFTER_FLUSH_INSTALL.with(|slot| slot.borrow_mut().take()) {
             hook();
@@ -356,7 +445,7 @@ impl Flusher {
                 // Version was just applied; pull the newly-added
                 // file's metadata back out so listeners see the
                 // exact bounds the engine committed.
-                let ver = self.versions.lock().current();
+                let ver = self.versions.current();
                 if let Some(added) = ver.levels[0].iter().find(|f| f.meta.file_id == file_id) {
                     (
                         added.meta.smallest_key.clone(),

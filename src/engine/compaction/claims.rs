@@ -39,10 +39,17 @@ use super::LiveSst;
 /// the tables claimed one by one.
 const POOL: usize = 1 << (usize::BITS - 1);
 
-/// The claims of every pass of one engine.
+/// What every pass of one engine shares: the claims on tables, whose turn
+/// the next pass is, and the census.
 #[derive(Default)]
 pub(crate) struct Claims {
     word: AtomicUsize,
+    /// Whether size-triggered work or a deletion pass goes first
+    /// (`deletion.rs`).
+    pub(crate) turn: super::deletion::Turn,
+    /// The count of deletions in tables recorded without one
+    /// (`census.rs`).
+    pub(crate) census: super::census::Census,
 }
 
 /// What one pass holds, given back on drop, whatever way the pass ends.
@@ -177,6 +184,7 @@ mod tests {
                 file_size: 1,
                 num_entries: 1,
                 global_seq: None,
+                deletions: None,
             },
             Arc::new(SsTableReader::open(&path, file_id).unwrap()),
         )

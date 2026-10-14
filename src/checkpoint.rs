@@ -92,10 +92,11 @@ impl<'db> Checkpoint<'db> {
     }
 }
 
-/// What a checkpoint job does before it takes the compaction gate, on the
-/// thread that runs it: ready the target directory, and drain the memtables
-/// so every write acknowledged so far is in a table.
-pub(crate) fn prepare(engine: &RegolithEngine, target_dir: &Path) -> Result<()> {
+/// The first thing a checkpoint job does, on the thread that runs it: ready
+/// the target directory. The drain of the memtables, so that every write
+/// acknowledged so far is in a table, follows
+/// ([`RegolithEngine::checkpoint_drain`]), and then the gate.
+pub(crate) fn prepare_target(engine: &RegolithEngine, target_dir: &Path) -> Result<()> {
     let target_sst = target_dir.join("sst");
     let target_wal = target_dir.join("wal");
 
@@ -103,25 +104,45 @@ pub(crate) fn prepare(engine: &RegolithEngine, target_dir: &Path) -> Result<()> 
     env.create_dir_all(&target_sst).map_err(Error::from)?;
     env.create_dir_all(&target_wal).map_err(Error::from)?;
 
-    if !env.read_dir(&target_sst).map_err(Error::from)?.is_empty() {
+    // One entry is enough to know, so the walk stops at the first.
+    let occupied = env
+        .read_dir(&target_sst)
+        .and_then(|mut walk| walk.next().transpose())
+        .map_err(Error::from)?
+        .is_some();
+    if occupied {
         return Err(Error::Io(std::io::Error::new(
             std::io::ErrorKind::AlreadyExists,
             "checkpoint target sst directory is not empty",
         )));
     }
+    Ok(())
+}
+
+/// What a checkpoint does before it takes the compaction gate, waiting on
+/// this thread: [`prepare_target`], then the drain.
+#[cfg(test)]
+fn prepare(engine: &RegolithEngine, target_dir: &Path) -> Result<()> {
+    prepare_target(engine, target_dir)?;
     engine.checkpoint_drain().map_err(Error::from)
 }
 
-/// What a checkpoint job does holding the compaction gate alone, after
-/// [`prepare`]: capture the version and its manifest, link every table it
-/// names into `target_dir`, and write the manifest there. The gate is
-/// released when this returns.
+/// What a checkpoint job does holding the compaction gate alone, after its
+/// drain: capture the version and its manifest, link every table it names
+/// into `target_dir`, and write the manifest there. The gate is released
+/// when this returns.
+///
+/// `after_capture` runs between the capture and the links. The capture is
+/// a section of the version store's step, and a queue's poll holds the step
+/// for it; this is where it gives the step back, so the links, which may
+/// copy whole tables, run with the step free.
 pub(crate) fn capture_into(
     engine: &RegolithEngine,
     gate: Exclusive,
     target_dir: &Path,
+    after_capture: impl FnOnce(),
 ) -> Result<()> {
-    capture_into_between(engine, gate, target_dir, || {})
+    capture_into_between(engine, gate, target_dir, after_capture)
 }
 
 /// A whole checkpoint on this thread, waiting here for the gate, with a hook

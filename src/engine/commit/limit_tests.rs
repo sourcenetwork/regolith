@@ -1,11 +1,9 @@
 //! Coverage for the record-length limit: the fold in the three
-//! validation loops, the admission hold-back, and the last-resort guard
-//! in `run_and_complete`.
+//! validation loops, the refusal before a write takes a slot of the commit
+//! ring, and the last-resort guard when a slot is decided.
 
 use std::collections::BTreeMap;
-use std::time::Instant;
 
-use proptest::prelude::*;
 use tempfile::TempDir;
 
 use super::super::wal::{ops_record_len, put_record_len};
@@ -150,65 +148,28 @@ fn commit_buffers_framing_to(
     (point_ops, range_deletes, merges)
 }
 
-/// Poll `f` until it is true, or fail with `msg` after `deadline`. Backs
-/// off from 1 ms to 50 ms rather than spinning or sleeping a fixed
-/// amount, so a fast run returns almost immediately and a stuck one
-/// fails instead of hanging the suite.
-fn wait_until(deadline: Duration, msg: &str, mut f: impl FnMut() -> bool) {
-    let start = Instant::now();
-    let mut backoff = Duration::from_millis(1);
-    while !f() {
-        assert!(start.elapsed() < deadline, "{msg}");
-        thread::sleep(backoff);
-        backoff = (backoff * 2).min(Duration::from_millis(50));
-    }
-}
-
-/// Run `call` on its own thread while this thread holds the pipeline
-/// mutex, and assert it refuses the write without ever needing that
-/// mutex: it must finish inside the deadline even though the mutex is
-/// unavailable, and every trace of the attempt (sequence, WAL offset,
-/// the key itself) must be untouched.
-fn assert_refused_while_pipeline_locked(
+/// Run `call` and assert it refuses the write before the write takes a slot
+/// of the commit ring: the ring hands out no index, and every trace of the
+/// attempt (sequence, WAL offset, the key itself) is untouched.
+fn assert_refused_before_the_pipeline(
     engine: &Arc<RegolithEngine>,
     probe_key: &[u8],
-    call: impl FnOnce(Arc<RegolithEngine>) -> io::Result<u64> + Send + 'static,
+    call: impl FnOnce(&Arc<RegolithEngine>) -> io::Result<u64>,
 ) {
-    let before_seq = engine.latest_seq.load(Ordering::Acquire);
-    let before_wal = engine
-        .active_wal
-        .lock()
-        .as_ref()
-        .map(|w| w.offset())
-        .unwrap();
+    let before_seq = engine.last_decided_seq();
+    let before_wal = engine.log_end();
+    let before_slots = engine.pipeline_slots_taken();
 
-    let guard = engine.pipeline.lock();
-    let spawned = Arc::clone(engine);
-    let handle = thread::spawn(move || call(spawned));
-
-    wait_until(
-        Duration::from_secs(60),
-        "the record-limit check must refuse a write before it needs the pipeline mutex",
-        || handle.is_finished(),
-    );
-    drop(guard);
-
-    let err = handle
-        .join()
-        .expect("the writer thread must not panic")
-        .expect_err("an oversized write must be refused");
+    let err = call(engine).expect_err("an oversized write must be refused");
     assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
 
-    assert_eq!(engine.latest_seq.load(Ordering::Acquire), before_seq);
     assert_eq!(
-        engine
-            .active_wal
-            .lock()
-            .as_ref()
-            .map(|w| w.offset())
-            .unwrap(),
-        before_wal
+        engine.pipeline_slots_taken(),
+        before_slots,
+        "the record-limit check must refuse a write before it takes a slot"
     );
+    assert_eq!(engine.last_decided_seq(), before_seq);
+    assert_eq!(engine.log_end(), before_wal);
     assert_eq!(engine.get(probe_key, u64::MAX).unwrap(), None);
 }
 
@@ -253,7 +214,7 @@ fn an_oversized_write_is_refused_before_it_reaches_the_pipeline() {
         let dir = TempDir::new().unwrap();
         let engine = open_engine(&dir);
         let probe = key(b"k00");
-        assert_refused_while_pipeline_locked(&engine, &probe, move |engine| {
+        assert_refused_before_the_pipeline(&engine, &probe, move |engine| {
             engine.apply_batch(
                 puts_framing_to(MAX_RECORD_LEN as usize + 1, 17),
                 DurabilityMode::Eventual,
@@ -268,7 +229,7 @@ fn an_oversized_write_is_refused_before_it_reaches_the_pipeline() {
         let (point_ops, range_deletes, merges) =
             commit_buffers_framing_to(MAX_RECORD_LEN as usize + 1);
         let probe = key(b"k00");
-        assert_refused_while_pipeline_locked(&engine, &probe, move |engine| {
+        assert_refused_before_the_pipeline(&engine, &probe, move |engine| {
             let checks = ValidationSet {
                 reads: Vec::new(),
                 writes_at: None,
@@ -307,349 +268,48 @@ fn an_oversized_write_is_refused_before_it_reaches_the_pipeline() {
             MAX_RECORD_LEN as usize + 1
         );
         let put_key = probe.clone();
-        assert_refused_while_pipeline_locked(&engine, &probe, move |engine| {
+        assert_refused_before_the_pipeline(&engine, &probe, move |engine| {
             engine.apply_single_put(put_key, vec![0u8; v], DurabilityMode::Eventual, false)
         });
     }
 }
 
-// -- T3.4: a group over the limit is refused whole --------------------
+// -- T3.4: a write over the limit that reaches the pipeline ------------
 
+/// The last line of defence, for a request that reached the pipeline without
+/// its producer's check: deciding its slot refuses it before it takes a
+/// sequence, a byte of the log or a memtable entry, and the pipeline goes
+/// on.
 #[test]
-fn a_group_past_the_limit_is_refused_whole_before_it_takes_a_sequence() {
+fn a_write_past_the_limit_is_refused_when_decided_before_it_takes_a_sequence() {
     let dir = TempDir::new().unwrap();
     let engine = open_engine(&dir);
+    engine
+        .commit_through_pipeline(durable_put(b"before", b"v"))
+        .expect("a write under the limit commits");
 
-    let before_seq = engine.latest_seq.load(Ordering::Acquire);
-    let before_horizon = engine.snapshot_seq();
-    let before_wal = engine
-        .active_wal
-        .lock()
-        .as_ref()
-        .map(|w| w.offset())
-        .unwrap();
-
-    // Two requests under the record limit on their own (600 MiB each),
-    // but 1.2 GiB together: only the group-level guard can catch this.
-    let names = [b"biga".to_vec(), b"bigb".to_vec()];
-    let slots: Vec<Arc<WriteSlot>> = names
-        .iter()
-        .map(|name| {
-            let slot = Arc::new(WriteSlot::new());
-            slot.arm(WriteRequest::Put {
-                key: key(name),
-                value: vec![0u8; 600 << 20],
-                durability: DurabilityMode::Eventual,
-                disable_wal: false,
-            })
-            .expect("fresh slot arms");
-            slot
+    let before_seq = engine.last_decided_seq();
+    let before_wal = engine.log_end();
+    let err = engine
+        .commit_through_pipeline(WriteRequest::Batch {
+            ops: puts_framing_to(MAX_RECORD_LEN as usize + 1, 17),
+            durability: DurabilityMode::Eventual,
+            disable_wal: false,
         })
-        .collect();
-
-    let mut pipe = engine.pipeline.lock();
-    pipe.group.clear();
-    for slot in &slots {
-        let request = slot.take_request();
-        pipe.group
-            .push(GroupTicket::new(Some(Arc::clone(slot)), request));
-    }
-    let own = engine.run_and_complete(&mut pipe, engine.view.load());
-    assert!(own.is_none(), "the group carries no leader request");
-    assert_eq!(pipe.stage.len(), 0);
-    drop(pipe);
-
-    for slot in &slots {
-        assert!(slot.is_done());
-        let err = slot
-            .finish()
-            .expect_err("an over-limit group must fail every member");
-        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
-    }
-
-    assert_eq!(engine.latest_seq.load(Ordering::Acquire), before_seq);
-    assert_eq!(engine.snapshot_seq(), before_horizon);
+        .expect_err("a record past the limit must be refused");
+    assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
     assert_eq!(
-        engine
-            .active_wal
-            .lock()
-            .as_ref()
-            .map(|w| w.offset())
-            .unwrap(),
-        before_wal
+        engine.last_decided_seq(),
+        before_seq,
+        "a refused write must not take a sequence"
     );
-    for name in &names {
-        assert_eq!(engine.get(&key(name), u64::MAX).unwrap(), None);
-    }
-}
+    assert_eq!(engine.log_end(), before_wal, "nor a byte of the log");
+    assert_eq!(engine.get(&key(b"k00"), u64::MAX).unwrap(), None);
 
-// -- T3.5-T3.8: admission's hold-back ----------------------------------
-
-#[test]
-fn admission_holds_back_a_ticket_that_would_take_the_group_past_the_limit() {
-    let dir = TempDir::new().unwrap();
-    let engine = open_engine(&dir);
-
-    let a = durable_put(b"a", b"short").staged_len();
-    let b = durable_put(b"b", b"a-bit-longer-value").staged_len();
-    let push_ab = |engine: &RegolithEngine| {
-        let slot_a = Arc::new(WriteSlot::new());
-        slot_a.arm(durable_put(b"a", b"short")).unwrap();
-        engine
-            .commit_ring
-            .push(slot_a)
-            .map_err(|_| "ring full")
-            .unwrap();
-        let slot_b = Arc::new(WriteSlot::new());
-        slot_b
-            .arm(durable_put(b"b", b"a-bit-longer-value"))
-            .unwrap();
-        engine
-            .commit_ring
-            .push(slot_b)
-            .map_err(|_| "ring full")
-            .unwrap();
-    };
-
-    let mut pipe = engine.pipeline.lock();
-    let view = engine.view.load();
-
-    pipe.group.clear();
-    pipe.held = None;
-    push_ab(&engine);
-    engine.admit_from_ring(&mut pipe, &view, a + b - 1);
-    assert_eq!(pipe.group.len(), 1);
-    assert_eq!(pipe.group[0].request.staged_len(), a);
-    assert!(pipe.held.is_some());
-    assert_eq!(pipe.held.as_ref().unwrap().request.staged_len(), b);
-
-    pipe.group.clear();
-    pipe.held = None;
-    push_ab(&engine);
-    engine.admit_from_ring(&mut pipe, &view, a + b);
-    assert_eq!(pipe.group.len(), 2);
-    assert!(pipe.held.is_none());
-}
-
-#[test]
-fn a_seeded_group_holds_back_what_does_not_fit() {
-    let dir = TempDir::new().unwrap();
-    let engine = open_engine(&dir);
-
-    let s = durable_put(b"seed", b"value").staged_len();
-    let a = durable_put(b"a", b"a-value").staged_len();
-
-    let seed = |pipe: &mut Pipeline| {
-        pipe.group.clear();
-        pipe.held = None;
-        pipe.group
-            .push(GroupTicket::new(None, durable_put(b"seed", b"value")));
-    };
-    let push_a = |engine: &RegolithEngine| {
-        let slot = Arc::new(WriteSlot::new());
-        slot.arm(durable_put(b"a", b"a-value")).unwrap();
-        engine
-            .commit_ring
-            .push(slot)
-            .map_err(|_| "ring full")
-            .unwrap();
-    };
-
-    let mut pipe = engine.pipeline.lock();
-    let view = engine.view.load();
-
-    seed(&mut pipe);
-    push_a(&engine);
-    engine.admit_from_ring(&mut pipe, &view, s + a - 1);
-    assert_eq!(pipe.group.len(), 1);
-    assert!(pipe.held.is_some());
-
-    seed(&mut pipe);
-    push_a(&engine);
-    engine.admit_from_ring(&mut pipe, &view, s + a);
-    assert_eq!(pipe.group.len(), 2);
-    assert!(pipe.held.is_none());
-}
-
-#[test]
-fn a_held_ticket_leads_the_next_group_ahead_of_the_ring() {
-    let dir = TempDir::new().unwrap();
-    let engine = open_engine(&dir);
-
-    let h_slot = Arc::new(WriteSlot::new());
-    h_slot.arm(durable_put(b"held", b"h")).unwrap();
-    let a_slot = Arc::new(WriteSlot::new());
-    a_slot.arm(durable_put(b"a", b"a")).unwrap();
+    // The same batch with the log skipped has no record to be too long.
     engine
-        .commit_ring
-        .push(Arc::clone(&a_slot))
-        .map_err(|_| "ring full")
-        .unwrap();
-
-    let mut pipe = engine.pipeline.lock();
-    pipe.group.clear();
-    pipe.held = Some(GroupTicket::new(
-        Some(Arc::clone(&h_slot)),
-        h_slot.take_request(),
-    ));
-    let view = engine.view.load();
-    engine.admit_from_ring(&mut pipe, &view, usize::MAX);
-
-    assert_eq!(pipe.group.len(), 2);
-    assert!(Arc::ptr_eq(pipe.group[0].slot.as_ref().unwrap(), &h_slot));
-    assert!(Arc::ptr_eq(pipe.group[1].slot.as_ref().unwrap(), &a_slot));
-    assert!(pipe.held.is_none());
-}
-
-#[test]
-fn the_first_ticket_is_admitted_whatever_the_limit() {
-    let dir = TempDir::new().unwrap();
-    let engine = open_engine(&dir);
-
-    let a_slot = Arc::new(WriteSlot::new());
-    a_slot.arm(durable_put(b"a", b"value")).unwrap();
-    engine
-        .commit_ring
-        .push(Arc::clone(&a_slot))
-        .map_err(|_| "ring full")
-        .unwrap();
-
-    // Nothing else holds the pipeline mutex here: the deadline is
-    // guarding against the hold-back condition looping inside a single
-    // call, not against contention.
-    let spawned = Arc::clone(&engine);
-    let handle = thread::spawn(move || {
-        let mut pipe = spawned.pipeline.lock();
-        pipe.group.clear();
-        pipe.held = None;
-        let view = spawned.view.load();
-        spawned.admit_from_ring(&mut pipe, &view, 1);
-        (pipe.group.len(), pipe.held.is_some())
-    });
-
-    wait_until(
-        Duration::from_secs(60),
-        "admission must terminate even when the first ticket alone exceeds the limit",
-        || handle.is_finished(),
-    );
-    let (group_len, held) = handle.join().expect("admission must not panic");
-    assert_eq!(
-        group_len, 1,
-        "the first ticket is admitted whatever it costs"
-    );
-    assert!(!held);
-}
-
-// -- T3.9: a held ticket survives to the next drain --------------------
-
-#[test]
-fn a_held_ticket_is_committed_by_the_next_drain() {
-    let dir = TempDir::new().unwrap();
-    let engine = open_engine(&dir);
-
-    let h_slot = Arc::new(WriteSlot::new());
-    h_slot.arm(durable_put(b"held", b"v")).unwrap();
-    {
-        let mut pipe = engine.pipeline.lock();
-        pipe.group.clear();
-        pipe.held = Some(GroupTicket::new(
-            Some(Arc::clone(&h_slot)),
-            h_slot.take_request(),
-        ));
-    }
-
-    assert!(
-        engine.try_drain(),
-        "a held ticket alone must still be drained"
-    );
-    assert!(h_slot.is_done());
-    assert!(h_slot.finish().is_ok());
-    assert_eq!(
-        engine.get(&key(b"held"), u64::MAX).unwrap(),
-        Some(b"v".to_vec())
-    );
-    assert!(engine.pipeline.lock().held.is_none());
-
-    // A held ticket left by an interrupted leader is admitted into the
-    // next leader's group, behind that leader's own seeded request.
-    let h2_slot = Arc::new(WriteSlot::new());
-    h2_slot.arm(durable_put(b"held2", b"v2")).unwrap();
-    {
-        let mut pipe = engine.pipeline.lock();
-        pipe.held = Some(GroupTicket::new(
-            Some(Arc::clone(&h2_slot)),
-            h2_slot.take_request(),
-        ));
-    }
-    let seq_own = engine
-        .submit(durable_put(b"own", b"v"))
-        .expect("the leader's own write commits");
-    assert!(h2_slot.is_done());
-    let seq_held = h2_slot.finish().expect("the held ticket commits too");
-    assert!(
-        seq_own < seq_held,
-        "the leader's own seeded request runs before the held ticket it admits: \
-         {seq_own} >= {seq_held}"
-    );
-    assert_eq!(
-        engine.get(&key(b"own"), u64::MAX).unwrap(),
-        Some(b"v".to_vec())
-    );
-    assert_eq!(
-        engine.get(&key(b"held2"), u64::MAX).unwrap(),
-        Some(b"v2".to_vec())
-    );
-}
-
-// -- T3.10: admission never stages a group past the limit -------------
-
-proptest! {
-    #![proptest_config(ProptestConfig::with_cases(48))]
-    #[test]
-    fn admission_never_stages_a_group_past_the_limit_and_keeps_ring_order(
-        value_lens in proptest::collection::vec(0usize..200, 1..=15),
-        limit in 32usize..600,
-    ) {
-        let dir = TempDir::new().unwrap();
-        let engine = open_engine(&dir);
-
-        let mut pushed = Vec::new();
-        for (i, len) in value_lens.iter().enumerate() {
-            let k = key(format!("k{i:02}").as_bytes());
-            let slot = Arc::new(WriteSlot::new());
-            slot.arm(WriteRequest::Put {
-                key: k.clone(),
-                value: vec![0u8; *len],
-                durability: DurabilityMode::Eventual,
-                disable_wal: false,
-            })
-            .expect("fresh slot arms");
-            engine.commit_ring.push(slot).map_err(|_| "ring full").unwrap();
-            pushed.push(k);
-        }
-
-        let mut pipe = engine.pipeline.lock();
-        pipe.group.clear();
-        pipe.held = None;
-        let view = engine.view.load();
-
-        let mut seen: Vec<Vec<u8>> = Vec::new();
-        loop {
-            engine.admit_from_ring(&mut pipe, &view, limit);
-            if pipe.group.is_empty() {
-                break;
-            }
-            let staged: usize = pipe.group.iter().map(|t| t.request.staged_len()).sum();
-            prop_assert!(pipe.group.len() == 1 || staged <= limit);
-            for ticket in pipe.group.drain(..) {
-                if let WriteRequest::Put { key, .. } = &ticket.request {
-                    seen.push(key.clone());
-                }
-            }
-        }
-
-        prop_assert!(engine.commit_ring.is_empty());
-        prop_assert!(pipe.held.is_none());
-        prop_assert_eq!(seen, pushed);
-    }
+        .commit_through_pipeline(durable_put(b"after", b"v"))
+        .expect("the pipeline goes on after a refusal");
+    assert_eq!(engine.last_decided_seq(), before_seq + 1);
+    assert!(engine.pipeline_is_idle());
 }

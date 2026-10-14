@@ -81,6 +81,14 @@ pub(super) struct BackupManifest {
     pub(super) last_seq: u64,
     /// The key the metadata is sealed under, `None` when it is plaintext.
     pub(super) sealed_under: Option<KeyId>,
+    /// The database it was taken from had its range deletes checked for
+    /// ones an earlier release left behind older keys they cover
+    /// (`engine::buried_range_deletes`), so the manifest a restore writes
+    /// says so. True for versions 3 and 4, which only this release line
+    /// writes, and every database it backs up was checked when it opened;
+    /// false for version 2, which 0.1.x wrote, so the restored database is
+    /// checked at its first open. Not stored: the version says it.
+    pub(super) range_deletes_checked: bool,
 }
 
 /// What every version shows without a key: when the backup was taken, and
@@ -279,6 +287,7 @@ pub(super) fn decode(
         next_file_id,
         last_seq,
         sealed_under: Some(key),
+        range_deletes_checked: true,
     })
 }
 
@@ -377,6 +386,7 @@ fn decode_plain(body: &[u8], version: u32) -> io::Result<BackupManifest> {
         next_file_id,
         last_seq,
         sealed_under: None,
+        range_deletes_checked: version >= VERSION_PLAIN,
     })
 }
 

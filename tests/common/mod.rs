@@ -14,7 +14,7 @@
 use std::fs;
 use std::path::Path;
 
-use regolith::{Db, Options};
+use regolith::{Db, Options, TransactionError, TxResult};
 use tempfile::TempDir;
 
 /// Options with a small write buffer (4 KiB) so memtable flushes
@@ -115,6 +115,18 @@ pub fn eventually(what: &str, mut reached: impl FnMut() -> bool) {
     }
 }
 
+/// Whether a commit landed: `true` when it committed, `false` when it lost
+/// to a conflict. Any other failure fails the test with the error, so a
+/// commit that failed for another reason is never read as a conflict.
+#[track_caller]
+pub fn committed<T>(outcome: &TxResult<T>) -> bool {
+    match outcome {
+        Ok(_) => true,
+        Err(TransactionError::Conflict(_)) => false,
+        Err(other) => panic!("a commit failed for a reason other than a conflict: {other}"),
+    }
+}
+
 /// Fault injection: subprocess crash harness, power-loss simulation,
 /// the valid-prefix validator, and byte-level mutators. See
 /// [`fault`] for the full contract, including why a `kill -9` is not a
@@ -132,6 +144,21 @@ pub mod parted;
 /// a listener that records the tails an open discards.
 pub mod wal_format;
 
+/// The database 0.1.9 left with an overlapping bottom level, and what it
+/// holds.
+pub mod overlap_fixture;
+
+/// The database 0.1.9 left with a range delete below older keys it covers,
+/// and what it holds.
+pub mod buried_fixture;
+
+/// The first open of a database an earlier release wrote, across a power
+/// cut at each of its I/O calls.
+pub mod open_sweep;
+
+/// Every warning a test thread logs, through one subscriber for the binary.
+pub mod log_capture;
+
 /// An `Env` that counts SSTable opens and reads, and can hold reads at the
 /// device: what the non-blocking read tests pin.
 pub mod device_env;
@@ -139,3 +166,8 @@ pub mod device_env;
 /// An `Env` that refuses chosen log removals and, while armed, table
 /// creations: what the flush retirement tests pin.
 pub mod faulty_env;
+
+/// An `Env` that records the threads a database starts and every write and
+/// sync of its log, and can hold a sync at the device: what the thread
+/// budget and the allocation tests pin.
+pub mod watched_env;

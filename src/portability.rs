@@ -63,7 +63,7 @@
 //! |---|---|---|
 //! | `xxhash-rust` | already `#![no_std]` | none |
 //! | `lru` | already `#![no_std]`, hashbrown-backed | none |
-//! | `rustix` | already `cfg(unix)`-gated | none |
+//! | `rustix` | already gated to Unix and WASI | none |
 //! | `tracing` | `no_std` via `default-features = false` | low |
 //! | `lz4_flex` | `no_std` covers the block format, which is all regolith uses | low: `default-features = false` |
 //! | `thiserror` 1.0 | no `no_std` support | medium: bump to 2.x |
@@ -72,7 +72,7 @@
 //!
 //! ## Locks, specifically
 //!
-//! Every blocking `Mutex` and `RwLock` left in the engine comes from
+//! Every blocking `Mutex` left in the engine comes from
 //! [`crate::sync::internal`], which is `std::sync` on a normal build and
 //! `loom::sync` under `--cfg loom`. That is one seam rather than sixty
 //! call sites, so the remaining work for tier B is to add a third arm
@@ -82,16 +82,19 @@
 //! latch and the directory registry hold no such lock: they are atomics and
 //! the lock-free [`crate::sync`] primitives.
 //!
-//! The `Condvar` half is more subtle than the `Mutex` half: on a
-//! single-threaded target there is no other thread to wake, so a
-//! blocking wait has to be replaced by the caller doing the work itself
-//! rather than by a different condvar. Two condvar waits exist today: the
-//! pessimistic transaction lock table's acquisition wait and the snapshot
-//! registry's wait for snapshots to drain. A commit follower parks on its
-//! slot and a stalled writer parks on a kovan signal, neither on a condvar.
-//! A thread that waits for the compaction gate, the flush exclusion or a
-//! close in flight parks itself until the [`crate::sync`] primitive wakes
-//! it; on `wasm32`, where the one thread could only be waiting for itself,
-//! that wait is an error instead (`sync::internal::wait_here`).
+//! Waiting is more subtle than locking: on a single-threaded target there
+//! is no other thread to wake, so a blocking wait has to be replaced by the
+//! caller doing the work itself. No condvar wait is left today. The
+//! rate limiter sleeps in slices until its bytes are due, a commit follower
+//! parks on its slot, a stalled writer parks on a kovan signal, a wait for
+//! snapshots to drain parks on a `regolith::sync::Notify` its releases
+//! wake, and a blocking wait for a key's lock parks until the lock table's
+//! release wakes it. A thread that waits for the compaction gate,
+//! the flush exclusion or a close in flight parks itself until the
+//! [`crate::sync`] primitive wakes it; on `wasm32`, where the one thread
+//! could only be waiting for itself, that wait is an error instead
+//! (`sync::internal::wait_here`).
 
-pub(crate) use portable_atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
+pub(crate) use portable_atomic::{
+    AtomicBool, AtomicPtr, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering,
+};

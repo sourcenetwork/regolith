@@ -103,8 +103,11 @@ pub(crate) struct TxnBuffer<K: 'static, V: 'static> {
     /// hold `&mut self`.
     removed: u64,
     /// An index over the list, built once it grows past `spill_at`.
-    /// Values are pointers into the list rather than copies of it.
-    spill: OnceLock<ConcurrentMap<K, NodeRef<K, V>>>,
+    /// Values are pointers into the list rather than copies of it. Boxed: a
+    /// map is a few hundred bytes of cache-padded fields, and a buffer that
+    /// never grows that far (most do not) would otherwise carry them, in
+    /// every transaction that is built, moved and dropped.
+    spill: OnceLock<Box<ConcurrentMap<K, NodeRef<K, V>>>>,
     /// Entries buffered before the index is built. `0` never indexes.
     spill_at: usize,
     /// Set once `spill` is published. An insert reads it after its push and
@@ -329,6 +332,15 @@ where
         self.newest(key).map(|node| node.value.clone())
     }
 
+    /// Whether anything is buffered for `key`, cloning nothing.
+    pub(crate) fn contains_key<Q>(&self, key: &Q) -> bool
+    where
+        K: core::borrow::Borrow<Q>,
+        Q: Hash + Eq + ?Sized,
+    {
+        self.newest(key).is_some()
+    }
+
     /// Build the index now if it does not exist yet, regardless of
     /// [`Self::spill_at`].
     ///
@@ -365,9 +377,9 @@ where
     /// Create the index and open it to inserts. `None` when another thread
     /// already did, and is seeding it.
     fn publish(&self) -> Option<&ConcurrentMap<K, NodeRef<K, V>>> {
-        self.spill.set(ConcurrentMap::new()).ok()?;
+        self.spill.set(Box::new(ConcurrentMap::new())).ok()?;
         self.spill_published.store(true, Ordering::SeqCst);
-        self.spill.get()
+        self.spill.get().map(|spill| &**spill)
     }
 
     /// Link every node already listed into `spill`, newest first, then let
@@ -481,6 +493,13 @@ where
     /// only when no reader can be walking the list, and a mutable borrow says
     /// so.
     pub(crate) fn truncate(&mut self, len: usize) {
+        self.truncate_into(len, drop);
+    }
+
+    /// [`Self::truncate`], handing each entry it takes off to `taken`, newest
+    /// first, instead of dropping it: what a rollback inside a transaction
+    /// callback keeps, so the callback failing can put it back.
+    pub(crate) fn truncate_into(&mut self, len: usize, mut taken: impl FnMut((K, V))) {
         let before = *self.len.get_mut();
         let mut remaining = before;
         let mut head = *self.head.get_mut();
@@ -498,6 +517,8 @@ where
             }
             head = node.next;
             remaining -= 1;
+            let Node { key, value, .. } = *node;
+            taken((key, value));
         }
         *self.head.get_mut() = head;
         *self.len.get_mut() = remaining;
@@ -514,27 +535,40 @@ where
     /// into a keyed structure anyway and gets it for free by keeping the
     /// first value it sees for a key.
     pub(crate) fn drain(&mut self) -> Vec<(K, V)> {
-        let mut drained = Vec::with_capacity(self.len.load(Ordering::Acquire));
-        let mut cursor = self.head.swap(core::ptr::null_mut(), Ordering::AcqRel);
-        while !cursor.is_null() {
-            // SAFETY: this thread took the list out of the buffer and has
-            // `&mut self`, so it is the only owner of these nodes.
-            let node = unsafe { Box::from_raw(cursor) };
-            cursor = node.next;
-            drained.push((node.key, node.value));
-        }
-        self.len.store(0, Ordering::Release);
-        self.removed += drained.len() as u64;
-        self.spill = OnceLock::new();
-        self.spill_published.store(false, Ordering::Release);
-        self.spill_seeded.store(false, Ordering::Release);
+        let mut drained = Vec::with_capacity(*self.len.get_mut());
+        self.drain_with(|key, value| drained.push((key, value)));
         drained
+    }
+
+    /// [`Self::drain`] handing each entry to `f`, newest first, instead of
+    /// collecting them: for a caller that only walks them once, so nothing
+    /// is allocated to hold them.
+    ///
+    /// Each node leaves the list before `f` sees it, so a panic in `f` leaves
+    /// the rest listed, and the buffer's `Drop` frees them.
+    pub(crate) fn drain_with(&mut self, mut f: impl FnMut(K, V)) {
+        // The index points into the list, so it goes first.
+        self.spill = OnceLock::new();
+        *self.spill_published.get_mut() = false;
+        *self.spill_seeded.get_mut() = false;
+        let taken = *self.len.get_mut();
+        *self.len.get_mut() = 0;
+        self.removed += taken as u64;
+        while !self.head.get_mut().is_null() {
+            // SAFETY: `&mut self` makes this thread the only one that can reach
+            // the list, and the head is a node `push` allocated by `Box::into_raw`.
+            let node = unsafe { Box::from_raw(*self.head.get_mut()) };
+            *self.head.get_mut() = node.next;
+            let Node { key, value, .. } = *node;
+            f(key, value);
+        }
     }
 }
 
 impl<K: 'static, V: 'static> Drop for TxnBuffer<K, V> {
     fn drop(&mut self) {
-        let mut cursor = self.head.swap(core::ptr::null_mut(), Ordering::AcqRel);
+        // `&mut self`: a plain read, not a locked exchange.
+        let mut cursor = core::mem::replace(self.head.get_mut(), core::ptr::null_mut());
         while !cursor.is_null() {
             // SAFETY: `&mut self` means no reader can be walking the
             // list, and each node was allocated by `Box::into_raw`.

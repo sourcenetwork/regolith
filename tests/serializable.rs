@@ -20,6 +20,8 @@ use std::thread;
 use regolith::{IsolationLevel, OptimisticTransactionDb, Options, TransactionError, TxnOptions};
 use tempfile::TempDir;
 
+mod common;
+
 /// Run the two-key write-skew schedule with both transactions
 /// interleaved, and report how many of the pairs committed together.
 ///
@@ -59,7 +61,7 @@ fn write_skew_pairs(isolation: IsolationLevel, rounds: usize) -> usize {
                 if seen.as_deref() == Some(b"0".as_ref()) {
                     tx.put(&mine, b"1").expect("write");
                 }
-                tx.commit().is_ok()
+                common::committed(&tx.commit())
             }));
         }
         let committed = handles

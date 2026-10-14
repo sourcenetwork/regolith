@@ -35,7 +35,9 @@ jobs:
   # the full one.
   chaos:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    # The recipe stops the run itself, as a failure, at ten minutes; the
+    # rest is the release build before it.
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable

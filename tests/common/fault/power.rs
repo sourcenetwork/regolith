@@ -282,9 +282,12 @@ fn resolve_cut(journal: &Journal, cut: CutPoint) -> u64 {
 fn replay(journal: &Journal, cut_seq: u64) -> (HashMap<PathBuf, FileState>, usize) {
     let mut files: HashMap<PathBuf, FileState> = HashMap::new();
     let mut replayed = 0usize;
-    // The source of the rename whose `RenameTo` record comes next (the shim
-    // emits the pair back to back), and whether this run had opened it.
-    let mut renaming: Option<(PathBuf, bool)> = None;
+    // The source of each thread's rename whose `RenameTo` record is still to
+    // come, and whether this run had opened it. The shim writes a rename's two
+    // records one after the other on the thread that renamed, but another
+    // thread's records can come between them (`A.from, B.from, A.to, B.to`),
+    // so a pair is matched by its thread id, never by what came last.
+    let mut renaming: HashMap<i64, (PathBuf, bool)> = HashMap::new();
 
     for r in journal.records.iter() {
         if r.path.as_os_str().is_empty() || !r.succeeded() {
@@ -369,7 +372,9 @@ fn replay(journal: &Journal, cut_seq: u64) -> (HashMap<PathBuf, FileState>, usiz
             OpKind::Unlink => {
                 files.remove(&r.path);
             }
-            OpKind::RenameFrom => renaming = Some((r.path.clone(), seen_before)),
+            OpKind::RenameFrom => {
+                renaming.insert(r.tid, (r.path.clone(), seen_before));
+            }
             // A rename carries the file's bytes, and what was synced of
             // them, to its new name, which names nothing else afterwards.
             // Left unmodelled, the new name kept the empty state the loop
@@ -379,7 +384,7 @@ fn replay(journal: &Journal, cut_seq: u64) -> (HashMap<PathBuf, FileState>, usiz
             // A file this run never opened is left as the loop found it:
             // the journal does not say how long it was.
             OpKind::RenameTo => {
-                if let Some((from, true)) = renaming.take()
+                if let Some((from, true)) = renaming.remove(&r.tid)
                     && let Some(mut moved) = files.remove(&from)
                 {
                     // The new name appears now: only a sync of its

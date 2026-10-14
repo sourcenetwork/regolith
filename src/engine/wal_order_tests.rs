@@ -13,7 +13,7 @@
 use std::path::{Path, PathBuf};
 
 use super::wal::wal_filename;
-use super::{Wal, list_wal_files};
+use super::{Wal, wal_scan};
 use crate::column_family::{DEFAULT_CF_ID, prefix_key};
 use crate::{Db, Options};
 
@@ -73,18 +73,32 @@ fn the_listing_orders_logs_by_number_across_the_six_digit_boundary() {
     std::fs::write(dir.path().join("wal_000003.tmp"), b"").unwrap();
 
     let env = Options::default().env;
-    let listed: Vec<String> = list_wal_files(&*env, dir.path())
-        .unwrap()
-        .iter()
-        .map(|path| path.file_name().unwrap().to_string_lossy().into_owned())
-        .collect();
+    let live = |min_wal_id: u64| -> Vec<String> {
+        wal_scan::live(&*env, dir.path(), min_wal_id)
+            .unwrap()
+            .iter()
+            .map(|path| path.file_name().unwrap().to_string_lossy().into_owned())
+            .collect()
+    };
+    // Before any reset every log is live, the ones with no id too.
     assert_eq!(
-        listed,
+        live(0),
         [
             "aa-no-id.wal",
             "zz-no-id.log",
             "wal_000007.log",
             "wal_123456.log",
+            "wal_999999.log",
+            "wal_1000000.log",
+            "wal_1000001.log",
+            "wal_10000000.log",
+        ]
+    );
+    // The minimum is compared as a number as well: a seven-digit log is
+    // above a six-digit minimum, and stays in its place.
+    assert_eq!(
+        live(LAST_SIX_DIGIT_ID),
+        [
             "wal_999999.log",
             "wal_1000000.log",
             "wal_1000001.log",

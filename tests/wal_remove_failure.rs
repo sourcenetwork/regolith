@@ -7,6 +7,7 @@
 //! flush or an ingest, would read back as its older value. The failure is
 //! reported, with a warn line and `regolith.wal.remove_failed`, and the log
 //! is removed again by the next flush or the next open.
+#![cfg(not(target_arch = "wasm32"))]
 
 mod common;
 

@@ -30,17 +30,17 @@
 //! peak-RSS counter is reset to the current RSS immediately before each
 //! workload (`/proc/self/clear_refs`), so the number is that workload's
 //! own peak rather than the whole binary's - but only when nothing else
-//! runs concurrently in the process. Run the ignored tests through
-//! `just test-extremes`, which pins `--test-threads=1`. When the counter
+//! runs concurrently in the process. Run the file through
+//! `just test-extremes`, which pins `--test-threads 1`. When the counter
 //! cannot be read or reset, the report says so instead of printing a
 //! number that would not mean what it claims.
 //!
 //! # Runtime
 //!
-//! The default `cargo test` run only holds the fast boundary and
-//! degenerate-input tests. Everything that writes six figures of
-//! operations, a 64 MiB value, or fills a filesystem is sized
-//! with its measured runtime stated at the test.
+//! Every test here is in the default run. Everything that writes six
+//! figures of operations, a 64 MiB value, or fills a filesystem states its
+//! measured runtime at the test.
+#![cfg(not(target_arch = "wasm32"))]
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -194,7 +194,7 @@ fn deepest_populated_level(db: &Db) -> Option<usize> {
 }
 
 // ---------------------------------------------------------------------
-// Degenerate inputs (fast, default run)
+// Degenerate inputs (fast)
 // ---------------------------------------------------------------------
 
 /// Proves a zero-length key and a zero-length value are ordinary data:
@@ -344,7 +344,7 @@ fn delete_range_covers_exactly_zero_one_and_all_keys() {
 }
 
 // ---------------------------------------------------------------------
-// Size limits (fast, default run)
+// Size limits (fast)
 // ---------------------------------------------------------------------
 
 /// Proves `max_value_size` is enforced at exactly the configured byte and
@@ -455,8 +455,8 @@ fn the_key_size_limit_is_exact_on_the_point_and_batch_paths() {
 /// Proves the documented defaults are the limits that actually ship:
 /// 64 MiB + 1 for a value and 8 MiB + 1 for a key are rejected by a
 /// database opened with `Options::default()`. This costs one allocation
-/// and no I/O, so it stays in the default run and guards the constants in
-/// `src/options.rs` against drifting away from the doc comment.
+/// and no I/O, and guards the constants in `src/options.rs` against
+/// drifting away from the doc comment.
 #[test]
 fn one_byte_over_the_default_limits_is_rejected() {
     let dir = TempDir::new().unwrap();
@@ -471,7 +471,7 @@ fn one_byte_over_the_default_limits_is_rejected() {
 }
 
 // ---------------------------------------------------------------------
-// Extremes (ignored by default; `just test-extremes`)
+// Extremes (`just test-extremes` runs them one at a time)
 // ---------------------------------------------------------------------
 
 /// Proves the default maxima are usable, not just declared: a value of

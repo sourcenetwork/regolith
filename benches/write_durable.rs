@@ -9,8 +9,8 @@
 
 mod common;
 
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Barrier};
 use std::time::{Duration, Instant};
 
 use regolith::{Options, WriteOptions};
@@ -52,12 +52,12 @@ struct Rep {
 fn run_rep(threads: usize, dur: Duration) -> Rep {
     let (tmp, db) = common::open("write-durable", opts());
     let db = Arc::new(db);
-    let barrier = Arc::new(Barrier::new(threads + 1));
+    let line = Arc::new(common::start::StartLine::new(threads));
     let written = Arc::new(AtomicU64::new(0));
     let mut handles = Vec::with_capacity(threads);
     for t in 0..threads {
         let db = Arc::clone(&db);
-        let barrier = Arc::clone(&barrier);
+        let line = Arc::clone(&line);
         let written = Arc::clone(&written);
         handles.push(std::thread::spawn(move || {
             let wo = WriteOptions {
@@ -71,8 +71,7 @@ fn run_rep(threads: usize, dur: Duration) -> Rep {
                 db.put_opt(&wo, &common::key(base + i), &value)
                     .expect("warmup put");
             }
-            barrier.wait();
-            let deadline = Instant::now() + dur;
+            let deadline = line.wait() + dur;
             let mut i = WARMUP_OPS;
             // An fsync dwarfs a clock read, so the deadline is checked per op.
             while Instant::now() < deadline {
@@ -83,15 +82,19 @@ fn run_rep(threads: usize, dur: Duration) -> Rep {
             written.fetch_add(i - WARMUP_OPS, Ordering::Relaxed);
         }));
     }
-    barrier.wait();
+    line.all_ready();
     let cpu0 = common::cpu_seconds();
-    let start = Instant::now();
+    let start = line.go();
     for h in handles {
         h.join().expect("writer thread panicked");
     }
     let elapsed = start.elapsed().as_secs_f64();
     let cpu_delta = common::cpu_seconds() - cpu0;
     let ops = written.load(Ordering::Relaxed) as f64;
+    assert!(
+        !common::rotated(&db),
+        "a memtable was sealed inside a timed repetition: raise write_buffer_size so every row times the write path alone"
+    );
     db.close().expect("close db");
     drop(db);
     drop(tmp);

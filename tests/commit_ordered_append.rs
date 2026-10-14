@@ -22,6 +22,8 @@ use regolith::prelude::*;
 use regolith::{DurabilityMode, Error, MemEnv, Snapshot, TransactionDb};
 use tempfile::TempDir;
 
+mod common;
+
 /// Entries at `journal/<20 decimal digits>`, head at `journal-head`.
 struct Journal {
     name: &'static str,
@@ -607,7 +609,7 @@ fn a_read_of_a_log_key_is_never_validated_at_defra_level() {
             let appender = db.begin(&TxnOptions::new());
             appender.append(&log, b"later", None).unwrap();
             appender.commit().unwrap();
-            let conflicted = matches!(reader.commit(), Err(TransactionError::Conflict(_)));
+            let conflicted = !common::committed(&reader.commit());
             let expected = level != IsolationLevel::DefraLevel && read.validated_at(level);
             assert_eq!(conflicted, expected, "{level:?} {read:?}");
         }

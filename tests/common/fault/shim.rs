@@ -38,6 +38,8 @@ pub const INTERPOSERS: &[&str] = &[
     "write",
     "pwrite64",
     "pwrite",
+    "pwritev64",
+    "pwritev",
     "writev",
     "fsync",
     "fdatasync",

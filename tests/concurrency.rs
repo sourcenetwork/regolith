@@ -2,10 +2,8 @@
 //! writes against a single `Db` handle.
 //!
 //! Scenarios ported from `db_test.cc` multi-threaded tests and
-//! from the black-box core of RocksDB's `db_stress`. Long-running
-//! soak variants run in the gate too, sized so that `cargo test`
-//! stays fast for PRs; CI runs them nightly via
-//! `cargo test -- --ignored`.
+//! from the black-box core of RocksDB's `db_stress`. The long-running
+//! soak runs in the gate too, sized so that `cargo test` stays fast.
 
 // Native-only. wasm-pack builds every test target for wasm32, and these use
 // threads, the filesystem or proptest, none of which exist there. The browser
@@ -278,7 +276,7 @@ fn reads_during_compaction_return_correct_values() {
     assert!(!err_flag.load(Ordering::Relaxed));
 }
 
-// ── long soak, gated behind --ignored ──────────────────────────
+// ── long soak ──────────────────────────────────────────────────
 
 #[test]
 fn writer_compactor_contention_soak() {

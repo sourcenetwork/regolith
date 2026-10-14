@@ -24,8 +24,11 @@ use regolith::{
     TxnOptions,
 };
 
-/// Adds nothing and touches every part: the default contract, which the commit
-/// pays for only when a key has newer operands.
+/// Appends its operands, and says an operand touches none of the parts a read
+/// names: a commit whose reads were projected asks `touches` of every newer
+/// operand of every key it read and commits. With the default contract (every
+/// part touched) the commit would be refused at the first key it checks, and
+/// a row of `n` reads would time one check.
 struct Concat;
 
 impl MergeOperator for Concat {
@@ -37,6 +40,10 @@ impl MergeOperator for Concat {
         let mut out = base.map(<[u8]>::to_vec).unwrap_or_default();
         operands.iter().for_each(|o| out.extend_from_slice(o));
         Some(out)
+    }
+
+    fn touches(&self, _: &[u8], _: &[u8], _: &[u32]) -> bool {
+        false
     }
 }
 
@@ -107,7 +114,9 @@ fn commit_us(
         let started = Instant::now();
         let outcome = txn.commit();
         samples.push(started.elapsed().as_secs_f64() * 1e6);
-        black_box(outcome.is_ok());
+        // Every row times a commit that lands: one refused would time a
+        // different path, stopped at the first key it checked.
+        outcome.unwrap_or_else(|e| panic!("{level:?}: commit {rep}: {e}"));
     }
     common::median(&mut samples)
 }
@@ -251,24 +260,38 @@ fn main() {
             ),
             "us",
         );
+        // The two rows below write between the reads and the commit, each to a
+        // database of its own, so the versions and operands they leave are not
+        // read by any other row.
+        //
         // Every key rewritten with the bytes it held: the value rule's path.
         let rewrite = |db: &regolith::Db, names: &[Vec<u8>]| {
             let value = [7u8; VALUE_LEN];
             names.iter().for_each(|k| db.put(k, &value).unwrap());
         };
+        let (_rewrite_tmp, rewrite_db) = open(&format!("read-rules-rewrite-{n}"), n);
         report(
             &format!("commit {n:>5} reads, every key rewritten identically"),
-            commit_us(&db, defra, n, commit_reps.min(20), get, rewrite, true),
+            commit_us(
+                &rewrite_db,
+                defra,
+                n,
+                commit_reps.min(20),
+                get,
+                rewrite,
+                true,
+            ),
             "us",
         );
         // Every key given an operand: the projected rule asks `touches`.
         let operand = |db: &regolith::Db, names: &[Vec<u8>]| {
             names.iter().for_each(|k| db.merge(k, b"+").unwrap());
         };
+        let (_operand_tmp, operand_db) = open(&format!("read-rules-operand-{n}"), n);
         report(
             &format!("commit {n:>5} get_parts reads, every key has an operand"),
             commit_us(
-                &db,
+                &operand_db,
                 defra,
                 n,
                 commit_reps.min(20),

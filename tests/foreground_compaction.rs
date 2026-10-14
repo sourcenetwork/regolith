@@ -408,3 +408,85 @@ fn full_lifecycle_with_zero_workers() {
     assert_eq!(db.get(b"key000006").unwrap(), None);
     assert_eq!(db.get(b"batched").unwrap().as_deref(), Some(&b"yes"[..]));
 }
+
+fn l0_tables(db: &Db) -> u64 {
+    db.get_int_property("regolith.num-files-at-level0").unwrap()
+}
+
+/// A slowdown delays no write. What a slowdown threshold still decides, for
+/// both of them (the count of level-0 tables and their bytes):
+///
+/// - a write that asked not to be slowed is refused with the reason;
+/// - with no worker and inline compaction on, a write pays one step of the
+///   compaction that is due, and with inline compaction off it does not.
+///
+/// A threshold that is off decides neither.
+#[test]
+fn a_slowdown_threshold_refuses_no_slowdown_writes_and_makes_a_write_pay_a_step() {
+    let dir = tempfile::tempdir().unwrap();
+    // Three level-0 tables, written with thresholds they never reach.
+    let quiet = || {
+        foreground_options()
+            .l0_compaction_trigger(1_000)
+            .level0_slowdown_writes_trigger(0)
+            .level0_stop_writes_trigger(0)
+            .soft_pending_compaction_bytes_limit(0)
+            .hard_pending_compaction_bytes_limit(0)
+    };
+    {
+        let db = Db::open(dir.path(), quiet()).unwrap();
+        for table in 0..3usize {
+            db.put(format!("key{table}").as_bytes(), &value(table))
+                .unwrap();
+            db.flush().unwrap();
+        }
+        assert_eq!(l0_tables(&db), 3);
+    }
+    let no_slowdown = WriteOptions {
+        no_slowdown: true,
+        ..WriteOptions::default()
+    };
+    let by_count = |options: Options| options.level0_slowdown_writes_trigger(3);
+    let by_bytes = |options: Options| options.soft_pending_compaction_bytes_limit(1);
+    let cases: [(&dyn Fn(Options) -> Options, &str); 2] = [
+        (&by_count, "slowdown: L0 files over trigger"),
+        (
+            &by_bytes,
+            "slowdown: pending compaction bytes over soft limit",
+        ),
+    ];
+
+    for (threshold, reason) in cases {
+        // Inline compaction off: nothing is compacted, a plain write goes
+        // on at once, and a write that refuses to be slowed is told why.
+        let db = Db::open(dir.path(), threshold(quiet()).inline_compaction(false)).unwrap();
+        db.put(b"plain", b"v").unwrap();
+        assert_eq!(l0_tables(&db), 3);
+        match db.put_opt(&no_slowdown, b"refused", b"v") {
+            Err(Error::Busy(told)) => assert_eq!(told, reason),
+            other => panic!("expected the slowdown's reason, got {other:?}"),
+        }
+        assert_eq!(db.get(b"refused").unwrap(), None);
+        drop(db);
+    }
+
+    // The threshold off, inline compaction on, a compaction due: a write
+    // owes nothing, so the tables stay.
+    let due = || quiet().l0_compaction_trigger(2).inline_compaction(true);
+    let db = Db::open(dir.path(), due()).unwrap();
+    db.put(b"plain", b"v").unwrap();
+    db.put_opt(&no_slowdown, b"not-refused", b"v").unwrap();
+    assert_eq!(l0_tables(&db), 3);
+    drop(db);
+
+    // The threshold on: the same write pays the step, which merges them.
+    let db = Db::open(dir.path(), by_count(due())).unwrap();
+    db.put(b"plain", b"w").unwrap();
+    assert_eq!(
+        l0_tables(&db),
+        0,
+        "the slowed write ran the pass that was due"
+    );
+    assert_eq!(db.get(b"key0").unwrap(), Some(value(0)));
+    assert_eq!(db.get(b"plain").unwrap(), Some(b"w".to_vec()));
+}

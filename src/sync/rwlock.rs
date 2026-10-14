@@ -58,9 +58,27 @@ impl<T> RwLock<T> {
         }
     }
 
+    loom_const_fn! {
+        /// An unlocked lock holding `value` whose contended acquires never
+        /// spin: they queue at once. For a lock its holders keep across long
+        /// waits of their own (a compaction pass, a job, I/O), where a spin
+        /// could only burn the caller's time.
+        pub(crate) fn new_without_spin(value: T) -> Self {
+            Self { raw: RawRwLock::without_spin(), value: core::cell::UnsafeCell::new(value) }
+        }
+    }
+
     /// Consumes the lock and returns its value.
     pub fn into_inner(self) -> T {
         self.value.into_inner()
+    }
+}
+
+#[cfg(all(test, not(loom)))]
+impl<T: ?Sized> RwLock<T> {
+    /// The rounds a contended acquire of this lock would spin now.
+    pub(crate) fn spin_rounds(&self) -> u32 {
+        self.raw.spin_rounds()
     }
 }
 
@@ -90,7 +108,9 @@ impl<T: ?Sized> RwLock<T> {
             .then(|| RwLockUpgradableReadGuard { lock: self })
     }
 
-    /// Waits to share the lock.
+    /// Waits to share the lock. Uncontended, the first poll is one atomic
+    /// read-modify-write. Contended, it is lock-free, not wait-free: see
+    /// [Progress](super#progress).
     pub fn read(&self) -> Read<'_, T> {
         Read {
             lock: self,
@@ -98,7 +118,9 @@ impl<T: ?Sized> RwLock<T> {
         }
     }
 
-    /// Waits to hold the lock alone.
+    /// Waits to hold the lock alone. Uncontended, the first poll is one atomic
+    /// read-modify-write. Contended, it is lock-free, not wait-free: see
+    /// [Progress](super#progress).
     pub fn write(&self) -> Write<'_, T> {
         Write {
             lock: self,
@@ -116,7 +138,8 @@ impl<T: ?Sized> RwLock<T> {
         }
     }
 
-    /// Waits for the upgradable read.
+    /// Waits for the upgradable read. It makes the progress
+    /// [`read`](Self::read) does.
     pub fn upgradable_read(&self) -> UpgradableRead<'_, T> {
         UpgradableRead {
             lock: self,
@@ -143,6 +166,11 @@ impl<T: ?Sized> fmt::Debug for RwLock<T> {
 }
 
 /// Shared access to a [`RwLock`]'s value; releases on drop.
+///
+/// The release is one atomic read-modify-write when no waiter needs telling.
+/// Otherwise it is lock-free, not wait-free: it returns after one pass over
+/// the queue, plus at most one for each operation of another thread that
+/// lands on the queue meanwhile (see [Progress](super#progress)).
 #[must_use = "dropping the guard releases the lock at once"]
 pub struct RwLockReadGuard<'a, T: ?Sized> {
     lock: &'a RwLock<T>,
@@ -170,7 +198,8 @@ impl<T: ?Sized + fmt::Debug> fmt::Debug for RwLockReadGuard<'_, T> {
     }
 }
 
-/// Exclusive access to a [`RwLock`]'s value; releases on drop.
+/// Exclusive access to a [`RwLock`]'s value; releases on drop. The release
+/// makes the progress [`RwLockReadGuard`]'s does.
 #[must_use = "dropping the guard releases the lock at once"]
 pub struct RwLockWriteGuard<'a, T: ?Sized> {
     lock: &'a RwLock<T>,
@@ -253,15 +282,31 @@ impl<T: ?Sized + fmt::Debug> fmt::Debug for OwnedRwLockWriteGuard<T> {
 }
 
 /// The upgradable read of a [`RwLock`]: shared access that can become
-/// exclusive without a writer getting in between. Releases on drop.
+/// exclusive without a writer getting in between. Releases on drop, with
+/// the progress [`RwLockReadGuard`]'s release makes.
+///
+/// It moves to another thread only when `T` is `Send` as well as `Sync`:
+/// an upgrade turns it into `&mut T`, so moving it can move the value. A
+/// value that may be shared but not moved, such as a
+/// [`std::sync::MutexGuard`], keeps the guard on its thread:
+///
+/// ```compile_fail,E0277
+/// use regolith::sync::RwLockUpgradableReadGuard;
+/// use std::sync::MutexGuard;
+///
+/// fn moves<T: Send>() {}
+/// moves::<RwLockUpgradableReadGuard<'static, Option<MutexGuard<'static, ()>>>>();
+/// ```
 #[must_use = "dropping the guard releases the lock at once"]
 pub struct RwLockUpgradableReadGuard<'a, T: ?Sized> {
     lock: &'a RwLock<T>,
 }
 
-// SAFETY: like a read guard, it hands out `&T` only.
-unsafe impl<T: ?Sized + Sync> Send for RwLockUpgradableReadGuard<'_, T> {}
-// SAFETY: as above.
+// SAFETY: moving it moves `&T` access and, through `upgrade` and
+// `try_upgrade`, `&mut T` access, as moving the `Upgrade` future does.
+unsafe impl<T: ?Sized + Send + Sync> Send for RwLockUpgradableReadGuard<'_, T> {}
+// SAFETY: `&RwLockUpgradableReadGuard` reaches `&T` only: both upgrades
+// take the guard by value.
 unsafe impl<T: ?Sized + Sync> Sync for RwLockUpgradableReadGuard<'_, T> {}
 
 impl<'a, T: ?Sized> RwLockUpgradableReadGuard<'a, T> {
@@ -501,6 +546,24 @@ mod tests {
     use crate::sync::test_support::{Polled, block_on};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicIsize, Ordering as StdOrdering};
+
+    /// A lock built without spin queues its contended readers and writers at
+    /// once: its budget is zero from the start and stays zero through a
+    /// contended write, its wake and its retry, where a spinning lock's
+    /// starts above zero.
+    #[test]
+    fn a_rwlock_built_without_spin_never_spins() {
+        assert!(RwLock::new(()).spin_rounds() > 0, "a plain lock spins");
+        let lock = RwLock::new_without_spin(0u8);
+        assert_eq!(lock.spin_rounds(), 0);
+        let read = lock.try_read().expect("free");
+        let mut writer = Polled::new(lock.write());
+        writer.pending();
+        drop(read);
+        assert_eq!(writer.wakes(), 1);
+        *writer.ready() += 1;
+        assert_eq!(lock.spin_rounds(), 0, "the lock never spins");
+    }
 
     const ITERATIONS: usize = if cfg!(miri) { 20 } else { 2_000 };
 
