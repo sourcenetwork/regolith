@@ -192,13 +192,26 @@ pub(super) struct WaitQueue {
 impl WaitQueue {
     loom_const_fn! {
         pub(super) fn new(state: usize) -> Self {
+            Self::with_spin(state, Budget::new())
+        }
+    }
+
+    loom_const_fn! {
+        /// A queue whose contended acquires never spin (see `spin::Budget::never`).
+        pub(super) fn without_spin(state: usize) -> Self {
+            Self::with_spin(state, Budget::never())
+        }
+    }
+
+    loom_const_fn! {
+        fn with_spin(state: usize, spin: Budget) -> Self {
             Self {
                 state: AtomicUsize::new(state),
                 arrivals: AtomicPtr::new(ptr::null_mut()),
                 cancels: AtomicUsize::new(0),
                 owed: AtomicUsize::new(0),
                 pool: Pool::new(),
-                spin: Budget::new(),
+                spin,
             }
         }
     }

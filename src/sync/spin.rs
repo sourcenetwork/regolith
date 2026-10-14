@@ -94,6 +94,10 @@ impl Gaps {
     }
 }
 
+/// The budget of a primitive that never spins: its holders keep it across
+/// long waits of their own, so a spin could only burn the caller's time.
+const NEVER: u8 = u8::MAX;
+
 /// A lock's spin budget: how many rounds its next spin makes.
 pub(super) struct Budget(AtomicU8);
 
@@ -104,13 +108,24 @@ impl Budget {
         }
     }
 
+    loom_const_fn! {
+        /// A budget that stays at zero rounds for good: no report of a won
+        /// or spent spin, and no won retry, ever raises it.
+        pub(super) fn never() -> Self {
+            Self(AtomicU8::new(NEVER))
+        }
+    }
+
     /// The rounds a spin starting now makes; zero means no spin.
     #[inline]
     pub(super) fn rounds(&self) -> u32 {
         if SPINLESS {
             return 0;
         }
-        u32::from(self.0.load(Ordering::Relaxed))
+        match self.0.load(Ordering::Relaxed) {
+            NEVER => 0,
+            rounds => u32::from(rounds),
+        }
     }
 
     /// A spin of `rounds` saw what it waited for: the next one may spin
@@ -131,6 +146,7 @@ impl Budget {
     fn store(&self, from: u32, next: u32) {
         if next != from
             && let Ok(next) = u8::try_from(next)
+            && self.0.load(Ordering::Relaxed) != NEVER
         {
             self.0.store(next, Ordering::Relaxed);
         }
@@ -159,6 +175,20 @@ mod tests {
         assert_eq!(budget.rounds(), 0);
         budget.won(0);
         assert_eq!(budget.rounds(), 1, "a won retry brings a spent budget back");
+    }
+
+    #[test]
+    fn a_budget_that_never_spins_stays_at_zero() {
+        let budget = Budget::never();
+        assert_eq!(budget.rounds(), 0);
+        budget.won(0);
+        budget.won(4);
+        budget.ran_out(4);
+        assert_eq!(
+            budget.rounds(),
+            0,
+            "no report raises a budget that never spins"
+        );
     }
 
     #[test]

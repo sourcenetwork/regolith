@@ -53,6 +53,20 @@ impl RawSemaphore {
         }
     }
 
+    loom_const_fn! {
+        /// A semaphore whose contended acquires never spin: for permits
+        /// their holders keep across long waits of their own (a once-cell's
+        /// initializer turn, a bounded channel's slots), where a spin could
+        /// only burn the caller's time.
+        pub(super) fn without_spin(permits: usize) -> Self {
+            assert!(permits <= MAX, "a semaphore holds at most Semaphore::MAX_PERMITS permits");
+            Self {
+                queue: WaitQueue::without_spin(permits << SHIFT),
+                waiting: UnsafeCell::new(List::new()),
+            }
+        }
+    }
+
     pub(super) fn available(&self) -> usize {
         self.queue.state.load(Ordering::Acquire) >> SHIFT
     }
