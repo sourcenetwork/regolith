@@ -313,6 +313,12 @@ impl OpfsEnv {
     /// In [`OpfsMode::Mirror`] this is the only thing that makes data
     /// durable: [`crate::Db::close`] is synchronous and cannot await, so
     /// call this on commit, on `visibilitychange`, and before unload.
+    ///
+    /// Mirror calls serialize before capturing their batch. Writes made while a
+    /// batch is awaiting browser I/O remain dirty for the next call. A failed
+    /// call keeps its work retryable, including failed file removals. Dropping
+    /// the caller's future does not cancel a batch already handed to the browser;
+    /// that batch finishes before the next one starts.
     pub async fn persist(&self) -> Result<(), OpfsError> {
         match &self.inner.backend {
             Backend::Sah(_) => Ok(()),

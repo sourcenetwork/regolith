@@ -18,6 +18,9 @@
 //! cargo invocation, which builds every test target in the package, and
 //! the rest of `tests/` is native-only.
 
+#[path = "wasm_opfs_main/persist.rs"]
+mod persist;
+
 use regolith::env::Env;
 use regolith::env::opfs::{OpfsEnv, OpfsError, OpfsMode, OpfsOptions};
 use regolith::{Db, Options};
