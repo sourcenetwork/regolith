@@ -246,6 +246,109 @@ git worktree remove ../regolith-foo             # Clean up
 
 Each worktree is isolated, no branch-switching overhead.
 
+## 9. House Rules
+
+The bare minimum for every change. A change that breaks one of them does not merge.
+
+### The boundary
+
+- regolith is a general-purpose engine. Every type, function, test and comment is named for the mechanism, never for a
+  downstream use; the only product-like identifier is `DefraLevel`. No downstream feature lives here (CRDT rules,
+  document lifecycles, head sets, arrival journals, indexes): regolith exposes traits and mechanisms, callers
+  implement and call them.
+- A DefraLevel behaviour is active only at `IsolationLevel::DefraLevel`. Engine fixes, `transact`, `Db::allocate` and
+  the commit receipt serve every level and change no level's semantics; a test pins each other level as unchanged.
+- Every method of a public trait is really called by the engine with the caller's own data. A method the engine never
+  calls is a gap to fix, never a limit to document. Each public trait carries a runnable generic rustdoc example, and
+  `testing` ships the property checks a caller runs against its own implementation.
+- Nothing valid is rejected. regolith fails loud only about a state it cannot know, with an actionable error.
+- No compatibility reasoning: break any API if it makes regolith faster or more correct, and never defer or shape work
+  for a release, a semver rule or a freeze. Releases are cut by the maintainers when they choose.
+
+### Threads, waiting and data locality
+
+- No call blocks its caller: it completes, or returns `Pending` or `WouldBlock` at once. Completions go to the asking
+  thread's own `IoQueue`; units (a block read, a group's sync) are single-flight and claimed with one CAS; a busy
+  thread is never woken.
+- No path takes a blocking OS lock or a condvar. What must exclude or wait uses `crate::sync`, which makes no system
+  call (kovan's queues may yield; kovan is used as it is). A contended acquire may spin within its bounded budget, then
+  suspends the task, never the thread.
+- No thread beyond the compaction worker, which stays on by default where the platform has threads. regolith never
+  requires a thread: without one, compaction runs inline and the caller's poll drives its own queue.
+- Lock-free by default, wait-free where the structure allows it (loads, `fetch_add` reservations, helping in the
+  commit pipeline).
+- Thread-per-core friendly: hot state is per thread or per core (statistics shards, snapshot-registry slots, I/O
+  queues), data stays local to the thread that owns it, and the read path loads the published view wait-free.
+- regolith stays as free of dependencies as it can: no new dependency for what the standard library, kovan or a few
+  lines of code already do. A map shared between threads is kovan's `HopscotchMap`.
+- Every resource (bytes, blocks, file descriptors, threads, in-flight I/O) is charged to the engine's own accounting
+  before it exists and released through the same seam.
+
+### Performance
+
+- 100% correct and fast; performance is the key. Reads are zero-copy; every source walk goes through the one shared
+  newest-first walk; no allocation, syscall or lock on an uncontended fast path; a mechanism nobody uses costs nothing.
+- A performance problem is researched before it is coded: what each tree does (file and line), a short profile,
+  upstream sources and papers, then two to four designs with expected numbers and the rules they touch.
+- A change that can move a number is measured interleaved against main on fixed CPUs, nothing else building, with
+  medians, minimum, maximum, every sample and the perf counters that explain it, and gated on the scales that broke
+  before (64 writers on 16 CPUs, 1 writer, Immediate durability). Keep the fastest variant that passes every check.
+
+### Proofs
+
+- Every mechanism has a written contract (what regolith guarantees, what the caller must uphold) and a TLA+ model
+  written before its code: the spec is the contract. Anything temporal or concurrent is modelled in TLA+; data
+  structures and laws that hold for every size are proved in Lean. New concurrency on production types gets a loom
+  model with a calibration that fails without the guard.
+- Each TLA+ model has GREEN configurations and, for every guard and every caller contract, a RED configuration that
+  breaks it and fails on its named invariant.
+- A correspondence table maps every model action, variable and invariant to the Rust function and line that implements
+  it; gaps are closed or explained. Transactional changes also run the real-code semantic checks: Elle, the
+  serial-history properties, the validation-set oracle, the MVCC invariants and the power-loss suites.
+- Bounded: one TLC configuration under 20 seconds of CPU on one worker, the whole `just tla` under 10 minutes; one loom
+  model under 60 seconds, a loom recipe under 5 minutes, `just loom-all` under 10. A slow model is shrunk (its `.cfg`
+  or comment says what it still covers), never given a longer limit or more shards. Never bound loom with
+  `LOOM_MAX_DURATION`, which passes silently when time runs out.
+- Lean: no `sorry`, `admit` or new `axiom`; the axiom audit allows only Lean's three standard axioms.
+- Proofs read ELI5, line by line, for someone who knows nothing about proofs or model checkers:
+  - each file opens with a plain-words story: the real thing it models, a tiny concrete example, what must never happen;
+  - every line of TLA+ and Lean carries a plain-words comment; each variable names the Rust it mirrors; each action
+    says when it happens in the program; each Lean tactic step says what it does to the goal;
+  - each RED configuration says which bug it plants and how that bug breaks the promise;
+  - each theorem and invariant opens with a one-sentence plain statement of what it promises.
+
+  Proof files are the exception to the comments policy (section 6).
+
+### Tests
+
+- A failing test first for every defect, kept as its regression test.
+- No test passes when the logic is wrong: break each mechanism once on purpose and see its named test fail.
+- Every durability change gets power-loss tests under the fault shim, run with CI's compiler and on a real disk as well
+  as tmpfs (where a sync finishes at once and timing bugs hide).
+- No fixed sleep in a polling loop: a deadline with bounded backoff.
+- Code that renames, removes or reopens files is correct on Windows, where an open file cannot be renamed or removed.
+
+### Checks: build the way CI builds
+
+- `RUSTFLAGS=-D warnings` on every build and test command, with CI's newest stable compiler as well as the default.
+- fmt; clippy with `-D warnings`, also for `x86_64-pc-windows-msvc` and `aarch64-apple-darwin`; docs with
+  `-D warnings`; the whole nextest profile; the fault-shim suites; doc tests; the MSRV check; the wasm and embedded
+  jobs as their workflows run them; `cargo deny`; miri on the unsafe modules touched; `just tla`, `just lean` and
+  `just loom-all` for what changed.
+- Nothing runs forever: every long command runs under a timeout, and a check that hits its limit has failed.
+- Heavy commands run at low priority on a bounded CPU range, one heavy stream at a time, leaving cores free for the
+  person using the machine. Stop only your own processes, by pid.
+
+### Code shape and git
+
+- Trait bounds go in a `where` clause, on functions, impls, types and traits alike, never inline in the generic
+  parameter list (`fn f<T>(t: T) where T: Trait`, not `fn f<T: Trait>(t: T)`).
+- Callback shapes are named traits or `type` aliases, with lifetimes that have meaningful names.
+- Every public item has rustdoc stating its contract: guarantees, preconditions, and what misuse breaks.
+- One logical change per commit, a one-line conventional subject through `git commit -m`, no body, no AI attribution,
+  never a change to git config, never a force push.
+- No em-dash or en-dash characters anywhere.
+
 ## Build Dependencies
 
 - **Rust** 1.90+ (edition 2024) for the library build (see `rust-version` in `Cargo.toml`); CI runs tests and tools on stable Rust.
