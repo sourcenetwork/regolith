@@ -1574,6 +1574,9 @@ fn perform_compaction_to(
     // Shared with each output's writer, which counts what they hide of it.
     let carried = Arc::new(retirement.carried_tombstones(&merged_range_tombstones));
 
+    // Compaction inputs are obsolete after publication; caching their full
+    // scan evicts foreground reads and retains buffers until the merge ends.
+    let scan_cache = BlockCache::with_config(0, 0, true);
     let CompactionOutputs {
         edits: new_file_edits,
         infos: output_file_infos,
@@ -1581,7 +1584,7 @@ fn perform_compaction_to(
     } = stream_compaction_outputs(
         versions,
         sst_dir,
-        cache,
+        &scan_cache,
         opts,
         target_level,
         &input_files,
@@ -2387,6 +2390,8 @@ fn delete_old_files<'a>(
     }
 }
 
+#[cfg(test)]
+mod cache_tests;
 #[cfg(test)]
 mod fifo_order_tests;
 #[cfg(test)]
