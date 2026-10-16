@@ -51,6 +51,12 @@
 //! No async runtime is involved: the executors are the functions below.
 
 mod common;
+#[path = "common/json.rs"]
+mod json;
+#[path = "common/records.rs"]
+mod records;
+#[path = "common/run_meta.rs"]
+mod run_meta;
 
 use std::future::Future;
 use std::hint::black_box;
@@ -476,6 +482,9 @@ fn main() {
         fairness(Duration::from_secs_f64(seconds));
         return;
     }
+    let started = std::time::SystemTime::now();
     benches();
     Criterion::default().configure_from_args().final_summary();
+    let data = records::criterion_since("clean", Some(started), "sync_");
+    common::write_family("sync", &json::to_string_pretty(&data).replace('\n', ""));
 }

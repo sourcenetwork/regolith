@@ -132,6 +132,13 @@ for (const [family, heading] of Object.entries(SECTION)) {
     failures.push(`${family} was collected (trust=${m.trust ?? "per-entry"}) but "${heading}" is not on the page`);
   }
 }
+for (const [family, data] of Object.entries(newest.metrics?.timings || {})) {
+  if (data.trust === "absent" || !data.rows?.length) continue;
+  const heading = family.replaceAll("_", " ");
+  if (!out.includes(`<h3>${heading}<span`) && !out.includes(`<h3>${heading}</h3>`)) {
+    failures.push(`${family} timing rows were collected but have no card`);
+  }
+}
 if (!out.includes("Trend across every recorded run")) {
   failures.push("the trend section is missing");
 }

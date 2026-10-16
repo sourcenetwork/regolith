@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Render a schema v1 run file into one HTML page built for reading.
+"""Render a schema v1 or v2 run file into one HTML page built for reading.
 
 The page exists to answer one question first - did anything regress -
 and to make the answer hard to misread. So the verdict is the largest
@@ -15,11 +15,13 @@ a year from now still renders with no network.
 import argparse
 import html
 import json
+import math
 import pathlib
 import sys
 
 sys.path.insert(0, str(pathlib.Path(__file__).parent))
 from compare import compare  # noqa: E402
+from timings import FAMILIES, families, throughput_rows  # noqa: E402
 
 GREEN = "#06b250"
 MUTED = "#4a504a"
@@ -31,7 +33,7 @@ def esc(s):
 
 def fmt_num(n):
     """Compact first, decimals only when they are the whole story."""
-    if n is None:
+    if not isinstance(n, (int, float)) or isinstance(n, bool) or not math.isfinite(n):
         return "n/a"
     a = abs(n)
     if a >= 1_000_000:
@@ -217,7 +219,7 @@ def area_chart(series, width=520, height=240, x_label="threads"):
     return "".join(o) + f'<div class="legend">{legend}</div>'
 
 
-def spark_bars(rows, **_):
+def spark_bars(rows, higher_is_better=False, **_):
     """`(label, before, after, unit)` as HTML bars.
 
     Deliberately not SVG. An SVG scaled to its container scales its text
@@ -233,7 +235,8 @@ def spark_bars(rows, **_):
         delta = ""
         if before:
             pct = (after - before) / before * 100
-            cls = "d-improved" if pct <= 0 else "d-regressed"
+            improved = pct >= 0 if higher_is_better else pct <= 0
+            cls = "d-improved" if improved else "d-regressed"
             delta = f'<span class="{cls}">{pct:+.0f}%</span>'
         bw = f"{(before or 0) / top * 100:.1f}%"
         aw = f"{after / top * 100:.1f}%"
@@ -261,9 +264,8 @@ VERDICT_COPY = {
                   "At least one metric moved beyond the noise threshold with "
                   "non-overlapping measurement ranges."),
     "unverified": ("UNVERIFIED",
-                   "Nothing could be compared. Either the baseline or this run "
-                   "recorded its measurements on a busy host, so a delta would "
-                   "say more about the machine than the code."),
+                   "At least one metric could not be verified. Check the missing "
+                   "measurements, workload settings and host trust before drawing a conclusion."),
 }
 
 
@@ -323,9 +325,11 @@ def detail_sections(cur, base):
     bt = (base or {}).get("metrics", {}).get("throughput", {})
     cards = []
     for name, w in ct.get("workloads", {}).items():
-        pts = [(p["threads"], p["ops"]) for p in w.get("points", [])]
-        bpts = [(p["threads"], p["ops"])
-                for p in bt.get("workloads", {}).get(name, {}).get("points", [])]
+        pts = [(p["threads"], p["median"]) for p in throughput_rows(w)
+               if isinstance(p["median"], (int, float)) and math.isfinite(p["median"])]
+        bpts = [(p["threads"], p["median"]) for p in
+                throughput_rows(bt.get("workloads", {}).get(name, {}))
+                if isinstance(p["median"], (int, float)) and math.isfinite(p["median"])]
         head = ""
         if pts:
             one = dict(pts).get(1)
@@ -381,7 +385,7 @@ def detail_sections(cur, base):
                 prev = bmap.get((c.get("flavor"), c.get("isolation")), {})
                 rows.append((label, prev.get(metric), c.get(metric), "ops/s"))
             cards.append(f'<div class="card"><h3>{title}{pill(ci.get("trust"))}</h3>'
-                         f'<p class="note">{esc(note)}</p>{spark_bars(rows)}</div>')
+                          f'<p class="note">{esc(note)}</p>{spark_bars(rows, higher_is_better=True)}</div>')
         rows = [(f'{c.get("flavor","?")} / {c.get("isolation","?")}',
                  bmap.get((c.get("flavor"), c.get("isolation")), {}).get("conflict_rate_pct"),
                  c.get("conflict_rate_pct"), "%") for c in cells]
@@ -405,6 +409,31 @@ def detail_sections(cur, base):
     return "".join(out)
 
 
+def timing_sections(cur, base):
+    current, baseline = families(cur), families(base or {})
+    cards = []
+    for name in sorted(set(FAMILIES) | set(current) | set(baseline)):
+        family = current.get(name, {})
+        old = {row["key"]: row for row in baseline.get(name, {}).get("rows", [])}
+        rows = []
+        for row in family.get("rows", []):
+            before = old.get(row["key"], {})
+            bounds = row.get("invalid_reason") or (f'{fmt_num(row["min"])} to {fmt_num(row["max"])}'
+                      if row.get("min") is not None and row.get("max") is not None
+                      else "not recorded")
+            rows.append(f'<tr><td>{esc(row["name"])}</td>'
+                        f'<td class="num">{fmt_num(before.get("median"))}</td>'
+                        f'<td class="num">{fmt_num(row.get("median"))}</td>'
+                        f'<td>{esc(row["unit"])}</td><td>{esc(bounds)}</td></tr>')
+        body = ('<table><thead><tr><th>Workload</th><th>Baseline</th><th>This run</th>'
+                '<th>Unit</th><th>Observed range</th></tr></thead>'
+                f'<tbody>{"".join(rows)}</tbody></table>' if rows else
+                '<div class="empty">not collected in this run</div>')
+        cards.append(f'<div class="card"><h3>{esc(name.replace("_", " "))}'
+                     f'{pill(family.get("trust", "absent"))}</h3>{body}</div>')
+    return '<h2>Transaction and mechanism timings</h2><div class="grid">' + "".join(cards) + '</div>'
+
+
 def downsample(pts, target=200):
     """Thin a curve for drawing, keeping the peak.
 
@@ -424,6 +453,9 @@ def downsample(pts, target=200):
 
 
 def render(cur, base, out_path, threshold=3.0):
+    for doc in [cur] + ([base] if base else []):
+        if doc.get("schema_version") not in (1, 2):
+            raise ValueError(f"unsupported schema_version {doc.get('schema_version')!r}")
     rep = compare(base, cur, threshold) if base else None
     retr = cur.get("retractions") or []
     retr_html = ""
@@ -443,9 +475,10 @@ def render(cur, base, out_path, threshold=3.0):
 {hero(cur, base, rep)}
 {deltas_table(rep)}
 {detail_sections(cur, base)}
+{timing_sections(cur, base)}
 {retr_html}
 <footer>
-Rendered from a schema v1 run file by <code>tools/perf-report/render_html.py</code>.
+Rendered from a schema v{cur.get("schema_version")} run file by <code>tools/perf-report/render_html.py</code>.
 A metric that could not be compared is listed as unverified rather than dropped, and a
 family measured on a busy host carries that on its heading. A delta counts as real only
 when it clears the {threshold:g}% threshold <em>and</em> the two runs' measured ranges do
@@ -468,7 +501,7 @@ def main():
 
     cur = json.loads(pathlib.Path(args.current).read_text())
     base = json.loads(pathlib.Path(args.baseline).read_text()) if args.baseline else None
-    if cur.get("schema_version") != 1:
+    if cur.get("schema_version") not in (1, 2):
         sys.exit(f"unsupported schema_version {cur.get('schema_version')!r}")
     page, rep = render(cur, base, args.out, args.threshold)
     print(f"wrote {args.out} ({len(page)/1024:.1f} KiB)"

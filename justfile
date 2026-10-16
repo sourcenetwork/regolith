@@ -4,7 +4,10 @@ default:
     @just --list
 
 # Everything CI enforces on every push, in the order it fails fastest.
-gate: fmt lint doc test test-testing deny
+gate: fmt perf-tools lint doc test test-testing deny
+
+perf-tools:
+    python3 -m unittest discover -s tools/perf-report -p 'test_*.py' -v
 
 fmt:
     cargo fmt --all -- --check
@@ -187,14 +190,16 @@ loadguard:
 
 # ---------- benchmarks ----------
 
-# Capture the reference baseline. Run ONCE, before any stack code lands.
+# Capture Criterion's named baseline. Custom harnesses emit family records;
+# compare their collected run files with tools/perf-report/compare.py.
 
 bench-baseline: loadguard
     cargo bench --bench point_read --bench write_durable --bench write_buffered \
-                --bench scan --bench batch --bench transaction \
+                --bench scan --bench batch --bench transaction --bench scan_commit \
+                --bench append --bench read_rules --bench txn_callbacks --bench sync \
                 --bench large_value -- --save-baseline pre
 
-# Compare against the `pre` baseline. This is what a PR pastes into its body.
+# Compare Criterion against `pre`; custom harnesses need paired run files.
 
 bench: loadguard
     cargo bench -- --baseline pre
@@ -203,7 +208,8 @@ bench: loadguard
 # JSON Lines file `collect` assembles a run file out of.
 bench-collect: loadguard
     cargo bench --bench point_read --bench write_durable --bench write_buffered \
-                --bench scan --bench batch --bench transaction \
+                --bench scan --bench batch --bench transaction --bench scan_commit \
+                --bench append --bench read_rules --bench txn_callbacks --bench sync \
                 --bench large_value --bench memory --bench size
 
 bench-one name: loadguard

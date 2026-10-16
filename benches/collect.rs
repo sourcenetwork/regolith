@@ -1,4 +1,4 @@
-//! Assemble one schema v1 run file from every metric family the benches wrote.
+//! Assemble one schema v2 run file from every metric family the benches wrote.
 //!
 //! Usage:
 //!   cargo bench --bench collect -- --out <run.json> --commit <sha> --label <label>
@@ -20,6 +20,8 @@ mod json;
 mod records;
 #[path = "common/run_meta.rs"]
 mod run_meta;
+#[path = "common/timings.rs"]
+mod timings;
 
 use std::path::PathBuf;
 
@@ -78,15 +80,28 @@ fn main() {
         "contaminated"
     };
 
+    let correctness = deterministic(&mut bag, CORRECTNESS, "% of committed updates surviving");
+    let mut timed = Json::Obj(Vec::new());
+    for name in timings::FAMILIES {
+        let source = if *name == "transaction" {
+            correctness.get("matrix").map(|_| correctness.clone())
+        } else {
+            bag.take_one(&[name])
+        };
+        let family =
+            timings::normalize(name, source, throughput_trust).unwrap_or_else(|error| die(&error));
+        timed.set(name, family);
+    }
     let metrics = Json::obj(vec![
         ("throughput", throughput(&mut bag, throughput_trust)),
         ("rss", rss(&mut bag)),
         ("binary_size", deterministic(&mut bag, BINARY_SIZE, "KiB")),
+        ("correctness", correctness),
         (
-            "correctness",
-            deterministic(&mut bag, CORRECTNESS, "% of committed updates surviving"),
+            "isolation",
+            measured(&mut bag, ISOLATION, "commits/s", throughput_trust),
         ),
-        ("isolation", deterministic(&mut bag, ISOLATION, "commits/s")),
+        ("timings", timed),
         ("allocs", deterministic(&mut bag, ALLOCS, "allocations/op")),
         ("scan_stream", deterministic(&mut bag, SCAN_STREAM, "B")),
         ("viability", deterministic(&mut bag, VIABILITY, "")),
@@ -112,7 +127,7 @@ fn main() {
     ]);
 
     let doc = Json::obj(vec![
-        ("schema_version", Json::Num(1.0)),
+        ("schema_version", Json::Num(2.0)),
         ("run", run),
         ("metrics", metrics),
         ("plan_targets", run_meta::plan_targets()),
@@ -129,7 +144,7 @@ struct Args {
     label: String,
 }
 
-const USAGE: &str = "collect: assemble one schema v1 run file from every bench family.
+const USAGE: &str = "collect: assemble one schema v2 run file from every bench family.
 
   cargo bench --bench collect -- --out <run.json> --commit <sha> --label <label>
 
@@ -210,6 +225,12 @@ fn accepted_names() -> Vec<&'static str> {
     ] {
         v.extend(group.iter().copied());
     }
+    v.extend(
+        timings::FAMILIES
+            .iter()
+            .copied()
+            .filter(|name| *name != "transaction"),
+    );
     v
 }
 
@@ -225,6 +246,7 @@ fn throughput(bag: &mut Bag, trust: &str) -> Json {
                 if let Some(r) = data.remove("reps").and_then(|v| v.as_f64()) {
                     reps.push(r);
                 }
+                let trust = timings::runner_trust(&data, trust);
                 apply_trust(&mut data, trust, slot);
                 workloads.set(slot, data);
                 measured += 1;
@@ -332,11 +354,20 @@ fn rss(bag: &mut Bag) -> Json {
 /// A family whose result a busy host cannot change: binary size, correctness,
 /// viability. Trust is clean when it was collected and absent when it was not.
 fn deterministic(bag: &mut Bag, aliases: &[&str], unit: &str) -> Json {
+    measured(bag, aliases, unit, "clean")
+}
+
+fn measured(bag: &mut Bag, aliases: &[&str], unit: &str, trust: &str) -> Json {
     let name = aliases[0];
     match bag.take_one(aliases) {
         Some(mut data) => {
             require_obj(&data, name);
-            apply_trust(&mut data, "clean", name);
+            let trust = if aliases == ISOLATION {
+                timings::runner_trust(&data, trust)
+            } else {
+                trust
+            };
+            apply_trust(&mut data, trust, name);
             data
         }
         None => {
