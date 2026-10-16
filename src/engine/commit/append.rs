@@ -100,14 +100,17 @@ impl AppendOrder {
     /// nothing: every position and once key it took is given back, so a later
     /// member numbers as if it had never been there. `ops` may then hold puts
     /// of appends numbered before the error, and the caller drops the member.
-    pub(crate) fn number(
+    pub(crate) fn number<A>(
         &mut self,
         engine: &RegolithEngine,
         view: &ReadView,
-        appends: Vec<PendingAppend>,
+        appends: A,
         ops: &mut Vec<WriteBatchOp>,
-    ) -> io::Result<()> {
-        let numbered = self.number_appends(engine, view, appends, ops);
+    ) -> io::Result<()>
+    where
+        A: AsRef<[PendingAppend]>,
+    {
+        let numbered = self.number_appends(engine, view, appends.as_ref(), ops);
         if numbered.is_ok() {
             for head in &mut self.logs {
                 if head.position != head.settled {
@@ -134,7 +137,7 @@ impl AppendOrder {
         &mut self,
         engine: &RegolithEngine,
         view: &ReadView,
-        appends: Vec<PendingAppend>,
+        appends: &[PendingAppend],
         ops: &mut Vec<WriteBatchOp>,
     ) -> io::Result<()> {
         for PendingAppend {
@@ -143,13 +146,15 @@ impl AppendOrder {
             once_key,
         } in appends
         {
-            let once_key = once_key.map(|key| prefix_key(DEFAULT_CF_ID, &key));
+            let once_key = once_key
+                .as_deref()
+                .map(|key| prefix_key(DEFAULT_CF_ID, key));
             if let Some(once) = &once_key
                 && self.holds_position(engine, view, once)?
             {
                 continue;
             }
-            let at = self.head_of(engine, view, &*log)?;
+            let at = self.head_of(engine, view, &**log)?;
             let position = self.logs[at].position.checked_add(1).ok_or_else(|| {
                 io::Error::new(
                     io::ErrorKind::InvalidInput,
@@ -172,7 +177,7 @@ impl AppendOrder {
             }
             ops.push(WriteBatchOp::Put {
                 key: prefix_key(DEFAULT_CF_ID, &self.key),
-                value: entry,
+                value: entry.clone(),
             });
             if let Some(once) = once_key {
                 self.taken.insert(once.clone());

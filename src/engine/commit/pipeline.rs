@@ -185,15 +185,15 @@ pub(super) enum Progress {
     Waits(Arc<Job>),
 }
 
-/// The operations slot `desc` lands, decided as `decision`: the batch
-/// deciding it produced when there is one, else the request's own.
+/// The operations slot `desc` lands, decided as `decision`: a request's own,
+/// followed by the puts deciding it added (a transaction's numbered appends);
+/// a counter reservation's batch; nothing for a unit.
 pub(super) fn ops_of<'a>(desc: &'a Descriptor, decision: &'a Decision) -> Ops<'a> {
-    if let Some(batch) = &decision.batch {
-        return Ops::Batch(batch);
-    }
-    match &desc.work {
-        Work::Request(request) => request.ops(),
-        Work::Allocate { .. } | Work::Unit { .. } => Ops::None,
+    match (&desc.work, &decision.batch) {
+        (Work::Request(WriteRequest::Txn(txn)), Some(added)) => Ops::Joined(&txn.ops, added),
+        (Work::Request(request), _) => request.ops(),
+        (Work::Allocate { .. } | Work::Unit { .. }, Some(batch)) => Ops::Batch(batch),
+        (Work::Allocate { .. } | Work::Unit { .. }, None) => Ops::None,
     }
 }
 
@@ -681,9 +681,12 @@ impl RegolithEngine {
             if txn.appends.is_empty() {
                 return Ok((fate, None));
             }
-            let mut ops = txn.ops.clone();
-            AppendOrder::default().number(self, &view, txn.appends.clone(), &mut ops)?;
-            Ok((fate, Some(ops)))
+            // Only the puts the appends add are built here: the slot lands
+            // the request's own operations followed by them (`ops_of`), so
+            // neither the operations nor the appends are copied.
+            let mut added = Vec::new();
+            AppendOrder::default().number(self, &view, &txn.appends, &mut added)?;
+            Ok((fate, Some(added)))
         };
         let decided = if txn.perf == PerfLevel::Disable {
             run()
