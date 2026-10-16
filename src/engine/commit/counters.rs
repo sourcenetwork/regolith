@@ -92,7 +92,7 @@ impl Counters {
             match ops {
                 Ops::None => false,
                 Ops::Put { key: put, .. } => *put == key,
-                Ops::Batch(batch) => batch.iter().any(|op| writes(op, key)),
+                Ops::Batch(_) | Ops::Joined(..) => ops.batch().any(|op| writes(op, key)),
             }
         };
         if !self.entries().iter().any(|(key, _)| written(key)) {

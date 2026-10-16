@@ -243,8 +243,9 @@ pub(crate) struct Decision {
     pub(super) place: Option<Place>,
     /// Whether the slot is published only once its record is durable.
     pub(super) immediate: bool,
-    /// The operations the slot lands as when they are not the request's own:
-    /// a transaction whose appends were numbered, a counter reservation.
+    /// Operations deciding the slot produced: for a transaction whose appends
+    /// were numbered, the puts that write them, landed after the request's
+    /// own operations; for a counter reservation, its whole batch.
     pub(super) batch: Option<Vec<WriteBatchOp>>,
     /// What deciding the slot counted, for its own thread's perf context.
     /// Boxed: only a thread that counts sets it, and every decision is

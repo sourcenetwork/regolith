@@ -442,7 +442,7 @@
 \*     and not applied, the check applies it first, as any helper of the
 \*     pipeline does, so the decided frontier counts it.
 \*       write_free_points, apply_decided                 write_free.rs:174-197, 203-216
-\*       (the pipeline's own apply: settle, src/engine/commit/pipeline.rs:721;
+\*       (the pipeline's own apply: settle, src/engine/commit/pipeline.rs:724;
 \*        the decided frontier: last_decided_seq, src/engine/mod.rs:1269)
 \*     A read, or a validated scan, made at or after the decided frontier has
 \*     nothing over it and is not looked up.               write_free.rs:121-126
@@ -478,7 +478,7 @@
 \*       the key's lock held when pessimistic, and marked to be checked.
 \*       Transaction::read_for_update, read_horizon        src/transaction.rs:1510-1526, 2387-2397
 \*   A commit that writes, decided and then published.     CommitWriting(t), Publish(t)
-\*       the pipeline: decide and apply, then publish       src/engine/commit/pipeline.rs:721, 911
+\*       the pipeline: decide and apply, then publish       src/engine/commit/pipeline.rs:724, 911
 \*   A failure that latches the database.                 Latch(l), latched
 \*       RegolithEngine::latch, is_latched                  src/engine/mod.rs:1223, 1229
 \*   A commit that writes, on a latched database.          CommitWriting(t), the `latched` branch

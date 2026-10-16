@@ -93,15 +93,32 @@ pub(super) enum Ops<'a> {
         value: &'a [u8],
     },
     Batch(&'a [WriteBatchOp]),
+    /// A transaction's own operations followed by the puts deciding it
+    /// added: its numbered appends. They land, are logged and take
+    /// sequences as the two runs end to end would, without being copied
+    /// into one.
+    Joined(&'a [WriteBatchOp], &'a [WriteBatchOp]),
 }
 
-impl Ops<'_> {
+impl<'a> Ops<'a> {
+    /// The operations of a batch or a joined pair, in landing order; none for
+    /// a single put or nothing.
+    pub(super) fn batch(&self) -> impl Iterator<Item = &'a WriteBatchOp> + use<'a> {
+        let (first, second): (&'a [WriteBatchOp], &'a [WriteBatchOp]) = match *self {
+            Ops::None | Ops::Put { .. } => (&[], &[]),
+            Ops::Batch(ops) => (ops, &[]),
+            Ops::Joined(own, added) => (own, added),
+        };
+        first.iter().chain(second)
+    }
+
     /// How many sequence numbers the operations consume: one each.
     pub(super) fn count(&self) -> u64 {
         match self {
             Ops::None => 0,
             Ops::Put { .. } => 1,
             Ops::Batch(ops) => ops.len() as u64,
+            Ops::Joined(own, added) => (own.len() + added.len()) as u64,
         }
     }
 
@@ -111,6 +128,8 @@ impl Ops<'_> {
             Ops::None => 0,
             Ops::Put { key, value } => put_record_len(key, value),
             Ops::Batch(ops) => ops_record_len(ops),
+            // A record's length is the sum of its operations' lengths.
+            Ops::Joined(own, added) => ops_record_len(own).saturating_add(ops_record_len(added)),
         }
     }
 
@@ -128,8 +147,8 @@ impl Ops<'_> {
         match self {
             Ops::None => 0,
             Ops::Put { key, value } => MemTable::max_entry_size(key.len(), value.len()),
-            Ops::Batch(ops) => ops
-                .iter()
+            Ops::Batch(_) | Ops::Joined(..) => self
+                .batch()
                 .map(batch_op_memtable_cost)
                 .fold(0usize, usize::saturating_add),
         }
@@ -143,7 +162,7 @@ impl Ops<'_> {
         match self {
             Ops::None => 0,
             Ops::Put { key, value } => (key.len() + value.len() + 8) as u64,
-            Ops::Batch(ops) => ops.iter().map(batch_op_wal_bytes).sum(),
+            Ops::Batch(_) | Ops::Joined(..) => self.batch().map(batch_op_wal_bytes).sum(),
         }
     }
 
@@ -162,11 +181,11 @@ impl Ops<'_> {
                 puts = 1;
                 bytes = user(key) + value.len() as u64;
             }
-            Ops::Batch(ops) => {
-                if ops.is_empty() {
+            Ops::Batch(_) | Ops::Joined(..) => {
+                if self.count() == 0 {
                     return;
                 }
-                for op in *ops {
+                for op in self.batch() {
                     match op {
                         WriteBatchOp::Put { key, value } => {
                             puts += 1;
@@ -203,6 +222,12 @@ impl Ops<'_> {
             Ops::None => {}
             Ops::Put { key, value } => encode_put_record(out, key, value, base_seq),
             Ops::Batch(ops) => encode_ops_record(out, ops, base_seq),
+            // Each operation is encoded with its own sequence and nothing
+            // frames the run, so two runs end to end are one record's bytes.
+            Ops::Joined(own, added) => {
+                encode_ops_record(out, own, base_seq);
+                encode_ops_record(out, added, base_seq + own.len() as u64);
+            }
         }
     }
 
@@ -217,8 +242,8 @@ impl Ops<'_> {
         match self {
             Ops::None => {}
             Ops::Put { key, value } => memtable.put_hinted(&mut hint, key, value, base_seq),
-            Ops::Batch(ops) => {
-                for (op, seq) in ops.iter().zip(base_seq..) {
+            Ops::Batch(_) | Ops::Joined(..) => {
+                for (op, seq) in self.batch().zip(base_seq..) {
                     apply_batch_op_to_memtable(memtable, &mut hint, op, seq);
                 }
             }
@@ -429,6 +454,41 @@ mod tests {
                 ops.iter().for_each(|op| len.op(op));
                 prop_assert_eq!(len.framed(), staged_len);
             }
+        }
+    }
+
+    proptest! {
+        /// A transaction's own operations joined to the puts its appends
+        /// added land, log, count and cost exactly as the one batch of both
+        /// end to end does, which is what the slot used to copy them into.
+        #[test]
+        fn joined_runs_behave_as_their_concatenation(
+            own in proptest::collection::vec(batch_op_strategy(), 0..12),
+            added in proptest::collection::vec(batch_op_strategy(), 0..6),
+            base in 1u64..1_000,
+        ) {
+            let whole: Vec<WriteBatchOp> = own.iter().chain(&added).cloned().collect();
+            let (joined, batch) = (Ops::Joined(&own, &added), Ops::Batch(&whole));
+            prop_assert_eq!(joined.count(), batch.count());
+            prop_assert_eq!(joined.payload_len(), batch.payload_len());
+            prop_assert_eq!(joined.memtable_cost(), batch.memtable_cost());
+            prop_assert_eq!(joined.reported_bytes(), batch.reported_bytes());
+            let (mut a, mut b) = (Vec::new(), Vec::new());
+            joined.encode(&mut a, base);
+            batch.encode(&mut b, base);
+            prop_assert_eq!(a, b);
+            let config = MemTableConfig::default();
+            let (one, two) = (MemTable::new(&config).unwrap(), MemTable::new(&config).unwrap());
+            joined.apply(&one, base);
+            batch.apply(&two, base);
+            prop_assert_eq!(one.iter_internal(), two.iter_internal());
+            prop_assert_eq!(
+                one.clone_range_tombstones().len(),
+                two.clone_range_tombstones().len()
+            );
+            let joined_ops: Vec<&WriteBatchOp> = joined.batch().collect();
+            let batch_ops: Vec<&WriteBatchOp> = batch.batch().collect();
+            prop_assert_eq!(format!("{joined_ops:?}"), format!("{batch_ops:?}"));
         }
     }
 

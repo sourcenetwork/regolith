@@ -268,11 +268,11 @@
 \* from its turn sleeps until its turn nears; T1 to T3 are turn_wait.rs's.
 \*
 \*   filled[i]: order i's record is encoded and will not change again. The
-\*       FILLED flag, set by Descriptor::fill (commit/descriptor.rs:592), read by
-\*       Descriptor::record (commit/descriptor.rs:610).
+\*       FILLED flag, set by Descriptor::fill (commit/descriptor.rs:593), read by
+\*       Descriptor::record (commit/descriptor.rs:611).
 \*   filling[i], encoding[a]: somebody claimed the encoding of order i's
 \*       record, and which record thread a has in hand. The FILLING flag
-\*       (commit/descriptor.rs:356), claimed by the fetch_or at the top of
+\*       (commit/descriptor.rs:357), claimed by the fetch_or at the top of
 \*       Descriptor::fill; the encoding is the closure that call runs.
 \*   writer: who holds the write unit. The CLAIMED bit of WriteUnit.word,
 \*       taken by try_claim (commit/write_unit.rs:219) and let go by release
@@ -287,7 +287,7 @@
 \*       try_batch (commit/write_unit.rs:967).
 \*   asleep, sleepOn[a]: a thread parked on a record. The thread on the
 \*       descriptor's list with PARKED set: Descriptor::register
-\*       (commit/descriptor.rs:657), then park (commit/descriptor.rs:640).
+\*       (commit/descriptor.rs:658), then park (commit/descriptor.rs:641).
 \*   looking[a], saw[a]: a thread about to park, and the claim it saw when it
 \*       found the unit taken (the `seen` of bring_written,
 \*       (commit/write_unit.rs:853 return Tried::Claimed(word)>)). claimNo counts
@@ -307,10 +307,10 @@
 \*       Turns.near_to and Turns.woken_to (commit/turn_wait.rs:54,
 \*       commit/turn_wait.rs:56).
 \*   nearMark[i]: order i was told its turn is near. The NEAR flag
-\*       (commit/descriptor.rs:364), set by wake_near's mark
-\*       (commit/pipeline.rs:803).
+\*       (commit/descriptor.rs:365), set by wake_near's mark
+\*       (commit/pipeline.rs:806).
 \*   owes[a]: thread a's commit is done and it still has to tell. drive's call
-\*       of wake_near once publish_upto says Published (commit/pipeline.rs:1064).
+\*       of wake_near once publish_upto says Published (commit/pipeline.rs:1067).
 \*   Lead: how far past the next order a thread's own must be before it parks
 \*       far from its turn. Turns::lead (commit/turn_wait.rs:73): LEAD
 \*       (commit/turn_wait.rs:41), and one more for every LEAD_PER_SLEEPER
@@ -321,16 +321,16 @@
 \*
 \*   EncodeStart(a, i), EncodeEnd(a): claim the encoding of a record nobody is
 \*       encoding, encode it, set FILLED and wake the parked. RegolithEngine::fill
-\*       (commit/write_unit.rs:581), called by drive (commit/pipeline.rs:1040) for
+\*       (commit/write_unit.rs:581), called by drive (commit/pipeline.rs:1043) for
 \*       the owner's own record, by the allocations (commit/allocate.rs:91), and
 \*       by bring_written for a record a thread needs that nobody is encoding
 \*       (commit/write_unit.rs:628); Descriptor::fill and its mark
-\*       (commit/descriptor.rs:565).
+\*       (commit/descriptor.rs:566).
 \*   DirectStart(a): the fast path (WU8). An owner whose record nobody has in
 \*       hand finds the unit free with no note on it, encodes its record and goes
 \*       to write it by itself; StealStart then counts it in and looks again.
 \*       RegolithEngine::write_alone (commit/write_unit.rs:775), called by drive
-\*       and drive_nowait before the unit's way (commit/pipeline.rs:1020):
+\*       and drive_nowait before the unit's way (commit/pipeline.rs:1023):
 \*       WriteUnit::quiet (commit/write_unit.rs:213), one load; then fill and
 \*       copy_record. The unit does not see such writes, so several owners may
 \*       take the fast path at once, each writing its own record.
@@ -359,20 +359,20 @@
 \*       the note put back on a free unit.
 \*   PubHorizon(a), PubFrontier(a) with PublishesRun(a, p): the holder
 \*       publishes what its run made publishable before it wakes the run's owners
-\*       (WU7). publish_ready (commit/pipeline.rs:934), called after the let go
+\*       (WU7). publish_ready (commit/pipeline.rs:937), called after the let go
 \*       (commit/write_unit.rs:981); each order through publishable_slot and
-\*       publish_slot (commit/pipeline.rs:911), as every publisher does.
+\*       publish_slot (commit/pipeline.rs:914), as every publisher does.
 \*   ParkLook(a), ParkSleep(a): find the record in another's hands, then park
 \*       on it. bring_written's try_batch returns the claim it saw; park_on
 \*       (commit/write_unit.rs:736) then registers on the record
-\*       (Descriptor::register (commit/descriptor.rs:657)) and looks again, its
+\*       (Descriptor::register (commit/descriptor.rs:658)) and looks again, its
 \*       note on the claim it saw part of the look; a refused note means the claim
 \*       is gone, and the thread looks afresh. Mutant NoteTrustsALoad is the code
 \*       as it was: a note trusted off a plain load.
 \*   CopyOwn(a): a commit that waits for a sync finds its own record in
 \*       another's hands and copies it instead of sleeping on it. drive's
 \*       bring_written with Await::Copy for an Immediate slot
-\*       (commit/pipeline.rs:1054), the same path the round's holder takes.
+\*       (commit/pipeline.rs:1057), the same path the round's holder takes.
 \*   Timeout(a): the park's time runs out. park_timeout in Descriptor::park,
 \*       and out_of_patience (commit/write_unit.rs:708) saying yes.
 \*   StealStart(a): the copy after the patience. copy_record, through
@@ -380,13 +380,13 @@
 \*   WriteStart(a, i): the round's holder copies. sync_written calls
 \*       bring_written with Await::Copy (commit/round.rs:243).
 \*   Need(a): the record a thread needs next. drive's bring_written of its own
-\*       record (commit/pipeline.rs:1059), then publish_upto's of the next to
-\*       publish (commit/pipeline.rs:895).
+\*       record (commit/pipeline.rs:1062), then publish_upto's of the next to
+\*       publish (commit/pipeline.rs:898).
 \*   Usable, RunFrom, Firsts: which records a run takes. The `usable` test of
 \*       the scan and Run::take's same log, same epoch, offset that follows on.
 \*   Pass, Void, DecideNow, UnitRun with Named(i): a frontier pass names the
 \*       orders whose turn is now near. RegolithEngine::pass_decided
-\*       (commit/pipeline.rs:783): Ring::pass_decided (commit/ring.rs:246), then
+\*       (commit/pipeline.rs:786): Ring::pass_decided (commit/ring.rs:246), then
 \*       Turns::name (commit/turn_wait.rs:79); the void path and the ordered units
 \*       pass through the same function.
 \*   RbFinish with Named and its wakes: a rollback's jump names the orders
@@ -396,16 +396,16 @@
 \*   TurnPark(a): a blocking thread far from its turn, finding the next order
 \*       being decided by another (its DECIDING claim taken), parks on its own
 \*       order. help_decide (commit/pipeline.rs:422), then park_far
-\*       (commit/pipeline.rs:813): Turns::count_in (commit/turn_wait.rs:111),
+\*       (commit/pipeline.rs:816): Turns::count_in (commit/turn_wait.rs:111),
 \*       Descriptor::park with Turns::near (commit/turn_wait.rs:125) as its look.
 \*   TurnWake(a): the sleeper wakes: NEAR set, or TURN_PATIENCE passed; then
 \*       Turns::count_out and help_decide looks again.
 \*   WakeNear(a): a finished commit tells the named orders. wake_near
-\*       (commit/pipeline.rs:795): Turns::claim_told (commit/turn_wait.rs:92),
+\*       (commit/pipeline.rs:798): Turns::claim_told (commit/turn_wait.rs:92),
 \*       then mark(NEAR) on each order in the ring.
 \*   PubFrontier waking a told owner from turnAsleep: a blocking slot's
 \*       landing wakes whoever parked on it. Descriptor::land
-\*       (commit/descriptor.rs:482), called by publish_slot and by the rollback.
+\*       (commit/descriptor.rs:483), called by publish_slot and by the rollback.
 \*
 \*   OneClaim (WU1): try_claim's compare-and-swap; loom
 \*       one_thread_at_a_time_holds_the_unit (commit/loom_write_unit.rs).
