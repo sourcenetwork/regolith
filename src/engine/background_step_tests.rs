@@ -505,3 +505,26 @@ fn a_job_that_finds_a_flush_in_flight_is_woken_when_it_ends() {
     assert_eq!(count(), 1);
     assert!(engine.flusher.hold_or_park(&waker).is_some());
 }
+
+/// A write that owes a step on a database no queue was ever opened on runs
+/// the step inline without making the queue table, and so do a rotation's
+/// unit and the close's: the table would be built for nothing and freed
+/// again with the database, on every open and close of a database used
+/// without queues.
+#[test]
+fn a_database_used_without_queues_makes_no_queue_table() {
+    let dir = TempDir::new().expect("tempdir");
+    let engine = RegolithEngine::open(dir.path(), tiny(0)).expect("open");
+    assert_ne!(engine.owed.load(std::sync::atomic::Ordering::Acquire), 0);
+    put(&engine, b"key", b"value").expect("put");
+    assert_eq!(
+        engine.owed.load(std::sync::atomic::Ordering::Acquire),
+        0,
+        "the step ran"
+    );
+    assert!(engine.cache.opened_io().is_none());
+    write_until_sealed(&engine, "fill");
+    assert!(engine.cache.opened_io().is_none());
+    engine.close().expect("close");
+    assert!(engine.cache.opened_io().is_none());
+}

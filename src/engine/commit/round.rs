@@ -88,7 +88,7 @@ pub(super) struct HeldRound<'a> {
 
 impl Drop for HeldRound<'_> {
     fn drop(&mut self) {
-        self.engine.io().run_job(&self.round.job);
+        self.engine.run_job(&self.round.job);
     }
 }
 
@@ -254,7 +254,7 @@ impl RegolithEngine {
                 return true;
             }
             let _perf = PerfTimer::new(PerfTimerField::WriteWal);
-            let start = self.statistics().and_then(|_| self.env.now_micros());
+            let start = self.timer_start();
             match log.sync_through(through) {
                 Ok(()) => {
                     if let Some(s) = self.statistics() {

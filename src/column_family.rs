@@ -302,8 +302,14 @@ impl CfRegistry {
     /// Replace the registry's contents with what the meta CF holds. Called
     /// once by `Db::open`, before any handle exists.
     pub(crate) fn load(&self, entries: impl IntoIterator<Item = (String, u32)>, next_id: u32) {
-        self.by_id.clear();
-        self.by_name.clear();
+        // A clear swaps in a new table and retires the old one, which an
+        // open, loading into the registry it just made, need not pay.
+        if !self.by_id.is_empty() {
+            self.by_id.clear();
+        }
+        if !self.by_name.is_empty() {
+            self.by_name.clear();
+        }
         for (name, id) in entries {
             let _ = self.insert(id, name);
         }

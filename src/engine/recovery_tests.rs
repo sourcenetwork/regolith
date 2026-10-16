@@ -290,3 +290,33 @@ fn a_dropped_tail_is_truncated_durably_before_the_next_log_exists() {
         );
     }
 }
+
+/// A read-write open lists the log directory once to find the logs it
+/// replays and to remove the staging files a crash left, and once more to
+/// retire the logs it replayed. Removing the staging files took a listing
+/// of its own before.
+#[test]
+fn a_writable_open_lists_the_log_directory_twice() {
+    let dir = tempfile::tempdir().unwrap();
+    let wal_dir = dir.path().join("wal");
+    let recording = Arc::new(RecordingEnv::default());
+    let options = crate::Options::default()
+        .env(recording.clone())
+        .max_background_compactions(0);
+    let db = crate::Db::open(dir.path(), options.clone()).unwrap();
+    db.put(b"key", b"value").unwrap();
+    drop(db);
+    let staged = wal_dir.join("wal_000099.tmp");
+    std::fs::write(&staged, b"a stamp a crash left").unwrap();
+    recording.events.lock().unwrap().listed.clear();
+
+    let db = crate::Db::open(dir.path(), options).unwrap();
+    assert!(!staged.exists(), "the open removes a staging file");
+    let listed = recording.events.lock().unwrap().listed.clone();
+    assert_eq!(
+        listed.iter().filter(|path| **path == wal_dir).count(),
+        2,
+        "{listed:?}"
+    );
+    assert_eq!(db.get(b"key").unwrap().as_deref(), Some(&b"value"[..]));
+}

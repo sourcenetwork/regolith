@@ -431,7 +431,9 @@ impl Flusher {
         if let Some(s) = self.options.statistics.as_deref() {
             s.add(crate::statistics::Ticker::FlushCount, 1);
             s.add(crate::statistics::Ticker::FlushBytesWritten, file_size);
-            if let Some(micros) = crate::env::elapsed_micros(&*self.env, flush_start) {
+            if s.timed()
+                && let Some(micros) = crate::env::elapsed_micros(&*self.env, flush_start)
+            {
                 s.record(crate::statistics::Histogram::FlushTime, micros);
             }
         }

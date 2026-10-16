@@ -6,7 +6,7 @@ use std::io;
 use std::ops::ControlFlow;
 use std::sync::Arc;
 
-use super::super::MergeChain;
+use super::super::merge_chain::VersionSink;
 use super::super::source_walk::{Above, Skip};
 use super::{
     Block, BlockCache, DbSlice, LookupKey, SsTableReader, VALUE_TYPE_MERGE, decode_internal_key,
@@ -41,13 +41,13 @@ impl SsTableReader {
         lk: &LookupKey,
         key_buf: &mut Vec<u8>,
         cache: &BlockCache,
-        out: &mut MergeChain,
+        out: &mut impl VersionSink,
     ) -> io::Result<bool> {
         let terminated = self.scan_key(lk, key_buf, cache, |block, seq, vt, offset, len| {
             let Some(value) = DbSlice::from_block(Arc::clone(block), offset, len) else {
                 return ControlFlow::Break(Err(invalid_data("block value extends past block")));
             };
-            out.push((seq, vt, value));
+            out.push_version((seq, vt, value));
             if vt != VALUE_TYPE_MERGE {
                 ControlFlow::Break(Ok(()))
             } else {

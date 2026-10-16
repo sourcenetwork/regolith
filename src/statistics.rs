@@ -27,7 +27,9 @@
 //! open time. The hot-path overhead is a single branch. Reaching
 //! for a non-`None` statistics object adds one relaxed `fetch_add` per
 //! ticker update and a few atomic operations per histogram sample, all
-//! on the calling thread's own shard.
+//! on the calling thread's own shard. A [`StatsLevel`] below
+//! [`StatsLevel::All`] drops the latency timers and the two clock reads
+//! each takes, or every histogram, and keeps the tickers.
 //!
 //! # Per-thread shards (plan 4.6, D54)
 //!
@@ -420,19 +422,31 @@ impl Default for HistogramData {
 }
 
 impl HistogramData {
+    /// Each read-modify-write after the count is skipped when it cannot
+    /// change its field: adding zero, or a sample the loaded minimum and
+    /// maximum already cover. Between resets the minimum only falls and the
+    /// maximum only rises, so a bound that covers the sample when loaded
+    /// covers it for good. A scope shorter than a microsecond records zero,
+    /// so the common sample costs one atomic add, not four.
     fn record(&self, value: u64) {
         self.count.fetch_add(1, Ordering::Relaxed);
-        let mut sum = self.sum.load(Ordering::Relaxed);
-        while let Err(current) = self.sum.compare_exchange_weak(
-            sum,
-            sum.saturating_add(value),
-            Ordering::Relaxed,
-            Ordering::Relaxed,
-        ) {
-            sum = current;
+        if value != 0 {
+            let mut sum = self.sum.load(Ordering::Relaxed);
+            while let Err(current) = self.sum.compare_exchange_weak(
+                sum,
+                sum.saturating_add(value),
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                sum = current;
+            }
         }
-        self.min.fetch_min(value, Ordering::Relaxed);
-        self.max.fetch_max(value, Ordering::Relaxed);
+        if value < self.min.load(Ordering::Relaxed) {
+            self.min.fetch_min(value, Ordering::Relaxed);
+        }
+        if value > self.max.load(Ordering::Relaxed) {
+            self.max.fetch_max(value, Ordering::Relaxed);
+        }
     }
 
     /// Folds this shard's state into `acc`: counts and sums add, the
@@ -505,6 +519,28 @@ impl Shard {
 pub struct Statistics {
     /// One per thread number; the length is a power of two.
     shards: Box<[CachePadded<Shard>]>,
+    level: StatsLevel,
+}
+
+/// What a [`Statistics`] measures, from least to most.
+///
+/// A timer reads the clock twice per instrumented call (each iterator step,
+/// each `get`, each log write) and records a latency sample; a histogram
+/// sample is a few atomic updates on each read and commit. A caller that
+/// reads only what a lower level keeps pays for nothing above it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[non_exhaustive]
+pub enum StatsLevel {
+    /// Every ticker; no histogram is recorded and no call reads the clock
+    /// for one.
+    ExceptHistogramOrTimers,
+    /// Every ticker and the size histograms ([`Histogram::BytesPerRead`],
+    /// [`Histogram::BytesPerWrite`]); no latency histogram is recorded and
+    /// no call reads the clock for one.
+    ExceptTimers,
+    /// Every ticker and every histogram, latencies included.
+    #[default]
+    All,
 }
 
 impl std::fmt::Debug for Statistics {
@@ -523,16 +559,48 @@ impl Statistics {
     /// Construct a fresh `Statistics` with every ticker and
     /// histogram at zero, with one shard per thread number.
     pub fn new() -> Self {
-        Self::with_shards(crate::per_thread::width())
+        Self::with_level(StatsLevel::All)
+    }
+
+    /// [`Statistics::new`] measuring only what `level` names.
+    ///
+    /// ```
+    /// use std::sync::Arc;
+    ///
+    /// use regolith::{Db, Histogram, Options, Statistics, StatsLevel, Ticker};
+    ///
+    /// let stats = Arc::new(Statistics::with_level(StatsLevel::ExceptTimers));
+    /// let db = Db::open("counted", Options::memory().statistics(Some(Arc::clone(&stats))))?;
+    /// db.put(b"k", b"v")?;
+    /// db.get(b"k")?;
+    /// assert_eq!(stats.get_ticker(Ticker::KeysRead), 1);
+    /// assert_eq!(stats.get_histogram_snapshot(Histogram::DbGet).count, 0);
+    /// # Ok::<(), regolith::Error>(())
+    /// ```
+    pub fn with_level(level: StatsLevel) -> Self {
+        Self::with_shards(crate::per_thread::width(), level)
+    }
+
+    /// What this measures.
+    pub fn level(&self) -> StatsLevel {
+        self.level
+    }
+
+    /// Whether latency histograms are recorded, and so whether a timed call
+    /// reads the clock at all.
+    #[inline]
+    pub(crate) fn timed(&self) -> bool {
+        self.level >= StatsLevel::All
     }
 
     /// A `Statistics` with `shards` copies (rounded up to a power of two).
-    fn with_shards(shards: usize) -> Self {
+    fn with_shards(shards: usize, level: StatsLevel) -> Self {
         let shards = shards.max(1).next_power_of_two();
         Self {
             shards: (0..shards)
                 .map(|_| CachePadded::new(Shard::new()))
                 .collect(),
+            level,
         }
     }
 
@@ -620,10 +688,13 @@ impl Statistics {
         self.shard().tickers[ticker as usize].fetch_add(amount, Ordering::Relaxed);
     }
 
-    /// Record a single sample into `hist`, in the calling thread's shard.
+    /// Record a single sample into `hist`, in the calling thread's shard,
+    /// unless this level records no histogram.
     #[inline]
     pub(crate) fn record(&self, hist: Histogram, value: u64) {
-        self.shard().histograms[hist as usize].record(value);
+        if self.level > StatsLevel::ExceptHistogramOrTimers {
+            self.shard().histograms[hist as usize].record(value);
+        }
     }
 
     /// [`Self::add`] into shard `shard` (taken modulo the shard count).
@@ -636,8 +707,8 @@ impl Statistics {
 
 /// Convenience RAII helper: creates a timer on construction and
 /// records the elapsed wall-clock microseconds into `hist` on
-/// `Drop`. If the statistics handle is `None` the helper is
-/// optimized out - both construction and drop are no-ops.
+/// `Drop`. With no statistics handle, or one at
+/// [`StatsLevel::ExceptTimers`], neither reads the clock.
 pub(crate) struct TimeScope<'a> {
     /// Start reading in microseconds. `None` when no statistics
     /// handle is installed, and also `None` on a platform with no
@@ -650,6 +721,7 @@ pub(crate) struct TimeScope<'a> {
 
 impl<'a> TimeScope<'a> {
     pub(crate) fn new(stats: Option<&'a Statistics>, hist: Histogram) -> Self {
+        let stats = stats.filter(|stats| stats.timed());
         Self {
             start: stats.and_then(|_| crate::env::platform_micros()),
             stats,
@@ -660,9 +732,11 @@ impl<'a> TimeScope<'a> {
 
 impl Drop for TimeScope<'_> {
     fn drop(&mut self) {
-        if let (Some(start), Some(stats), Some(now)) =
-            (self.start, self.stats, crate::env::platform_micros())
-        {
+        // The clock is read only for a scope that took a start reading.
+        let (Some(start), Some(stats)) = (self.start, self.stats) else {
+            return;
+        };
+        if let Some(now) = crate::env::platform_micros() {
             stats.record(self.hist, now.saturating_sub(start));
         }
     }
@@ -702,7 +776,7 @@ mod tests {
     #[test]
     fn ticker_totals_are_exact_once_writers_are_quiescent() {
         const ADDS: u64 = 50_000;
-        let stats = std::sync::Arc::new(Statistics::with_shards(4));
+        let stats = std::sync::Arc::new(Statistics::with_shards(4, StatsLevel::All));
         let start = std::sync::Arc::new(std::sync::Barrier::new(16));
         let threads: Vec<_> = (0..16u64)
             .map(|t| {
@@ -733,7 +807,7 @@ mod tests {
 
     #[test]
     fn a_read_sums_every_shard() {
-        let stats = Statistics::with_shards(8);
+        let stats = Statistics::with_shards(8, StatsLevel::All);
         for shard in 0..8 {
             stats.add_to(shard, Ticker::WalSyncCount, 1 << shard);
         }
@@ -751,7 +825,7 @@ mod tests {
     #[cfg(not(target_arch = "wasm32"))]
     #[test]
     fn concurrent_reads_never_go_backwards() {
-        let stats = std::sync::Arc::new(Statistics::with_shards(4));
+        let stats = std::sync::Arc::new(Statistics::with_shards(4, StatsLevel::All));
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let writers: Vec<_> = (0..6)
             .map(|_| {
@@ -781,7 +855,7 @@ mod tests {
 
     #[test]
     fn a_histogram_merges_its_shards() {
-        let stats = Statistics::with_shards(4);
+        let stats = Statistics::with_shards(4, StatsLevel::All);
         for (shard, value) in [(0usize, 7u64), (1, 2), (1, 30), (3, 11)] {
             stats.shards[shard].histograms[Histogram::DbGet as usize].record(value);
         }
@@ -923,5 +997,56 @@ mod tests {
         let _t = TimeScope::new(None, Histogram::DbGet);
         // Nothing to assert - the test is that Drop runs without
         // panicking when the stats handle is absent.
+    }
+
+    /// Without timers a scope records no latency, and the tickers and size
+    /// histograms still count.
+    #[test]
+    fn a_level_without_timers_records_no_latency_and_still_counts() {
+        let s = Statistics::with_level(StatsLevel::ExceptTimers);
+        assert_eq!(s.level(), StatsLevel::ExceptTimers);
+        {
+            let t = TimeScope::new(Some(&s), Histogram::DbGet);
+            assert!(
+                t.start.is_none(),
+                "no clock read for a scope without timers"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        s.add(Ticker::KeysRead, 1);
+        s.record(Histogram::BytesPerRead, 7);
+        assert_eq!(s.get_histogram_snapshot(Histogram::DbGet).count, 0);
+        assert_eq!(s.get_ticker(Ticker::KeysRead), 1);
+        assert_eq!(s.get_histogram_snapshot(Histogram::BytesPerRead).sum, 7);
+        assert_eq!(Statistics::new().level(), StatsLevel::All);
+    }
+
+    /// The lowest level keeps tickers and no histogram, sizes included.
+    #[test]
+    fn a_level_without_histograms_keeps_only_tickers() {
+        let s = Statistics::with_level(StatsLevel::ExceptHistogramOrTimers);
+        {
+            let t = TimeScope::new(Some(&s), Histogram::DbGet);
+            assert!(t.start.is_none(), "no clock read without histograms");
+        }
+        s.add(Ticker::KeysRead, 2);
+        s.record(Histogram::BytesPerRead, 7);
+        assert_eq!(s.get_ticker(Ticker::KeysRead), 2);
+        for hist in [Histogram::DbGet, Histogram::BytesPerRead] {
+            assert_eq!(s.get_histogram_snapshot(hist).count, 0, "{hist:?}");
+        }
+    }
+
+    /// A sample skips the updates it cannot change and still lands exactly:
+    /// zeros leave the sum alone, and a bound already past the sample is
+    /// kept.
+    #[test]
+    fn samples_inside_the_bounds_keep_count_sum_min_and_max_exact() {
+        let s = Statistics::with_shards(1, StatsLevel::All);
+        for value in [5, 0, 9, 0, 5, 3, 9] {
+            s.record(Histogram::DbGet, value);
+        }
+        let snap = s.get_histogram_snapshot(Histogram::DbGet);
+        assert_eq!((snap.count, snap.sum, snap.min, snap.max), (7, 31, 0, 9));
     }
 }

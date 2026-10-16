@@ -272,3 +272,24 @@ proptest! {
         }
     }
 }
+
+/// An open records its new log in the manifest before its view exists, so
+/// the view starts at that version and the open publishes none of its own:
+/// each publication retires the view it replaces and pays a padded
+/// reclamation batch for it (`reclaim::submit`). A reopen, which replays
+/// the log, publishes none either.
+#[test]
+fn an_open_publishes_no_view_of_its_own() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    for _ in 0..2 {
+        let db = crate::Db::open(dir.path(), crate::Options::default()).expect("open");
+        assert_eq!(db.engine.view.publications(), 0);
+        let wal_id = db.engine.wal_id.load(Ordering::SeqCst);
+        let view = db.engine.view.load();
+        assert_eq!(view.version.min_wal_id, wal_id);
+        assert_eq!(view.version.next_file_id, wal_id + 1);
+        drop(view);
+        db.put(b"key", b"value").expect("put");
+        db.close().expect("close");
+    }
+}

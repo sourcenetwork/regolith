@@ -8,7 +8,7 @@
 
 use std::io::{self, Read};
 
-use xxhash_rust::xxh3::{Xxh3, Xxh3Default, xxh3_64_with_seed};
+use xxhash_rust::xxh3::{Xxh3, Xxh3Default, xxh3_64, xxh3_64_with_seed};
 
 // Hash domain separators: never displayed, never compared against a
 // name, and present only to keep one checksum family from colliding with
@@ -165,7 +165,35 @@ fn u32_parts(domain: &[u8], parts: &[&[u8]]) -> u32 {
     u64_parts(domain, parts) as u32
 }
 
+/// Inputs this long or shorter are copied together and hashed in one shot.
+///
+/// XXH3 of a stream is XXH3 of its bytes in one piece, so the checksum is
+/// the same either way; the streaming hasher's setup alone costs more than
+/// hashing a small input whole. Manifest batches, WAL format 1 records,
+/// stamps and footers are all this small, and an open checks every
+/// manifest batch.
+const ONE_SHOT_MAX: usize = 512;
+
+/// XXH3 of `domain`, then each part behind its length as a little-endian
+/// `u64`.
 fn u64_parts(domain: &[u8], parts: &[&[u8]]) -> u64 {
+    let len = parts
+        .iter()
+        .fold(domain.len(), |len, part| len + 8 + part.len());
+    if len <= ONE_SHOT_MAX {
+        let mut input = [0u8; ONE_SHOT_MAX];
+        let mut at = 0;
+        let mut put = |bytes: &[u8]| {
+            input[at..at + bytes.len()].copy_from_slice(bytes);
+            at += bytes.len();
+        };
+        put(domain);
+        for part in parts {
+            put(&(part.len() as u64).to_le_bytes());
+            put(part);
+        }
+        return xxh3_64(&input[..len]);
+    }
     let mut hasher = new_hasher(domain);
     for part in parts {
         hasher.update(&(part.len() as u64).to_le_bytes());
@@ -178,4 +206,50 @@ fn new_hasher(domain: &[u8]) -> Xxh3Default {
     let mut hasher = Xxh3Default::new();
     hasher.update(domain);
     hasher
+}
+
+#[cfg(all(test, not(target_family = "wasm")))]
+mod tests {
+    use proptest::prelude::*;
+
+    use super::*;
+
+    /// The streaming hasher every checksum here was computed with before
+    /// small inputs were hashed in one shot: the on-disk reference.
+    fn streamed(domain: &[u8], parts: &[&[u8]]) -> u64 {
+        let mut hasher = new_hasher(domain);
+        for part in parts {
+            hasher.update(&(part.len() as u64).to_le_bytes());
+            hasher.update(part);
+        }
+        hasher.digest()
+    }
+
+    proptest! {
+        /// One shot or streamed, a checksum is the same, on both sides of
+        /// [`ONE_SHOT_MAX`], so every file written before still verifies.
+        #[test]
+        fn one_shot_and_streamed_checksums_agree(
+            domain in proptest::collection::vec(any::<u8>(), 0..40),
+            parts in proptest::collection::vec(proptest::collection::vec(any::<u8>(), 0..300), 0..5),
+        ) {
+            let parts: Vec<&[u8]> = parts.iter().map(Vec::as_slice).collect();
+            prop_assert_eq!(u64_parts(&domain, &parts), streamed(&domain, &parts));
+        }
+    }
+
+    /// Inputs just inside and just past [`ONE_SHOT_MAX`] take the two
+    /// paths and agree with the reference.
+    #[test]
+    fn checksums_agree_at_the_one_shot_limit() {
+        let domain = MANIFEST_RECORD_DOMAIN;
+        for total in ONE_SHOT_MAX - 2..=ONE_SHOT_MAX + 2 {
+            let part = vec![0xa5u8; total - domain.len() - 8];
+            assert_eq!(
+                u64_parts(domain, &[&part]),
+                streamed(domain, &[&part]),
+                "{total} bytes"
+            );
+        }
+    }
 }

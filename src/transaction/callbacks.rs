@@ -333,6 +333,17 @@ impl Callbacks {
         }
         self.queues.get_mut().take()
     }
+
+    /// What an ending carries away: these callbacks when anything was
+    /// registered or is running, and an empty set otherwise, so the ending
+    /// of a transaction with none moves no queues.
+    fn take_live(&mut self) -> Self {
+        if self.registered || self.running != 0 {
+            std::mem::take(self)
+        } else {
+            Self::default()
+        }
+    }
 }
 
 /// How far `prepare` got, so a second call repeats nothing.
@@ -726,7 +737,7 @@ impl Transaction {
     /// the thread that delivers it.
     pub(super) fn ending(&mut self) -> Ending {
         Ending {
-            callbacks: std::mem::take(&mut self.callbacks),
+            callbacks: self.callbacks.take_live(),
             claim: self.claim.clone(),
             isolation: self.isolation,
             hooks: self.engine.transaction_hooks().cloned(),

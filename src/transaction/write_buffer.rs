@@ -130,9 +130,9 @@ fn merged(
 /// without copying them: the key's chain is walked in place from its newest
 /// write back to the one that replaced it, and only the value handed back is
 /// copied.
-pub(super) fn read_buffered(
+pub(super) fn read_buffered<'op>(
     writes: &TxnBuffer<Vec<u8>, Write>,
-    merge: Option<&dyn MergeOperator>,
+    merge: impl FnOnce() -> Option<&'op dyn MergeOperator>,
     key: &[u8],
     committed: impl FnOnce() -> io::Result<Option<DbSlice>>,
 ) -> io::Result<Option<Option<Vec<u8>>>> {
@@ -152,9 +152,13 @@ pub(super) fn read_buffered(
             ControlFlow::Break(())
         }
     });
-    // Newest first as walked; the operator folds them oldest first.
+    // Newest first as walked; the operator folds them oldest first. The
+    // operator is looked up only for a key with operands to fold.
+    if operands.is_empty() {
+        return Ok(base.map(|base| base.map(<[u8]>::to_vec)));
+    }
     operands.reverse();
-    match merge.filter(|_| !operands.is_empty()) {
+    match merge() {
         Some(op) => merged(op, key, base, &operands, committed).map(|value| Some(Some(value))),
         None => Ok(base.map(|base| base.map(<[u8]>::to_vec))),
     }

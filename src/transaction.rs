@@ -939,19 +939,16 @@ enum TxMode {
 /// assert_eq!(db.db().get(b"balance")?.as_deref(), Some(&b"90"[..]));
 /// # Ok::<(), Box<dyn std::error::Error>>(())
 /// ```
+/// Laid out in declaration order (`repr(C)`), hot fields first: a read or a
+/// write of a transaction meets the fields it needs in its first three cache
+/// lines, rather than spread across the seventeen the struct covers, and the
+/// callbacks' in-place queues come last.
+#[repr(C)]
 pub struct Transaction {
     engine: Arc<RegolithEngine>,
-    /// What the commit-time validation covers. See [`IsolationLevel`].
-    isolation: IsolationLevel,
     /// The key classes [`IsolationLevel::DefraLevel`] applies.
     policy: Option<Arc<dyn KeyClassifier>>,
     snapshot_seq: u64,
-    /// Where `snapshot_seq` is pinned in the engine's snapshot registry.
-    /// Released exactly there when the transaction ends, on whichever
-    /// thread that happens.
-    snapshot_pin: crate::engine::SnapshotPin,
-    durability: crate::engine::DurabilityMode,
-    mode: TxMode,
     /// Buffer of the transaction's writes: puts, deletes and merge
     /// operands in the order they were made, which is what lets a read and
     /// a commit agree on what a put after a merge, or a merge after a put,
@@ -959,6 +956,58 @@ pub struct Transaction {
     /// at commit, which is where the order the engine applies them in is
     /// restored.
     writes: TxnBuffer<Vec<u8>, Write>,
+    /// What this transaction has observed about each key it read,
+    /// through a point read, or through a scan at Serializable. Sorted
+    /// at commit so a multi-key conflict always reports the same key.
+    /// Never rewound: a savepoint rollback undoes buffered writes, not
+    /// reads that already happened.
+    tracked: TxnBuffer<Vec<u8>, Arc<KeyState>>,
+    /// Where this transaction's block-cache misses go, and the queue its
+    /// completions belong to ([`TxnOptions::read_mode`],
+    /// [`TxnOptions::io_queue`]).
+    reading: txn_options::Reading,
+    /// Shared with the engine so `close` can abort the transaction; made when
+    /// the first `on_abort` callback is registered, or at once under a
+    /// database with [`TransactionHooks`].
+    claim: Option<Arc<Claim>>,
+    /// The database's lock table; `None` for an optimistic transaction.
+    lock_table: Option<Arc<LockTable>>,
+    /// What the commit-time validation covers. See [`IsolationLevel`].
+    isolation: IsolationLevel,
+    mode: TxMode,
+    durability: crate::engine::DurabilityMode,
+    /// Each write is checked against newer versions as it is made
+    /// ([`TxnOptions::early_validation`]). Optimistic transactions only.
+    early_validation: bool,
+    /// The owner won the commit claim, so a claim made from here on, by an
+    /// `on_abort` registered inside a `before_commit` callback, starts as
+    /// committing too: `close` must not abort a commit that began.
+    committing: bool,
+    /// The commit is a [`Transaction::commit_nowait`]: the `before_commit`
+    /// callbacks' reads keep the transaction's read mode instead of reading
+    /// the device, so one that would block ends the commit with that wait.
+    nowait: bool,
+    resolved: bool,
+    resources_released: bool,
+    /// A read was made through [`Transaction::get_for_update`]: a commit that
+    /// writes nothing at `SnapshotIsolation`, or under DefraLevel's
+    /// write-free relaxation, has a read to check. Only latches on.
+    for_update_reads: AtomicBool,
+    /// Highest sequence [`Transaction::get_for_update`] has ever promoted a
+    /// key to; `snapshot_seq` while nothing has been promoted past it.
+    /// Lets `scan_read_seq` skip the `tracked` lookup outright for a
+    /// pessimistic scan that could not possibly find a promoted key,
+    /// instead of walking `tracked` once per yielded key.
+    promoted_seq: AtomicU64,
+    /// Where `snapshot_seq` is pinned in the engine's snapshot registry.
+    /// Released exactly there when the transaction ends, on whichever
+    /// thread that happens.
+    snapshot_pin: crate::engine::SnapshotPin,
+    /// How far [`Transaction::prepare`] got.
+    prepare_state: Prepare,
+    /// Savepoint stack: how much of each buffer the transaction held when each
+    /// was set.
+    savepoints: Vec<Savepoint>,
     /// The `append` calls, in the order they were made. Not part of `writes`:
     /// their positions do not exist until the commit orders them, so nothing
     /// in the transaction can read them. Allocated by the first `append`, and
@@ -966,12 +1015,6 @@ pub struct Transaction {
     /// pays nothing for it. A buffer rather than a queue so a savepoint can
     /// take the appends made after it back.
     appends: OnceLock<Box<TxnBuffer<(), PendingAppend>>>,
-    /// What this transaction has observed about each key it read,
-    /// through a point read, or through a scan at Serializable. Sorted
-    /// at commit so a multi-key conflict always reports the same key.
-    /// Never rewound: a savepoint rollback undoes buffered writes, not
-    /// reads that already happened.
-    tracked: TxnBuffer<Vec<u8>, Arc<KeyState>>,
     /// The stretches of snapshot keys this transaction's scans yielded, one
     /// record per stretch rather than one per key. Allocated by the first
     /// scan that yields a snapshot key. Never rewound, like `tracked`.
@@ -983,51 +1026,12 @@ pub struct Transaction {
     /// The ranges the validated scans ([`ScanCheck::Range`]) cover, one record
     /// per cursor. Boxed for the reason `scan_runs` is.
     scan_ranges: OnceLock<Box<SegQueue<Arc<RangeRecord>>>>,
-    /// Each write is checked against newer versions as it is made
-    /// ([`TxnOptions::early_validation`]). Optimistic transactions only.
-    early_validation: bool,
-    /// Where this transaction's block-cache misses go, and the queue its
-    /// completions belong to ([`TxnOptions::read_mode`],
-    /// [`TxnOptions::io_queue`]).
-    reading: txn_options::Reading,
-    /// Highest sequence [`Transaction::get_for_update`] has ever promoted a
-    /// key to; `snapshot_seq` while nothing has been promoted past it.
-    /// Lets `scan_read_seq` skip the `tracked` lookup outright for a
-    /// pessimistic scan that could not possibly find a promoted key,
-    /// instead of walking `tracked` once per yielded key.
-    promoted_seq: AtomicU64,
-    /// A read was made through [`Transaction::get_for_update`]: a commit that
-    /// writes nothing at `SnapshotIsolation`, or under DefraLevel's
-    /// write-free relaxation, has a read to check. Only latches on.
-    for_update_reads: AtomicBool,
-    /// Savepoint stack: how much of each buffer the transaction held when each
-    /// was set.
-    savepoints: Vec<Savepoint>,
-    /// What the caller registered to run when the transaction ends, the
-    /// first four of each kind in place: no allocation for them.
-    callbacks: Callbacks,
-    /// Shared with the engine so `close` can abort the transaction; made when
-    /// the first `on_abort` callback is registered, or at once under a
-    /// database with [`TransactionHooks`].
-    claim: Option<Arc<Claim>>,
-    /// The owner won the commit claim, so a claim made from here on, by an
-    /// `on_abort` registered inside a `before_commit` callback, starts as
-    /// committing too: `close` must not abort a commit that began.
-    committing: bool,
-    /// The commit is a [`Transaction::commit_nowait`]: the `before_commit`
-    /// callbacks' reads keep the transaction's read mode instead of reading
-    /// the device, so one that would block ends the commit with that wait.
-    nowait: bool,
-    /// How far [`Transaction::prepare`] got.
-    prepare_state: Prepare,
     /// Keys for which this transaction holds a pessimistic lock, each with
     /// its lock and the use of it the hold took. A set rather than a list:
     /// membership is checked on every locking operation, and release order
     /// does not matter. Released by `Drop` if not already released by
     /// `commit` or `rollback`, or by the landing of a `commit_nowait`.
     held_locks: TxnBuffer<Vec<u8>, Arc<KeyLock>>,
-    /// The database's lock table; `None` for an optimistic transaction.
-    lock_table: Option<Arc<LockTable>>,
     /// The name this transaction's locks carry: taken at begin for a
     /// pessimistic transaction, from the ones this thread's earlier
     /// transactions gave back (`LockOwner::take`), and given back when it
@@ -1037,8 +1041,9 @@ pub struct Transaction {
     /// calls (`locking`). Allocated by the first wait.
     lock_waits: OnceLock<Box<LockWaits>>,
     lock_timeout: Duration,
-    resolved: bool,
-    resources_released: bool,
+    /// What the caller registered to run when the transaction ends, the
+    /// first four of each kind in place: no allocation for them.
+    callbacks: Callbacks,
 }
 
 /// The mark a savepoint keeps: the entry counts of the buffers it rolls back.
@@ -1307,7 +1312,7 @@ impl Transaction {
     ) -> TxResult<Option<Option<Vec<u8>>>> {
         read_buffered(
             &self.writes,
-            self.engine.merge_operator(),
+            || self.engine.merge_operator(),
             prefixed,
             committed,
         )
@@ -1993,6 +1998,65 @@ impl Transaction {
         result
     }
 
+    /// Move this transaction out, leaving in its place an empty one that
+    /// holds nothing: it pins no snapshot, has no claim, no lock and no
+    /// write, and its end runs no callback and no hook. It only holds the
+    /// place, for an owner that has the transaction by reference for a
+    /// while, such as an [`OptimisticTransactionDb::transact_async`] attempt,
+    /// and hands it to another owner until it puts it back
+    /// (`*txn = taken`). It reads at this transaction's snapshot without
+    /// pinning it, so compaction may drop what it would read.
+    ///
+    /// Beginning a transaction to hold the place instead registers a
+    /// snapshot, and under [`TransactionHooks`] a claim, only to drop them.
+    ///
+    /// ```
+    /// use regolith::{OptimisticTransactionDb, Options, TxnOptions};
+    ///
+    /// let db = OptimisticTransactionDb::open("taken", Options::memory())?;
+    /// let mut held = db.begin(&TxnOptions::new());
+    /// let taken = held.take();
+    /// taken.put(b"key", b"value")?;
+    /// held = taken;
+    /// held.commit()?;
+    /// assert_eq!(db.db().get(b"key")?.as_deref(), Some(&b"value"[..]));
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    pub fn take(&mut self) -> Transaction {
+        let shell = Self {
+            engine: Arc::clone(&self.engine),
+            policy: None,
+            snapshot_seq: self.snapshot_seq,
+            writes: TxnBuffer::new(0),
+            tracked: TxnBuffer::new(0),
+            reading: self.reading,
+            claim: None,
+            lock_table: None,
+            isolation: self.isolation,
+            mode: self.mode,
+            durability: self.durability,
+            early_validation: false,
+            committing: false,
+            nowait: false,
+            resolved: true,
+            resources_released: true,
+            for_update_reads: AtomicBool::new(false),
+            promoted_seq: AtomicU64::new(self.snapshot_seq),
+            snapshot_pin: crate::engine::SnapshotPin::none(),
+            prepare_state: Prepare::Pending,
+            savepoints: Vec::new(),
+            appends: OnceLock::new(),
+            scan_runs: OnceLock::new(),
+            scan_ranges: OnceLock::new(),
+            held_locks: TxnBuffer::new(0),
+            lock_owner: None,
+            lock_waits: OnceLock::new(),
+            lock_timeout: self.lock_timeout,
+            callbacks: Callbacks::default(),
+        };
+        std::mem::replace(self, shell)
+    }
+
     /// Discard the transaction's buffered writes and release any
     /// pessimistic locks. Equivalent to dropping the transaction,
     /// but surfaces as an explicit call in user code. Its `on_abort`
@@ -2440,8 +2504,8 @@ impl Transaction {
             return;
         }
         self.resources_released = true;
-        if let Some(claim) = &self.claim {
-            self.engine.open_transactions().remove(claim.id);
+        if let Some(slot) = self.claim.as_ref().and_then(|claim| claim.slot) {
+            self.engine.open_transactions().remove(slot);
         }
         self.release_locks();
         self.engine.release_snapshot(self.snapshot_pin.take());

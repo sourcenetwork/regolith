@@ -16,9 +16,9 @@ fn is_log(path: &Path) -> bool {
         .is_some_and(|ext| ext == "log" || ext == "wal")
 }
 
-/// Walk the write-ahead logs in `dir`, one entry at a time. A directory
-/// that does not exist holds none.
-pub(super) fn walk<'a>(
+/// Walk every entry of `dir`, one at a time. A directory that does not
+/// exist holds none.
+fn entries<'a>(
     env: &'a dyn Env,
     dir: &Path,
 ) -> io::Result<impl Iterator<Item = io::Result<PathBuf>> + use<'a>> {
@@ -30,10 +30,19 @@ pub(super) fn walk<'a>(
     Ok(entries
         .into_iter()
         .flatten()
-        .filter_map(|entry| match entry {
-            Ok(entry) => is_log(&entry.path).then_some(Ok(entry.path)),
-            Err(e) => Some(Err(e)),
-        }))
+        .map(|entry| entry.map(|entry| entry.path)))
+}
+
+/// Walk the write-ahead logs in `dir`, one entry at a time. A directory
+/// that does not exist holds none.
+pub(super) fn walk<'a>(
+    env: &'a dyn Env,
+    dir: &Path,
+) -> io::Result<impl Iterator<Item = io::Result<PathBuf>> + use<'a>> {
+    Ok(entries(env, dir)?.filter(|path| match path {
+        Ok(path) => is_log(path),
+        Err(_) => true,
+    }))
 }
 
 /// The logs recovery replays, oldest first: the ones at or above
@@ -53,11 +62,34 @@ pub(super) fn walk<'a>(
 /// the names itself. A name with no id sorts before every numbered log, by
 /// name.
 pub(super) fn live(env: &dyn Env, dir: &Path, min_wal_id: u64) -> io::Result<Vec<PathBuf>> {
+    collect_live(env, dir, min_wal_id, false)
+}
+
+/// [`live`] for a read-write open, which also removes, as the same walk
+/// reaches them, the staging files a crash left (`wal_seal::is_staged`):
+/// one listing of the directory where removing them first took a second.
+/// The open holds the directory lock, so no log is being created.
+pub(super) fn live_removing_staged(
+    env: &dyn Env,
+    dir: &Path,
+    min_wal_id: u64,
+) -> io::Result<Vec<PathBuf>> {
+    collect_live(env, dir, min_wal_id, true)
+}
+
+fn collect_live(
+    env: &dyn Env,
+    dir: &Path,
+    min_wal_id: u64,
+    remove_staged: bool,
+) -> io::Result<Vec<PathBuf>> {
     let mut live = Vec::new();
-    for log in walk(env, dir)? {
-        let log = log?;
-        if super::should_replay_wal(&log, min_wal_id) {
-            live.push(log);
+    for path in entries(env, dir)? {
+        let path = path?;
+        if remove_staged && super::wal_seal::is_staged(&path) {
+            super::wal_seal::remove_staged(env, &path)?;
+        } else if is_log(&path) && super::should_replay_wal(&path, min_wal_id) {
+            live.push(path);
         }
     }
     live.sort_by(|a, b| (super::wal_file_id(a), a).cmp(&(super::wal_file_id(b), b)));

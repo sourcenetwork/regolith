@@ -127,7 +127,7 @@ pub use rate_limiter::{Priority, RateLimiter, TokenBucketRateLimiter};
 pub use slice::DbSlice;
 pub use snapshot_wait::SnapshotWait;
 pub use sst_file_writer::{IngestOptions, SstFileMeta, SstFileWriter};
-pub use statistics::{Histogram, HistogramSnapshot, Statistics, Ticker};
+pub use statistics::{Histogram, HistogramSnapshot, Statistics, StatsLevel, Ticker};
 pub use stream_writer::{StreamOptions, StreamingWriter};
 pub use tailing::TailingIter;
 pub use transaction::{

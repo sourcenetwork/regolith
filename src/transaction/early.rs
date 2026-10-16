@@ -21,9 +21,18 @@ impl Transaction {
     /// read (the read's rule decides, not the write's), and every key once it
     /// has scanned (a write inside a stretch is validated as a read). A put or
     /// merge of a content-addressed key is never validated, early or late.
+    #[inline]
     pub(super) fn validate_early(&self, prefixed: &[u8], write: EarlyWrite<'_>) -> TxResult<()> {
-        if !self.early_validation
-            || !matches!(self.mode, TxMode::Optimistic)
+        if !self.early_validation {
+            return Ok(());
+        }
+        self.validate_write_now(prefixed, write)
+    }
+
+    /// [`Transaction::validate_early`] for a transaction that validates
+    /// early.
+    fn validate_write_now(&self, prefixed: &[u8], write: EarlyWrite<'_>) -> TxResult<()> {
+        if !matches!(self.mode, TxMode::Optimistic)
             || self.scan_runs.get().is_some()
             || self.tracked.get(prefixed).is_some()
         {

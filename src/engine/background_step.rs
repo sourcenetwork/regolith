@@ -151,7 +151,7 @@ impl RegolithEngine {
         if self.owed.load(Ordering::Acquire) == 0 {
             return;
         }
-        if let Some(queue) = self.io().current_queue() {
+        if let Some(queue) = self.current_queue() {
             // One job waits at a time, and it takes what is owed when it
             // runs, this included.
             if self.owed_queued.swap(true, Ordering::AcqRel) {
@@ -255,7 +255,7 @@ impl RegolithEngine {
             }
         }
         if matches!(self.stall_state(), Some((_, true)))
-            && let Some(queue) = self.io().current_queue()
+            && let Some(queue) = self.current_queue()
         {
             self.leave_stall_step(&queue);
         }

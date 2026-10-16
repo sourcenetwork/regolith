@@ -82,8 +82,10 @@
 \*     bytes is the same protocol with n slots.
 \*   - Overwrites and shrinks: they always take the copy path, which is
 \*     the path modelled here for appends too.
-\*   - The spare capacity: when it runs out a writer takes the copy path;
-\*     here a writer may take either path at any time, which covers it.
+\*   - The room: an append in place that runs out of it links more
+\*     (src/env/mem_file/extent.rs) while it holds WRITER, above the
+\*     published length, which is the in-place write modelled here; and
+\*     here a writer may take either path at any time.
 \*   - Memory ordering: the CAS steps are atomic here; the code's Acquire
 \*     and Release make them so.
 \*   - An append at one length only (MemFile::append_at, which the

@@ -86,7 +86,9 @@
 
 use std::ptr;
 
-use crate::sync::internal::{Arc, AtomicPtr, AtomicU64, AtomicUsize, Ordering, seq_cst_handshake};
+use crate::sync::internal::{
+    Arc, AtomicPtr, AtomicU64, AtomicUsize, Ordering, seq_cst_handshake, take_ptr,
+};
 
 /// The slot is published; the cell is free for the index one lap later.
 const DONE: u64 = 0;
@@ -529,8 +531,10 @@ impl<T> Ring<T> {
 
 impl<T> Drop for Ring<T> {
     fn drop(&mut self) {
-        for cell in self.cells.iter() {
-            let raw = cell.desc.swap(ptr::null_mut(), Ordering::SeqCst);
+        // A plain take per cell, not a locked swap: a ring is dropped with
+        // every engine, and its hundreds of cells made that a cost of a close.
+        for cell in self.cells.iter_mut() {
+            let raw = take_ptr(&mut cell.desc);
             if !raw.is_null() {
                 // SAFETY: `&mut self` excludes every other thread, and a
                 // non-null pointer is a reference the cell still owns.

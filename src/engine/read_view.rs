@@ -107,6 +107,9 @@ pub(crate) struct ReadView {
 /// Holds the currently published [`ReadView`].
 pub(crate) struct ReadViewCell {
     current: Atom<ReadView>,
+    /// Test-only: the views published after the initial one.
+    #[cfg(test)]
+    publications: std::sync::atomic::AtomicUsize,
 }
 
 /// One loaded view, pinned for as long as the guard lives.
@@ -178,7 +181,15 @@ impl ReadViewCell {
         let _fresh_epoch = kovan::pin();
         Self {
             current: Atom::new(view),
+            #[cfg(test)]
+            publications: std::sync::atomic::AtomicUsize::new(0),
         }
+    }
+
+    /// Test-only: the views published after the initial one.
+    #[cfg(test)]
+    pub(crate) fn publications(&self) -> usize {
+        self.publications.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Load the currently published view. This is the read path: a pin
@@ -228,6 +239,9 @@ impl ReadViewCell {
             let current = self.current.load();
             let (next, out) = build(&current);
             if self.current.compare_and_swap(&current, next).is_ok() {
+                #[cfg(test)]
+                self.publications
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 return out;
             }
         }

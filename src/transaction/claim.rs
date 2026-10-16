@@ -36,7 +36,8 @@ const ABORTED: u8 = 2;
 
 /// The shared half of a transaction that has something to run when it aborts.
 pub(crate) struct Claim {
-    pub(crate) id: u64,
+    /// Where the engine lists it for `close`; `None` when it is not listed.
+    pub(crate) slot: Option<u32>,
     state: AtomicU8,
     on_abort: FirstFour<OnAbort>,
     /// The name a pessimistic transaction's key locks carry, once it has
@@ -53,14 +54,17 @@ impl Claim {
     /// no claim until now: the claim starts as committing and is not listed,
     /// since `close` never aborts a commit that began.
     pub(super) fn track(engine: &RegolithEngine, committing: bool) -> Arc<Self> {
+        let slot = (!committing && !engine.is_closed())
+            .then(|| engine.open_transactions().reserve())
+            .flatten();
         let claim = Arc::new(Self {
-            id: engine.open_transactions().next_id(),
+            slot,
             state: AtomicU8::new(if committing { COMMITTING } else { OPEN }),
             on_abort: FirstFour::default(),
             lock_owner: OnceLock::new(),
         });
-        if !committing && !engine.is_closed() {
-            engine.open_transactions().insert(Arc::clone(&claim));
+        if let Some(slot) = slot {
+            engine.open_transactions().insert(slot, &claim);
         }
         claim
     }

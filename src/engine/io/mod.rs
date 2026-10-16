@@ -232,6 +232,12 @@ pub(crate) struct IoRuntime {
     gate: CloseGate,
 }
 
+/// Run a job this thread claimed, whatever scope the caller is in.
+pub(crate) fn run_claimed(job: &Arc<Job>) {
+    let _device = scope::blocking();
+    job.run();
+}
+
 /// A job in the job table, and the queue whose owner runs it.
 #[derive(Clone)]
 struct Listed {
@@ -359,11 +365,12 @@ impl IoRuntime {
         queue.deliver(Message::Job { job, waiter }).is_ok()
     }
 
-    /// Run a job this thread claimed, whatever scope the caller is in, then
-    /// drop it from the job table.
+    /// Test-only: run a job this thread claimed, whatever scope the caller
+    /// is in, then drop it from the job table. The engine's own runs go
+    /// through `RegolithEngine::run_job`, which makes no table to do it.
+    #[cfg(test)]
     pub(crate) fn run_job(&self, job: &Arc<Job>) {
-        let _device = scope::blocking();
-        job.run();
+        run_claimed(job);
         self.forget_job(job);
     }
 
@@ -476,7 +483,7 @@ impl IoRuntime {
         released
     }
 
-    fn forget_job(&self, job: &Arc<Job>) {
+    pub(crate) fn forget_job(&self, job: &Arc<Job>) {
         self.jobs
             .remove_if(&job_key(job), |held| Arc::ptr_eq(&held.job, job));
     }

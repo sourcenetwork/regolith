@@ -190,7 +190,7 @@ impl RegolithEngine {
         scope::waits("a round or a unit in the way of a call that blocks");
         loop {
             if job.claim() {
-                self.io().run_job(job);
+                self.run_job(job);
                 return;
             }
             if job.wait_turn() {

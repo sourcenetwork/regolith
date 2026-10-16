@@ -290,7 +290,7 @@ impl RegolithEngine {
             completion.deliver_decided();
             return ticket;
         }
-        let queue = self.io().current_queue();
+        let queue = self.current_queue();
         if self.has_worker {
             let body = Box::new(Foreground {
                 engine: self.me.clone(),
