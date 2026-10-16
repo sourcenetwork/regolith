@@ -176,7 +176,7 @@ fn a_cached_entry_costs_no_more_heap_than_it_is_charged() {
         );
         let line = stdout
             .lines()
-            .find(|l| l.starts_with("ADVRESULT"))
+            .find_map(|line| line.find("ADVRESULT").map(|at| &line[at..]))
             .unwrap_or_else(|| panic!("no result from child:\n{stdout}"))
             .to_string();
         println!("{line}");
