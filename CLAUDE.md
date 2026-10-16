@@ -296,6 +296,12 @@ The bare minimum for every change. A change that breaks one of them does not mer
 
 ### Proofs
 
+- No logic change without its models. A change to what the code does ships with its TLA+ model and its Lean proof
+  in the same change, and both pass before the code is written or merged. That covers behavior, an ordering, a
+  protocol, durability, recovery, conflict and validation rules, an encoding, and a data structure's invariants.
+  A model that does not pass means the design is broken: it is not implemented until the design is fixed and TLC
+  and Lean pass. A change that keeps behavior identical (a refactor, a speedup with identical results, tests,
+  docs) still updates the correspondence table of every model whose code it moves.
 - Every mechanism has a written contract (what regolith guarantees, what the caller must uphold) and a TLA+ model
   written before its code: the spec is the contract. Anything temporal or concurrent is modelled in TLA+; data
   structures and laws that hold for every size are proved in Lean. New concurrency on production types gets a loom
