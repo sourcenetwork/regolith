@@ -27,7 +27,7 @@
 
 ```toml
 [dependencies]
-regolith = "0.1"
+regolith = "0.2"
 ```
 
 ## Quick start
