@@ -37,16 +37,14 @@ fn only_per_thread_asks_the_os_for_the_core_count() {
         for (number, line) in source.lines().enumerate() {
             let code = line.trim_start();
             if !code.starts_with("//") && code.contains(ASK) {
-                askers.push((relative.to_path_buf(), number + 1));
+                askers.push(format!("{}:{}", relative.display(), number + 1));
             }
         }
     }
-    // Compared by components, so the separator a platform prints does not
-    // matter.
-    let the_one_place = Path::new("src").join("per_thread.rs");
+    let the_one_place = ["src", "per_thread.rs"].join(std::path::MAIN_SEPARATOR_STR);
     assert_eq!(askers.len(), 1, "OS core-count queries: {askers:#?}");
-    assert_eq!(
-        askers[0].0, the_one_place,
+    assert!(
+        askers[0].starts_with(&the_one_place),
         "OS core-count queries: {askers:#?}"
     );
 }
