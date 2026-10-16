@@ -390,9 +390,10 @@ proves were synced refuses the open instead. Rot inside the last synced group of
 log cannot be told from a torn write, so it is dropped the same way: reported, never
 silent.
 
-A database written by 0.1.x opens, and the open rewrites its log in format 2, which 0.1.x
-refuses to open: the upgrade is one-way. A database a 0.1.x release left with tables of
-overlapping key ranges in one level opens too: the first open moves that level and the
+regolith 0.2 opens a database written by 0.1.x, and the open rewrites its log in format 2,
+which 0.1.x refuses to open: the upgrade from 0.1.x to 0.2 is one-way. A database a 0.1.x
+release left with tables of overlapping key ranges in one level opens on 0.2 too: the first
+open moves that level and the
 levels above it into level 0 and logs one warning (the `regolith.manifest.tables_demoted`
 ticker and property count the tables moved). A database a 0.1.x release left with a range
 delete below older keys it deletes reads them as deleted: the first open copies every range
