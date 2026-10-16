@@ -199,6 +199,7 @@ impl Version {
 /// intersects `[first, last]`, with `first <= last`. They are a contiguous run
 /// of the level, found by binary search: the first table ending at or after
 /// `first`, through the last one starting at or before `last`.
+#[inline]
 pub(crate) fn overlapping<'level>(
     files: &'level [Arc<LiveSst>],
     first: &[u8],
@@ -211,6 +212,7 @@ pub(crate) fn overlapping<'level>(
 
 /// The tables of `files`, one level below L0 in order, whose key range covers
 /// `key`. More than one only where a table ends on the key another begins at.
+#[inline]
 pub(crate) fn covering<'level>(
     files: &'level [Arc<LiveSst>],
     key: &[u8],

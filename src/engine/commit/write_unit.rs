@@ -802,8 +802,8 @@ impl RegolithEngine {
         let _perf = PerfTimer::new(PerfTimerField::WriteWal);
         // Through `Env`, not `std::time::Instant`: browsers have a clock but
         // `Instant::now` panics on `wasm32-unknown-unknown`. Read only when
-        // statistics are on.
-        let start = self.statistics().and_then(|_| self.env.now_micros());
+        // statistics record latencies.
+        let start = self.timer_start();
         let written = || desc.flags() & (WRITTEN | FAILED) != 0;
         let wrote = match desc.record() {
             Some(record) => log.write_unless(place, record, written),
@@ -927,7 +927,7 @@ impl RegolithEngine {
             return Tried::Wrote;
         }
         let _perf = PerfTimer::new(PerfTimerField::WriteWal);
-        let start_micros = self.statistics().and_then(|_| self.env.now_micros());
+        let start_micros = self.timer_start();
         let mut slices = [IoSlice::new(&[]); MAX_BATCH_RECORDS];
         for (slice, held) in slices.iter_mut().zip(run.records().take(keep)) {
             *slice = IoSlice::new(held.record().unwrap_or_default());

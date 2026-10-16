@@ -278,23 +278,23 @@
 \*       taken by try_claim (commit/write_unit.rs:219) and let go by release
 \*       (commit/write_unit.rs:239).
 \*   gathered[a]: the run the holder collected. The Run that try_batch's scan
-\*       fills (commit/write_unit.rs:885), record by record through Run::take
-\*       (commit/write_unit.rs:456).
+\*       fills (commit/write_unit.rs:874), record by record through Run::take
+\*       (commit/write_unit.rs:462).
 \*   fly[a]: a write counted in at the gate, its bytes on the way. InFlight
-\*       (wal_log.rs:626), made by Log::count_in (wal_log.rs:417) and counted out
-\*       when it drops (wal_log.rs:644).
+\*       (wal_log.rs:641), made by Log::count_in (wal_log.rs:417) and counted out
+\*       when it drops (wal_log.rs:659).
 \*   runEnd[a]: the last record of the run thread a wrote. wrote_upto in
-\*       try_batch (commit/write_unit.rs:961).
+\*       try_batch (commit/write_unit.rs:967).
 \*   asleep, sleepOn[a]: a thread parked on a record. The thread on the
 \*       descriptor's list with PARKED set: Descriptor::register
 \*       (commit/descriptor.rs:657), then park (commit/descriptor.rs:640).
 \*   looking[a], saw[a]: a thread about to park, and the claim it saw when it
 \*       found the unit taken (the `seen` of bring_written,
-\*       (commit/write_unit.rs:847 return Tried::Claimed(word)>)). claimNo counts
+\*       (commit/write_unit.rs:853 return Tried::Claimed(word)>)). claimNo counts
 \*       the claims, as the claim number in WriteUnit.word does; noted holds every
 \*       claim a note ever landed on, which only the broken NoteTrustsALoad reads.
 \*   late[a]: a parked thread whose patience ran out. out_of_patience answered
-\*       yes (commit/write_unit.rs:669); copy_record comes next.
+\*       yes (commit/write_unit.rs:675); copy_record comes next.
 \*   wanted: a parked thread noted the current claim. The WANTED bit, put on
 \*       by WriteUnit::note (commit/write_unit.rs:251) with a compare-and-swap
 \*       that lands only while the claim it saw still holds the unit, and read by
@@ -321,50 +321,50 @@
 \*
 \*   EncodeStart(a, i), EncodeEnd(a): claim the encoding of a record nobody is
 \*       encoding, encode it, set FILLED and wake the parked. RegolithEngine::fill
-\*       (commit/write_unit.rs:575), called by drive (commit/pipeline.rs:1040) for
+\*       (commit/write_unit.rs:581), called by drive (commit/pipeline.rs:1040) for
 \*       the owner's own record, by the allocations (commit/allocate.rs:91), and
 \*       by bring_written for a record a thread needs that nobody is encoding
-\*       (commit/write_unit.rs:623); Descriptor::fill and its mark
+\*       (commit/write_unit.rs:628); Descriptor::fill and its mark
 \*       (commit/descriptor.rs:565).
 \*   DirectStart(a): the fast path (WU8). An owner whose record nobody has in
 \*       hand finds the unit free with no note on it, encodes its record and goes
 \*       to write it by itself; StealStart then counts it in and looks again.
-\*       RegolithEngine::write_alone (commit/write_unit.rs:769), called by drive
+\*       RegolithEngine::write_alone (commit/write_unit.rs:775), called by drive
 \*       and drive_nowait before the unit's way (commit/pipeline.rs:1020):
 \*       WriteUnit::quiet (commit/write_unit.rs:213), one load; then fill and
 \*       copy_record. The unit does not see such writes, so several owners may
 \*       take the fast path at once, each writing its own record.
 \*   Gather(a): claim the free unit and collect the first run. try_batch
-\*       (commit/write_unit.rs:843): try_claim, then the scan from past the
+\*       (commit/write_unit.rs:849): try_claim, then the scan from past the
 \*       written hint or the published frontier, whichever is further.
 \*   RunStart(a): count in, look again, keep what still waits.
-\*       log.count_in(run.epoch) (commit/write_unit.rs:908), then the look again,
+\*       log.count_in(run.epoch) (commit/write_unit.rs:914), then the look again,
 \*       which is Kept.
 \*   WriteLand(a), a run: the run's one write lands. flight.write
-\*       (commit/write_unit.rs:929) through InFlight::write (wal_log.rs:635),
+\*       (commit/write_unit.rs:935) through InFlight::write (wal_log.rs:650),
 \*       LogFile::write_all_vectored_at and its pwritev, or pwrite for a run of
-\*       one (../env/std_env.rs:477); then the count out and the quiet marks
+\*       one (../env/std_env.rs:479); then the count out and the quiet marks
 \*       (mark_quiet). The run's sleepers are woken only after the let go
 \*       (Release, WU7).
-\*   WriteLand(a), a copy: copy_record (commit/write_unit.rs:787) through
+\*   WriteLand(a), a copy: copy_record (commit/write_unit.rs:793) through
 \*       Log::write_unless (wal_log.rs:391), then Descriptor::mark, which wakes.
 \*   LandFail(a): a write fails. The error arms of try_batch and copy_record:
 \*       the log is poisoned and the parked are woken.
 \*   Release(a): let the unit go and tell. Claim's drop
-\*       (commit/write_unit.rs:1021): WriteUnit::release reads the notes in its
-\*       swap, then tell_waiters (commit/write_unit.rs:993) wakes every record
+\*       (commit/write_unit.rs:1027): WriteUnit::release reads the notes in its
+\*       swap, then tell_waiters (commit/write_unit.rs:999) wakes every record
 \*       still waiting for the unit (WriteUnit::tell, wake_if_waiting
-\*       (commit/write_unit.rs:516)); then publish_ready, then the run's own
+\*       (commit/write_unit.rs:522)); then publish_ready, then the run's own
 \*       sleepers. Mutant FirstOnly is the code as it was: the first record only,
 \*       the note put back on a free unit.
 \*   PubHorizon(a), PubFrontier(a) with PublishesRun(a, p): the holder
 \*       publishes what its run made publishable before it wakes the run's owners
 \*       (WU7). publish_ready (commit/pipeline.rs:934), called after the let go
-\*       (commit/write_unit.rs:975); each order through publishable_slot and
+\*       (commit/write_unit.rs:981); each order through publishable_slot and
 \*       publish_slot (commit/pipeline.rs:911), as every publisher does.
 \*   ParkLook(a), ParkSleep(a): find the record in another's hands, then park
 \*       on it. bring_written's try_batch returns the claim it saw; park_on
-\*       (commit/write_unit.rs:730) then registers on the record
+\*       (commit/write_unit.rs:736) then registers on the record
 \*       (Descriptor::register (commit/descriptor.rs:657)) and looks again, its
 \*       note on the claim it saw part of the look; a refused note means the claim
 \*       is gone, and the thread looks afresh. Mutant NoteTrustsALoad is the code
@@ -374,7 +374,7 @@
 \*       bring_written with Await::Copy for an Immediate slot
 \*       (commit/pipeline.rs:1054), the same path the round's holder takes.
 \*   Timeout(a): the park's time runs out. park_timeout in Descriptor::park,
-\*       and out_of_patience (commit/write_unit.rs:702) saying yes.
+\*       and out_of_patience (commit/write_unit.rs:708) saying yes.
 \*   StealStart(a): the copy after the patience. copy_record, through
 \*       Log::write_unless: count in, look again (the `written` test), write.
 \*   WriteStart(a, i): the round's holder copies. sync_written calls
@@ -386,7 +386,7 @@
 \*       the scan and Run::take's same log, same epoch, offset that follows on.
 \*   Pass, Void, DecideNow, UnitRun with Named(i): a frontier pass names the
 \*       orders whose turn is now near. RegolithEngine::pass_decided
-\*       (commit/pipeline.rs:783): Ring::pass_decided (commit/ring.rs:244), then
+\*       (commit/pipeline.rs:783): Ring::pass_decided (commit/ring.rs:246), then
 \*       Turns::name (commit/turn_wait.rs:79); the void path and the ordered units
 \*       pass through the same function.
 \*   RbFinish with Named and its wakes: a rollback's jump names the orders
@@ -444,7 +444,7 @@
 \*       (Regolith/PipelineHelping.lean).
 \*
 \* RUST WITH NO STEP OF ITS OWN HERE, and why that loses nothing:
-\*   - the spin before a park (commit/write_unit.rs:682) and its budget
+\*   - the spin before a park (commit/write_unit.rs:688) and its budget
 \*     SPIN_BUDGET (commit/write_unit.rs:143), past which a waiter parks at
 \*     once: a wait that ends by itself changes nothing, and which waiters
 \*     spin first changes nothing either;

@@ -228,7 +228,7 @@ impl JobTicket {
                 // One of this thread's own queue's jobs: stepped with the
                 // rest of them until it lands.
                 Some(engine) if engine.io().is_own(job) => engine.io().wait_landed(job),
-                Some(engine) if job.claim() => engine.io().run_job(job),
+                Some(engine) if job.claim() => engine.run_job(job),
                 None if job.claim() => job.run(),
                 _ => {}
             }

@@ -44,6 +44,67 @@ fn an_extension_after_a_cut_reads_zeros_not_old_bytes() {
     assert_eq!(file.to_vec(), [0u8; 6]);
 }
 
+/// A copy builds its extent without zeroing the room it grows into, so an
+/// extension or a write past the end that copies zeroes what it exposes.
+#[test]
+fn an_extension_that_copies_reads_zeros_where_it_exposes_bytes() {
+    let file = file_with(b"abc");
+    let capacity = file.current.load().capacity();
+    let past = capacity as u64 * 4;
+    assert_eq!(file.set_len(past, &Free).unwrap(), (3, past));
+    let mut expected = b"abc".to_vec();
+    expected.resize(past as usize, 0);
+    assert_eq!(file.to_vec(), expected);
+
+    let far = past * 4;
+    assert_eq!(file.write_at(far, b"z", &Free).unwrap(), (past, far + 1));
+    expected.resize(far as usize, 0);
+    expected.push(b'z');
+    assert_eq!(file.to_vec(), expected);
+}
+
+/// A file grows in place: an append past its room links one more segment,
+/// as large as the room before it, and copies none of the bytes the file
+/// already holds. Reads across the segments see the bytes as written.
+#[test]
+fn a_growing_file_links_room_and_copies_nothing() {
+    let file = MemFile::new();
+    let before = copied();
+    let mut model = Vec::new();
+    for i in 0..(1usize << 20) / 1000 {
+        let record = vec![(i % 251) as u8; 1000];
+        file.append(&[&record], &Free).unwrap();
+        model.extend_from_slice(&record);
+    }
+    assert_eq!(copied(), before, "an append in place copies nothing");
+    let extent = file.current.load();
+    assert!(extent.capacity() < 2 * model.len() + 4096);
+    assert!(extent.segment_count() <= 22, "the chain doubles its room");
+    drop(extent);
+    assert_eq!(file.to_vec(), model);
+    let mut buf = vec![0u8; 70_000];
+    file.read_exact_at(12_345, &mut buf).unwrap();
+    assert_eq!(buf, model[12_345..12_345 + buf.len()]);
+}
+
+/// An overwrite of a large file copies it, and hands the extent it replaced
+/// to the reclaimer at once rather than leaving it in this thread's batch
+/// until enough other retirements fill it.
+#[test]
+fn a_copy_of_a_large_file_hands_the_old_extent_to_the_reclaimer() {
+    let file = MemFile::new();
+    file.append(&[&vec![1u8; 4 * RECLAIM_PROMPTLY]], &Free)
+        .unwrap();
+    let before = submitted();
+    file.write_at(0, b"x", &Free).unwrap();
+    assert_eq!(submitted() - before, 1);
+    let small = file_with(b"small");
+    let before = submitted();
+    small.write_at(0, b"S", &Free).unwrap();
+    assert_eq!(submitted(), before, "a small extent waits for its batch");
+    assert_eq!(small.to_vec(), b"Small");
+}
+
 /// An append publishes in place while a copy is between its build and its
 /// freeze. The copy's freeze CAS expects the word it built from, so it fails,
 /// and the copy writes again from the longer file: the append survives.

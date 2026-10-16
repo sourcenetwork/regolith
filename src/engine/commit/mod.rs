@@ -147,9 +147,8 @@ const MAX_KEPT_STAGE_BYTES: usize = 16 * MAX_GROUP_BYTES;
 /// commits may be decided and not yet published at once; a commit that
 /// finds it full brings the oldest of them through first.
 pub(crate) fn commit_ring_capacity() -> usize {
-    std::thread::available_parallelism()
-        .map(|n| n.get().saturating_mul(4))
-        .unwrap_or(16)
+    crate::per_thread::parallelism()
+        .saturating_mul(4)
         .clamp(256, 1024)
 }
 

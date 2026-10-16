@@ -49,9 +49,8 @@ const WIDTH_UNKNOWN: usize = 0;
 /// of the process, so a structure sized by it once always covers every
 /// number [`index`] returns.
 ///
-/// The first call asks the OS for the available parallelism; every later
-/// call is one relaxed load. Two threads racing on the first call compute
-/// the same value.
+/// The first call reads [`parallelism`]; every later call is one relaxed
+/// load. Two threads racing on the first call compute the same value.
 pub(crate) fn width() -> usize {
     static WIDTH: crate::portability::AtomicUsize =
         crate::portability::AtomicUsize::new(WIDTH_UNKNOWN);
@@ -59,11 +58,29 @@ pub(crate) fn width() -> usize {
     if known != WIDTH_UNKNOWN {
         return known;
     }
-    let parallelism = std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
-    let width = width_for(parallelism, crate::env::PLATFORM_THREADS);
+    let width = width_for(parallelism(), crate::env::PLATFORM_THREADS);
     WIDTH.store(width, crate::portability::Ordering::Relaxed);
     width
 }
+
+/// The machine's available parallelism, at least 1, asked of the OS once
+/// per process. Every sizing by the core count reads it here.
+///
+/// On Linux the OS answer reads the cgroup's CPU quota, about a dozen
+/// system calls; an open of a database sizes its commit ring by it, and
+/// a process that opens many databases must not pay them each time.
+pub(crate) fn parallelism() -> usize {
+    static PARALLELISM: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *PARALLELISM.get_or_init(|| {
+        #[cfg(test)]
+        OS_ASKED.fetch_add(1, crate::portability::Ordering::Relaxed);
+        std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get)
+    })
+}
+
+/// Test-only: how many times [`parallelism`] asked the OS.
+#[cfg(test)]
+static OS_ASKED: crate::portability::AtomicUsize = crate::portability::AtomicUsize::new(0);
 
 /// The width for a machine with `parallelism` cores, on a target that has
 /// other threads (`threads`) or only this one.
@@ -246,6 +263,23 @@ mod tests {
         let width = width();
         assert!(width.is_power_of_two() && width <= MAX_WIDTH);
         assert_eq!(width, super::width(), "fixed for the process");
+    }
+
+    /// Sizing by the core count, the commit ring an open builds included,
+    /// asks the OS once per process, not once per call.
+    #[test]
+    fn the_os_is_asked_for_the_parallelism_once() {
+        let cores = parallelism();
+        assert!(cores >= 1);
+        for _ in 0..8 {
+            assert_eq!(parallelism(), cores);
+            assert_eq!(
+                crate::engine::commit::commit_ring_capacity(),
+                cores.saturating_mul(4).clamp(256, 1024)
+            );
+            let _ = width();
+        }
+        assert_eq!(OS_ASKED.load(crate::portability::Ordering::Relaxed), 1);
     }
 
     #[test]

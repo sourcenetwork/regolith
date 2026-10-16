@@ -274,25 +274,21 @@ pub(crate) fn stage_durably(env: &Arc<dyn Env>, path: &Path, stamp: &[u8]) -> io
     crate::env::sync_parent_dir(&**env, path)
 }
 
-/// Remove the staging files [`create_durably`] leaves in `wal_dir` when a
-/// crash comes before the rename: no log was ever named by one, so nothing
-/// in them is needed. Called by a read-write open, which holds the
-/// directory lock, so no creation is in progress. Each one is removed as
-/// the walk reaches it, so the walk holds one entry at a time.
-pub(crate) fn remove_staged(env: &dyn Env, wal_dir: &Path) -> io::Result<()> {
-    if !env.exists(wal_dir) {
-        return Ok(());
+/// Whether `path` is a staging file [`create_durably`] leaves when a crash
+/// comes before the rename: no log was ever named by one, so nothing in it
+/// is needed.
+pub(crate) fn is_staged(path: &Path) -> bool {
+    path.extension().is_some_and(|ext| ext == "tmp")
+}
+
+/// Remove the staging file at `path` ([`is_staged`]). A read-write open
+/// removes each one its walk of the log directory reaches
+/// (`wal_scan::live_removing_staged`).
+pub(crate) fn remove_staged(env: &dyn Env, path: &Path) -> io::Result<()> {
+    match env.remove_file(path) {
+        Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e),
+        _ => Ok(()),
     }
-    for entry in env.read_dir(wal_dir)? {
-        let entry = entry?;
-        if entry.path.extension().is_some_and(|ext| ext == "tmp") {
-            match env.remove_file(&entry.path) {
-                Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e),
-                _ => {}
-            }
-        }
-    }
-    Ok(())
 }
 
 /// Bytes a sealed CLOSE record's payload holds: an empty sealed frame.

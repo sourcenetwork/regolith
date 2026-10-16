@@ -474,6 +474,12 @@ impl BlockCache {
         self.io.get_or_init(IoRuntime::new)
     }
 
+    /// The table of reads in flight, if anything made it: a database that
+    /// never opened a queue or read through one has none.
+    pub(crate) fn opened_io(&self) -> Option<&IoRuntime> {
+        self.io.get()
+    }
+
     /// `close`: hand every queue waiting on a read its completion now. A
     /// database that never opened a queue has nothing to do.
     pub(crate) fn close_io(&self) {

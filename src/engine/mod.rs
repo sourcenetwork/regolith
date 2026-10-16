@@ -49,6 +49,7 @@ pub mod loom_model;
 pub(crate) mod manifest;
 pub(crate) mod memtable;
 pub(crate) mod merge_call;
+mod merge_chain;
 pub(crate) mod open_transactions;
 pub(crate) mod orphan_sweep;
 #[cfg(all(test, not(loom)))]
@@ -61,7 +62,7 @@ pub(crate) mod range_tombstone;
 pub(crate) mod read_horizon;
 mod read_rule;
 pub(crate) mod read_view;
-mod reclaim;
+pub(crate) mod reclaim;
 mod recovery;
 pub(crate) mod seal;
 pub(crate) mod skiplist;
@@ -300,8 +301,7 @@ fn apply_batch_op_to_memtable<'a>(
 /// One version of a key: its sequence, value type and value.
 pub(crate) type KeyVersion = (u64, u8, DbSlice);
 
-/// A key's visible versions, newest first, through its first terminator.
-pub(crate) type MergeChain = Vec<KeyVersion>;
+pub(crate) use merge_chain::MergeChain;
 
 struct MultiGetEntry {
     key: Vec<u8>,
@@ -709,8 +709,7 @@ impl RegolithEngine {
             options.max_write_buffer_number,
         );
         let memtable = Arc::new(MemTable::new(&memtable_config)?);
-        wal_seal::remove_staged(&*env, &wal_dir)?;
-        let wal_files = wal_scan::live(&*env, &wal_dir, version.min_wal_id)?;
+        let wal_files = wal_scan::live_removing_staged(&*env, &wal_dir, version.min_wal_id)?;
 
         let (latest_seq, discarded) = replay_logs(
             &env,
@@ -743,12 +742,6 @@ impl RegolithEngine {
         let (log, log_end) = wal.into_log()?;
 
         let versions = Arc::new(VersionStore::new(version_set));
-        let view = Arc::new(ReadViewCell::new(ReadView {
-            active: Arc::clone(&memtable),
-            frozen: Vec::new(),
-            version: versions.current(),
-        }));
-        versions.attach_view(Arc::clone(&view));
 
         // The new log holds every write the replayed ones did, so they are
         // retired with the logs flushes left behind. Recorded unsynced: if
@@ -763,12 +756,23 @@ impl RegolithEngine {
         // delete check records it here too, synced for the same reason (RED
         // `CheckBeforeLog`); a new database records it unsynced, having
         // nothing to copy.
+        //
+        // Applied before the view exists, so the view starts at the version
+        // this records and the open publishes no view of its own: a
+        // publication retires the view it replaces, which costs a padded
+        // reclamation batch (`reclaim::submit`) on every open.
         versions.run(|versions| {
             versions.apply(&[
                 VersionEdit::SetNextFileId(wal_id + 1),
                 VersionEdit::SetMinWalId(wal_id),
             ])
         })?;
+        let view = Arc::new(ReadViewCell::new(ReadView {
+            active: Arc::clone(&memtable),
+            frozen: Vec::new(),
+            version: versions.current(),
+        }));
+        versions.attach_view(Arc::clone(&view));
         let tables_demoted_at_open = moved.map_or(0, |moved| moved.tables);
         if let Some(moved) = moved {
             report_demoted_tables(&options, &manifest_path, moved, false);
@@ -1117,6 +1121,15 @@ impl RegolithEngine {
         crate::env::elapsed_micros(&*self.env, start)
     }
 
+    /// The start reading of a latency sample, or `None` when no latency
+    /// histogram is recorded: no statistics, or statistics at
+    /// [`crate::StatsLevel::ExceptTimers`]. Then no clock is read.
+    fn timer_start(&self) -> Option<u64> {
+        self.statistics()
+            .filter(|stats| stats.timed())
+            .and_then(|_| self.env.now_micros())
+    }
+
     pub(crate) fn snapshot_seq(&self) -> u64 {
         self.visible_seq.visible()
     }
@@ -1358,6 +1371,29 @@ impl RegolithEngine {
     /// queues, for this database.
     pub(crate) fn io(&self) -> &io::IoRuntime {
         self.cache.io()
+    }
+
+    /// The calling thread's queue on this database, if it has one open
+    /// ([`io::IoRuntime::current_queue`]). A queue is opened through the
+    /// queue table, so a database without one has no queue for any thread,
+    /// and asking does not make the table: a plain write that owes a step
+    /// asks, and a database no queue was opened on would otherwise build the
+    /// table (and free it at close) for that answer.
+    pub(crate) fn current_queue(&self) -> Option<Arc<io::shared::QueueShared>> {
+        self.cache.opened_io()?.current_queue()
+    }
+
+    /// Run `job`, which this thread claimed, whatever scope the caller is
+    /// in, then drop it from the job table ([`io::IoRuntime::run_job`]).
+    /// Only a queue lists a job there, through the table, so a database no
+    /// queue was opened on has nothing to drop, and the unit a close runs
+    /// does not build the table to find that out. Looked at after the run,
+    /// so a queue opened meanwhile is not missed.
+    pub(crate) fn run_job(&self, job: &Arc<io::job::Job>) {
+        io::run_claimed(job);
+        if let Some(io) = self.cache.opened_io() {
+            io.forget_job(job);
+        }
     }
 
     /// A new I/O queue for one thread, on this database's block cache.
@@ -1798,7 +1834,7 @@ impl RegolithEngine {
         // first order, stopping at (and including) the first
         // terminator (`VALUE` or `DELETION`). Range tombstones that
         // cover the key are treated as virtual deletion terminators.
-        let mut chain: MergeChain = Vec::new();
+        let mut chain = MergeChain::default();
         // The chain is the result; where the walk ended adds nothing to it.
         let _ = view.walk_newest_first(
             lk.prefixed_user_key(),
@@ -1814,10 +1850,11 @@ impl RegolithEngine {
                 // Entries are newest first, so a range tombstone hides the
                 // first entry at or below it and every older one: it stands
                 // in as the terminator.
-                if let Some(hidden) = chain[start..]
+                let hidden = chain
                     .iter()
-                    .position(|entry| entry.0 <= max_rt_seq)
-                {
+                    .skip(start)
+                    .position(|entry| entry.0 <= max_rt_seq);
+                if let Some(hidden) = hidden {
                     chain.truncate(start + hidden);
                     chain.push((max_rt_seq, VALUE_TYPE_DELETION, DbSlice::empty()));
                     return Ok(ControlFlow::Break(()));
@@ -1856,6 +1893,18 @@ impl RegolithEngine {
 
         let key = lk.prefixed_user_key();
         let mut chain = self.merge_chain_in_view(lk, view)?;
+        // Nearly every key's newest visible version is its value or its
+        // deletion, with no operand above it: that version is the answer.
+        if chain.len() <= 1
+            && chain
+                .last()
+                .is_none_or(|version| version.1 != VALUE_TYPE_MERGE)
+        {
+            return Ok(match chain.pop() {
+                Some((_, VALUE_TYPE_VALUE, value)) => Some(value),
+                _ => None,
+            });
+        }
         // Materialize the chain. `chain` is newest-first; the last
         // entry (if any) is either a real VALUE / DELETION terminator
         // or (if !terminated) the oldest visible merge operand.
@@ -1874,10 +1923,11 @@ impl RegolithEngine {
             chain.len()
         };
         let mut operands_owned: Vec<&[u8]> = Vec::with_capacity(merge_end);
-        for entry in chain[..merge_end].iter().rev() {
+        operands_owned.extend(chain.iter().take(merge_end).map(|entry| {
             debug_assert_eq!(entry.1, VALUE_TYPE_MERGE);
-            operands_owned.push(entry.2.as_slice());
-        }
+            entry.2.as_slice()
+        }));
+        operands_owned.reverse();
 
         if operands_owned.is_empty() {
             // No merges at all - the chain is just a plain
@@ -2334,7 +2384,7 @@ impl RegolithEngine {
     /// the error that says waiting would not end.
     fn stopped(&self, reason: &'static str) -> Result<(), crate::Error> {
         self.stop_holds_for_good(reason)?;
-        let queue = self.io().current_queue();
+        let queue = self.current_queue();
         if self.writers_relieve() {
             match &queue {
                 None => return self.relieve_inline(Self::MAX_INLINE_PASSES),
@@ -2407,7 +2457,7 @@ impl RegolithEngine {
         };
         self.stop_holds_for_good(reason)?;
         if self.writers_relieve()
-            && let Some(queue) = self.io().current_queue()
+            && let Some(queue) = self.current_queue()
         {
             self.leave_stall_step(&queue);
         }

@@ -26,6 +26,8 @@ pub(crate) struct Recording {
     pub ops: Vec<String>,
     /// The name of every thread spawned, in order.
     pub spawned: Vec<String>,
+    /// Every directory listed, in order.
+    pub listed: Vec<std::path::PathBuf>,
 }
 
 #[derive(Debug, Default)]
@@ -184,6 +186,7 @@ impl Env for RecordingEnv {
         self.inner.create_dir_all(path)
     }
     fn read_dir(&self, path: &Path) -> io::Result<ReadDir<'_>> {
+        self.events.lock().unwrap().listed.push(path.to_path_buf());
         self.inner.read_dir(path)
     }
     fn open_read(&self, path: &Path) -> io::Result<Box<dyn ReadFile>> {

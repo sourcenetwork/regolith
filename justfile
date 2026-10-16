@@ -396,7 +396,25 @@ loom-gate:
     RUSTFLAGS="--cfg loom" cargo test --release --test loom_gate --no-run
     RUSTFLAGS="--cfg loom" timeout 10m cargo test --release --test loom_gate
 
-loom-all: loom loom-debug loom-sync loom-io loom-snapshots loom-view loom-cache loom-tombstones loom-tables loom-locks loom-gate loom-pipeline
+# Loom models for the slots close finds open transactions in (claim_slots.rs):
+# every reference dropped once by its owner or close, a claim listed before
+# close began found, no ABA on the free stack, and a pushed slot's link
+# seen by its taker, driving the production table; six calibrations must
+# fail. Measured at 2.4s in all, the largest at about 35,000 interleavings.
+loom-claims:
+    RUSTFLAGS="--cfg loom" cargo test --release --test loom_claim_slots --no-run
+    RUSTFLAGS="--cfg loom" timeout 5m cargo test --release --test loom_claim_slots
+
+# Loom models for an in-memory file's extents (mem_file.rs, extent.rs),
+# transcribed because kovan's Atom and the raw byte copies are invisible to
+# loom: a read racing growth in place, two appends, a copy walking a growing
+# chain, an extension read as zeros, a read racing a replacement; five
+# calibrations must fail. Measured at 0.5s in all.
+loom-mem-file:
+    RUSTFLAGS="--cfg loom" cargo test --release --test loom_mem_file --no-run
+    RUSTFLAGS="--cfg loom" timeout 5m cargo test --release --test loom_mem_file
+
+loom-all: loom loom-debug loom-sync loom-io loom-snapshots loom-view loom-cache loom-tombstones loom-tables loom-locks loom-gate loom-pipeline loom-claims loom-mem-file
 
 # The read-view chaos workload at a larger size than `cargo test` runs it:
 # 4 instances x 2 rounds x 120 versions by default, against 2 x 1 x 50.
@@ -848,6 +866,19 @@ tla:
     check MC_ShardedStats_Green                        GREEN
     check MC_ShardedStats_Red_LostUpdate               RED QuiescentExact
     check MC_ShardedStats_Red_PartialRead              RED ReadBetween
+    # A histogram sample's skipped updates (statistics.rs, HistogramData::record):
+    # a sample of 0 leaves the sum alone, and the minimum and maximum are
+    # loaded and moved only when the sample lies outside them; three threads
+    # share one shard. Green_ReachesStaleSkip is a witness: a skip on a bound
+    # another thread has since moved is reached. Lean:
+    # Regolith/HistogramBounds.lean, minRun_eq, maxRun_eq, sumRun_eq.
+    spec=HistogramBounds
+    check MC_HistogramBounds_Green                     GREEN
+    check MC_HistogramBounds_Red_StoreAfterSkip        RED MinExact
+    check MC_HistogramBounds_Red_WrongDirection        RED MinExact
+    check MC_HistogramBounds_Red_MaxStoreAfterSkip     RED MaxExact
+    check MC_HistogramBounds_Red_SumLoadStore          RED SumExact
+    check MC_HistogramBounds_Green_ReachesStaleSkip    RED NeverSkipsStale
     # E10 and 4.7, the lock-free commit pipeline as built: helping, voiding,
     # the check in two parts (early, then in ring order), the round (one
     # claim on the log's device step), the rollback of a failed log, ordered
@@ -1252,6 +1283,27 @@ tla:
     check MC_TxnCallbacks_Red_DeliverNoClaim           RED AtMostOnce
     check MC_TxnCallbacks_Red_HelperDelivers           RED OnCommittingThread
     check MC_TxnCallbacks_Red_CloseNoClaim             RED AtMostOnce
+    # The slots close finds the open transactions' claims in (claim_slots.rs):
+    # a lock-free free stack with an ABA tag, one swap deciding who drops a
+    # claim, and a drain that sees every claim listed when it began. The
+    # Green_Reaches rows are witnesses: each GREEN run reaches its race.
+    # Lean: Regolith/ClaimSlots.lean, place_bijective (every slot in one
+    # chunk cell, for every size) and no_aba (the tag's bound); loom:
+    # `just loom-claims`.
+    spec=ClaimSlots
+    check MC_ClaimSlots_Green                          GREEN
+    check MC_ClaimSlots_Green_Reuse                    GREEN
+    check MC_ClaimSlots_Green_ReuseShared              GREEN
+    check MC_ClaimSlots_Green_ABA                      GREEN
+    check MC_ClaimSlots_Green_Full                     GREEN
+    check MC_ClaimSlots_Red_NoTag                      RED FreeStackSound
+    check MC_ClaimSlots_Red_GiveBackFirst              RED CellBelongsToHolder
+    check MC_ClaimSlots_Red_TakeByLoad                 RED DroppedOnce
+    check MC_ClaimSlots_Red_NoClamp                    RED DrainInBounds
+    check MC_ClaimSlots_Red_StopAtEmpty                RED LiveTakenByClose
+    check MC_ClaimSlots_Green_ReachesABA               RED NeverABA
+    check MC_ClaimSlots_Green_ReachesCloseFirst        RED NeverCloseFirst
+    check MC_ClaimSlots_Green_ReachesLateChunk         RED NeverLateChunk
     # 4.6, Phase 7b: the wait-free read view (D54). Lean:
     # Regolith/ReadView.lean, reachable_safe and cas_chain.
     spec=ReadView
@@ -1348,6 +1400,30 @@ tla:
     check MC_EnvFiles_Green_Rename                     GREEN
     check MC_EnvFiles_Red_RemoveFirst                  RED OpenFindsFile
     check MC_EnvFiles_Red_NoReload                     RED OpenFindsFile
+    # An in-memory file's extent as a chain of segments (mem_file/extent.rs):
+    # growth links a segment before it publishes the length, the room is
+    # zeroed where a write exposes it, a read holds its extent across the
+    # copy, and a replaced large extent is submitted to the reclaimer after
+    # the writer lets go. Red_NoSubmit breaks LargeFreed, a property of whole
+    # runs. Lean: Regolith/MemFileExtents.lean, pieces_exact (a range cut
+    # into pieces inside their segments, no gap or overlap, for every chain)
+    # and grow_doubling; loom: `just loom-mem-file`.
+    spec=MemFileExtents
+    check MC_MemFileExtents_Green_Appends              GREEN
+    check MC_MemFileExtents_Green_Extend               GREEN
+    check MC_MemFileExtents_Green_Shrink               GREEN
+    check MC_MemFileExtents_Green_Overwrite            GREEN
+    check MC_MemFileExtents_Green_Reclaim              GREEN
+    check MC_MemFileExtents_Red_NoZeroExtend           RED CurrentIsFile
+    check MC_MemFileExtents_Red_NoZeroGap              RED CurrentIsFile
+    check MC_MemFileExtents_Red_PublishFirst           RED CurrentIsFile
+    check MC_MemFileExtents_Red_OverwriteInPlace       RED CurrentIsFile
+    check MC_MemFileExtents_Red_ReadsRoom              RED ReadIsSnapshot
+    check MC_MemFileExtents_Red_ReadAfterRelease       RED NoUseAfterFree
+    check MC_MemFileExtents_Red_CapAfterDrop           RED NoUseAfterFree
+    check MC_MemFileExtents_Red_NoSubmit               RED LargeFreed
+    check MC_MemFileExtents_Green_ReachesGrowthRead    RED NeverReadsGrowing
+    check MC_MemFileExtents_Green_ReachesRetiredRead   RED NeverReadsRetired
     # MemEnv's rename racing other changes to the namespace: the rename marks
     # its source before it puts the file at the destination, so a removal or
     # a rename that moves the destination on cannot make it undo itself.

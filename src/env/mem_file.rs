@@ -4,24 +4,26 @@
 //! # Shape
 //!
 //! A file is one *extent* at a time, published through a [`kovan::Atom`]:
-//! a buffer with spare capacity and one state word holding the published
-//! length and two flags.
+//! a chain of buffers (`extent.rs`) and one state word holding the
+//! published length and two flags.
 //!
 //! - **Bytes below the published length never change.** A reader loads the
 //!   extent, loads the length (Acquire), and copies from below it, with no
 //!   lock and no retry, while writers work above it or on a new extent.
-//! - **An append in place.** A write at the end that fits the spare capacity
-//!   sets `WRITER` with one CAS, copies its bytes above the length, and
-//!   publishes the new length with a second CAS that clears the flag. The
-//!   bytes it copies are above every published length, so no reader can be
-//!   reading them.
+//! - **An append in place.** A write at the end sets `WRITER` with one CAS,
+//!   links one more buffer to the chain if the room runs out, copies its
+//!   bytes above the length, and publishes the new length with a second CAS
+//!   that clears the flag. The bytes it copies are above every published
+//!   length, so no reader can be reading them, and a growing file never
+//!   copies the bytes it already holds.
 //! - **Everything else copies.** An overwrite below the length, a shrink, or
-//!   an append past the capacity builds a new extent from the published
-//!   bytes, *freezes* the old one (a CAS that sets `FROZEN`, after which no
-//!   append can publish there), and swaps the new one in with a CAS on the
-//!   `Atom`. An append whose publishing CAS meets `FROZEN` lost the race and
-//!   writes again, on the new extent. The copy reads only below the length
-//!   it froze, never the bytes a concurrent appender may be writing.
+//!   an append that meets another append in place builds a new extent from
+//!   the published bytes, *freezes* the old one (a CAS that sets `FROZEN`,
+//!   after which no append can publish there), and swaps the new one in with
+//!   a CAS on the `Atom`. An append whose publishing CAS meets `FROZEN` lost
+//!   the race and writes again, on the new extent. The copy reads only below
+//!   the length it froze, never the bytes a concurrent appender may be
+//!   writing.
 //!
 //! - **An append at one length only.** The positional log of `MemEnv`
 //!   (`mem_log.rs`) appends a record only while the file is exactly as long
@@ -41,23 +43,26 @@
 
 #![allow(unsafe_code)]
 
-use std::cell::UnsafeCell;
 use std::io;
 
 use kovan::{Atom, AtomGuard};
 
-use crate::portability::{AtomicU64, Ordering};
+use crate::portability::Ordering;
+use extent::{Extent, MIN_CAPACITY};
+
+mod extent;
 
 /// The published length.
 const LEN: u64 = (1 << 62) - 1;
-/// An append in place holds the spare capacity.
+/// An append in place holds the room above the length.
 const WRITER: u64 = 1 << 62;
 /// A copy replaced or is replacing this extent: nothing more publishes here.
 const FROZEN: u64 = 1 << 63;
 
-/// The smallest buffer a file grows into, so a file of a few small appends
-/// does not reallocate on each.
-const MIN_CAPACITY: usize = 64;
+/// The capacity from which an extent a copy replaced is reclaimed promptly
+/// (`engine::reclaim`): such a copy rewrites a whole file, so the
+/// reclaimer's fixed cost is small beside it.
+const RECLAIM_PROMPTLY: usize = 64 * 1024;
 
 /// What a write costs the memory it is charged to, if anything: the OPFS
 /// mirror bounds its resident bytes, `MemEnv` charges nothing.
@@ -79,97 +84,6 @@ impl Charge for Free {
     }
 
     fn release(&self, _bytes: u64) {}
-}
-
-/// The same allocation, as cells a shared reference may write through.
-fn cells(bytes: Box<[u8]>) -> Box<[UnsafeCell<u8>]> {
-    // SAFETY: `UnsafeCell<u8>` is `repr(transparent)` over `u8`, so the
-    // slice has the same layout, and the box keeps its allocation.
-    unsafe { Box::from_raw(Box::into_raw(bytes) as *mut [UnsafeCell<u8>]) }
-}
-
-/// One buffer and its published length.
-struct Extent {
-    bytes: Box<[UnsafeCell<u8>]>,
-    state: AtomicU64,
-}
-
-// SAFETY: bytes below the published length are never written while the
-// extent can be reached (only read), and bytes at or above it are written
-// only by the one thread holding `WRITER`, which no reader reads: a reader
-// copies only below a length it loaded with Acquire, which the writer's
-// publishing CAS (Release) made visible after the bytes.
-unsafe impl Sync for Extent {}
-
-impl Extent {
-    fn with_capacity(capacity: usize) -> io::Result<Self> {
-        let mut bytes = Vec::new();
-        bytes.try_reserve_exact(capacity).map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::OutOfMemory,
-                format!("cannot hold a {capacity} byte file in memory"),
-            )
-        })?;
-        bytes.resize(capacity, 0);
-        Ok(Self {
-            bytes: cells(bytes.into_boxed_slice()),
-            state: AtomicU64::new(0),
-        })
-    }
-
-    fn capacity(&self) -> usize {
-        self.bytes.len()
-    }
-
-    fn base(&self) -> *mut u8 {
-        UnsafeCell::raw_get(self.bytes.as_ptr())
-    }
-
-    /// Copy `out.len()` published bytes starting at `at`.
-    ///
-    /// # Safety
-    ///
-    /// `at + out.len()` is at most a length this thread loaded from `state`
-    /// with Acquire ordering.
-    unsafe fn copy_out(&self, at: usize, out: &mut [u8]) {
-        // SAFETY: the range is published, so nothing writes it (see the
-        // `Sync` impl), and it lies within the buffer.
-        unsafe { std::ptr::copy_nonoverlapping(self.base().add(at), out.as_mut_ptr(), out.len()) }
-    }
-
-    /// Copy `src` into the buffer at `at`.
-    ///
-    /// # Safety
-    ///
-    /// The range is at or above every length published on this extent and
-    /// this thread holds `WRITER`, or the extent is not yet published.
-    unsafe fn copy_in(&self, at: usize, src: &[u8]) {
-        // SAFETY: the caller owns the range exclusively, and it lies within
-        // the buffer.
-        unsafe { std::ptr::copy_nonoverlapping(src.as_ptr(), self.base().add(at), src.len()) }
-    }
-
-    /// Zero `n` bytes at `at`.
-    ///
-    /// # Safety
-    ///
-    /// As [`Self::copy_in`].
-    unsafe fn zero(&self, at: usize, n: usize) {
-        // SAFETY: as `copy_in`.
-        unsafe { std::ptr::write_bytes(self.base().add(at), 0, n) }
-    }
-
-    /// Copy the first `n` bytes of `src` to the start of this extent.
-    ///
-    /// # Safety
-    ///
-    /// `n` is at most a length loaded from `src.state` with Acquire, and this
-    /// extent is not yet published.
-    unsafe fn copy_prefix(&self, src: &Extent, n: usize) {
-        // SAFETY: the source range is published and never written; the
-        // destination is this thread's alone. Two allocations, no overlap.
-        unsafe { std::ptr::copy_nonoverlapping(src.base(), self.base(), n) }
-    }
 }
 
 /// What a write does to the file.
@@ -226,7 +140,8 @@ impl Change<'_> {
             // SAFETY: forwarded from the caller.
             #[cfg(any(test, all(target_arch = "wasm32", target_os = "unknown")))]
             Change::At(_, buf) => unsafe { extent.copy_in(at, buf) },
-            // A new extent is zeroed; an extension in place zeroes below.
+            // What an extension exposes is zeroed where it is copied or
+            // extended in place, before the fill.
             Change::SetLen(_) => {}
         }
     }
@@ -262,22 +177,15 @@ impl MemFile {
     /// An empty file.
     pub(crate) fn new() -> Self {
         Self {
-            current: Atom::new(Extent {
-                bytes: Box::new([]),
-                state: AtomicU64::new(0),
-            }),
+            current: Atom::new(Extent::empty()),
         }
     }
 
     /// A file holding `bytes`.
     #[cfg(any(test, all(target_arch = "wasm32", target_os = "unknown")))]
     pub(crate) fn from_vec(bytes: Vec<u8>) -> Self {
-        let len = bytes.len() as u64;
         Self {
-            current: Atom::new(Extent {
-                bytes: cells(bytes.into_boxed_slice()),
-                state: AtomicU64::new(len),
-            }),
+            current: Atom::new(Extent::holding(bytes)),
         }
     }
 
@@ -384,15 +292,11 @@ impl MemFile {
                 return Ok((len, len));
             }
             let (at, end) = change.bounds(len)?;
-            let need = to_usize(end)?;
             let grow = end.saturating_sub(len);
             charge.reserve(grow)?;
-            let attempt = if state & (WRITER | FROZEN) == 0
-                && at == len
-                && end >= len
-                && need <= extent.capacity()
-            {
-                Ok(self.in_place(&extent, state, change, len, end))
+            let in_place = state & (WRITER | FROZEN) == 0 && at == len && end >= len;
+            let attempt = if in_place {
+                self.in_place(&extent, state, change, len, end)
             } else {
                 self.copy(&extent, state, change, at, len, end)
             };
@@ -400,6 +304,17 @@ impl MemFile {
                 Ok(true) => {
                     if end < len {
                         charge.release(len - end);
+                    }
+                    // A copy retired the extent it replaced. A large one is
+                    // handed to the reclaimer now, once this thread no
+                    // longer reaches it, rather than when enough other
+                    // retirements fill this thread's batch.
+                    let replaced = (!in_place).then(|| extent.capacity());
+                    drop(extent);
+                    if replaced.is_some_and(|capacity| capacity >= RECLAIM_PROMPTLY) {
+                        crate::engine::reclaim::submit();
+                        #[cfg(test)]
+                        SUBMITTED.with(|n| n.set(n.get() + 1));
                     }
                     return Ok((len, end));
                 }
@@ -414,8 +329,8 @@ impl MemFile {
         }
     }
 
-    /// Append at the end of `extent`, within its capacity. `false` when
-    /// another write got there first.
+    /// Append at the end of `extent`, linking more room when it runs out.
+    /// `false` when another write got there first.
     fn in_place(
         &self,
         extent: &AtomGuard<'_, Extent>,
@@ -423,15 +338,27 @@ impl MemFile {
         change: &Change<'_>,
         len: u64,
         end: u64,
-    ) -> bool {
+    ) -> io::Result<bool> {
+        let (from, to) = (to_usize(len)?, to_usize(end)?);
         if extent
             .state
             .compare_exchange(state, state | WRITER, Ordering::Acquire, Ordering::Relaxed)
             .is_err()
         {
-            return false;
+            return Ok(false);
         }
-        let (from, to) = (len as usize, end as usize);
+        // SAFETY: `WRITER` is held.
+        if let Err(err) = unsafe { extent.reserve(to) } {
+            // Give `WRITER` back. A copy that froze the extent meanwhile has
+            // taken the file elsewhere, and the word stays as it froze it.
+            let _ = extent.state.compare_exchange(
+                state | WRITER,
+                state,
+                Ordering::Release,
+                Ordering::Relaxed,
+            );
+            return Err(err);
+        }
         if let Change::SetLen(_) = change {
             // Bytes above the length may hold a lost attempt's bytes.
             // SAFETY: `WRITER` is held and the range is above the length.
@@ -444,12 +371,13 @@ impl MemFile {
         if let Some(hook) = BETWEEN_WRITE_AND_PUBLISH.with(|slot| slot.borrow_mut().take()) {
             hook();
         }
-        // Release: the bytes are visible to every reader that loads this
-        // length. Fails only when a copy froze the extent meanwhile.
-        extent
+        // Release: the bytes, and the room they were written to, are visible
+        // to every reader that loads this length. Fails only when a copy
+        // froze the extent meanwhile.
+        Ok(extent
             .state
             .compare_exchange(state | WRITER, end, Ordering::Release, Ordering::Relaxed)
-            .is_ok()
+            .is_ok())
     }
 
     /// Build a new extent holding the file after `change`, freeze `extent`,
@@ -464,8 +392,10 @@ impl MemFile {
         len: u64,
         end: u64,
     ) -> io::Result<bool> {
+        #[cfg(test)]
+        COPIED.with(|n| n.set(n.get() + 1));
         // Grows by doubling only when the bytes need more room; a copy for an
-        // overwrite or a lost race keeps the capacity it had.
+        // overwrite or a lost race keeps the capacity it had, in one segment.
         let need = to_usize(end)?;
         let capacity = if need <= extent.capacity() {
             extent.capacity()
@@ -475,10 +405,20 @@ impl MemFile {
         };
         let fresh = Extent::with_capacity(capacity)?;
         let kept = len.min(end) as usize;
+        // The bytes between the old end and the change's own bytes: an
+        // extension's whole range, a write past the end's gap. They read as
+        // zeros, and `fresh` holds nothing there yet.
+        let gap_end = match change {
+            Change::SetLen(_) => need,
+            _ => at as usize,
+        };
         // SAFETY: `kept <= len`, loaded with Acquire by the caller; `fresh`
         // is not published, so this thread owns all of it.
         unsafe {
             fresh.copy_prefix(extent, kept);
+            if gap_end > kept {
+                fresh.zero(kept, gap_end - kept);
+            }
             change.fill(&fresh, at as usize);
         }
         fresh.state.store(end, Ordering::Relaxed);
@@ -525,6 +465,26 @@ impl Default for MemFile {
     fn default() -> Self {
         Self::new()
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Replaced extents this thread handed to the reclaimer.
+    static SUBMITTED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Copies this thread built.
+    static COPIED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// How many replaced extents this thread has handed to the reclaimer.
+#[cfg(test)]
+fn submitted() -> usize {
+    SUBMITTED.with(std::cell::Cell::get)
+}
+
+/// How many copies this thread has built.
+#[cfg(test)]
+fn copied() -> usize {
+    COPIED.with(std::cell::Cell::get)
 }
 
 #[cfg(test)]

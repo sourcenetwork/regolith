@@ -4,24 +4,26 @@
 //!
 //! `close` aborts each of them (see `transaction::claim`), so a callback
 //! never waits on a caller that will not return. Nothing is listed for a
-//! transaction without callbacks or hooks, and the map is built by the first
-//! one that is, so a database that uses neither pays nothing.
+//! transaction without callbacks or hooks, and the table is built by the
+//! first one that is, so a database that uses neither pays nothing. Listing
+//! one is a slot taken and given back ([`claim_slots`]).
 //!
 //! A pessimistic database also lists its lock table here: `close` releases
 //! the key locks of the transactions it aborted and wakes every transaction
 //! waiting for a lock, which then fails with `Closed`.
 
+mod claim_slots;
+#[cfg(loom)]
+pub mod loom_model;
+
 use std::sync::{Arc, OnceLock};
 
-use kovan_map::HopscotchMap;
-
 use super::RegolithEngine;
-use crate::portability::{AtomicU64, Ordering};
 use crate::transaction::{Claim, LockTable};
+use claim_slots::ClaimSlots;
 
 pub(crate) struct OpenTransactions {
-    next_id: AtomicU64,
-    open: OnceLock<HopscotchMap<u64, Arc<Claim>>>,
+    open: OnceLock<ClaimSlots<Claim>>,
     /// The pessimistic lock table of the database, if it has one.
     locks: OnceLock<Arc<LockTable>>,
 }
@@ -29,25 +31,26 @@ pub(crate) struct OpenTransactions {
 impl OpenTransactions {
     pub(crate) fn new() -> Self {
         Self {
-            next_id: AtomicU64::new(0),
             open: OnceLock::new(),
             locks: OnceLock::new(),
         }
     }
 
-    pub(crate) fn next_id(&self) -> u64 {
-        self.next_id.fetch_add(1, Ordering::Relaxed)
+    /// A slot to list a claim in, with [`OpenTransactions::insert`]; see
+    /// [`ClaimSlots::reserve`].
+    pub(crate) fn reserve(&self) -> Option<u32> {
+        self.open.get_or_init(ClaimSlots::new).reserve()
     }
 
-    pub(crate) fn insert(&self, claim: Arc<Claim>) {
-        self.open
-            .get_or_init(HopscotchMap::new)
-            .insert(claim.id, claim);
+    /// List `claim` in the `slot` reserved for it.
+    pub(crate) fn insert(&self, slot: u32, claim: &Arc<Claim>) {
+        self.open.get_or_init(ClaimSlots::new).fill(slot, claim);
     }
 
-    pub(crate) fn remove(&self, id: u64) {
+    /// End the listing in `slot` and give the slot back.
+    pub(crate) fn remove(&self, slot: u32) {
         if let Some(open) = self.open.get() {
-            open.remove(&id);
+            open.remove(slot);
         }
     }
 
@@ -65,13 +68,13 @@ impl OpenTransactions {
     pub(crate) fn abort_all(&self, engine: &RegolithEngine) {
         let mut aborted = Vec::new();
         if let Some(open) = self.open.get() {
-            for (_, claim) in open.iter() {
+            open.drain(|claim| {
                 if claim.abort_for_close(engine)
                     && let Some(owner) = claim.lock_owner()
                 {
                     aborted.push(Arc::clone(owner));
                 }
-            }
+            });
         }
         if let Some(locks) = self.locks.get() {
             locks.close(&aborted);

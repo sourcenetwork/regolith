@@ -6,7 +6,7 @@ use std::io;
 use std::ops::ControlFlow;
 use std::sync::Arc;
 
-use super::super::MergeChain;
+use super::super::merge_chain::VersionSink;
 use super::super::source_walk::{Above, Skip};
 use super::{
     Block, BlockCache, DbSlice, LookupKey, SsTableReader, VALUE_TYPE_MERGE, decode_internal_key,
@@ -36,18 +36,21 @@ impl SsTableReader {
     /// the key does: a key with more operands than one block holds, which a
     /// pinned snapshot makes routine by keeping compaction from folding
     /// them, would otherwise lose the rest of its chain and its base.
-    pub(crate) fn collect_merge_chain(
+    pub(crate) fn collect_merge_chain<S>(
         &self,
         lk: &LookupKey,
         key_buf: &mut Vec<u8>,
         cache: &BlockCache,
-        out: &mut MergeChain,
-    ) -> io::Result<bool> {
+        out: &mut S,
+    ) -> io::Result<bool>
+    where
+        S: VersionSink,
+    {
         let terminated = self.scan_key(lk, key_buf, cache, |block, seq, vt, offset, len| {
             let Some(value) = DbSlice::from_block(Arc::clone(block), offset, len) else {
                 return ControlFlow::Break(Err(invalid_data("block value extends past block")));
             };
-            out.push((seq, vt, value));
+            out.push_version((seq, vt, value));
             if vt != VALUE_TYPE_MERGE {
                 ControlFlow::Break(Ok(()))
             } else {

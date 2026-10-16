@@ -1711,7 +1711,9 @@ fn perform_compaction_to(
         s.add(crate::statistics::Ticker::CompactionCount, 1);
         s.add(crate::statistics::Ticker::CompactionBytesRead, bytes_in);
         s.add(crate::statistics::Ticker::CompactionBytesWritten, bytes_out);
-        if let Some(micros) = crate::env::elapsed_micros(&*opts.env, compaction_start) {
+        if s.timed()
+            && let Some(micros) = crate::env::elapsed_micros(&*opts.env, compaction_start)
+        {
             s.record(crate::statistics::Histogram::CompactionTime, micros);
         }
     }

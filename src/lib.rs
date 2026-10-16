@@ -127,7 +127,7 @@ pub use rate_limiter::{Priority, RateLimiter, TokenBucketRateLimiter};
 pub use slice::DbSlice;
 pub use snapshot_wait::SnapshotWait;
 pub use sst_file_writer::{IngestOptions, SstFileMeta, SstFileWriter};
-pub use statistics::{Histogram, HistogramSnapshot, Statistics, Ticker};
+pub use statistics::{Histogram, HistogramSnapshot, Statistics, StatsLevel, Ticker};
 pub use stream_writer::{StreamOptions, StreamingWriter};
 pub use tailing::TailingIter;
 pub use transaction::{
@@ -176,6 +176,7 @@ pub mod loom_exports {
         arena, families, gate, handoff, io_queue, jobs, park, skiplist, slice, snapshots, step,
         tombstones, version,
     };
+    pub use crate::engine::open_transactions::loom_model as claim_slots;
     pub use crate::env::open_file_limit::loom_model as open_files;
     pub use crate::sync::loom_model as sync;
     pub use crate::transaction::lock_loom as locks;

@@ -4,7 +4,7 @@
 
 use std::ops::ControlFlow;
 
-use super::super::MergeChain;
+use super::super::merge_chain::VersionSink;
 use super::{DbSlice, LookupKey, MemTable, NodeRef, VALUE_TYPE_MERGE, decode_internal_key};
 
 /// Visits one entry of a key in a memtable: its node, sequence and value type.
@@ -53,9 +53,12 @@ impl MemTable {
     ///
     /// Used by the merge-operator read path to collect a chain of
     /// merge operands layered on top of the underlying base value.
-    pub(crate) fn collect_merge_chain(&self, lk: &LookupKey, out: &mut MergeChain) -> bool {
+    pub(crate) fn collect_merge_chain<S>(&self, lk: &LookupKey, out: &mut S) -> bool
+    where
+        S: VersionSink,
+    {
         self.scan_key(lk, |node, seq, value_type| {
-            out.push((seq, value_type, self.value_slice(&node)));
+            out.push_version((seq, value_type, self.value_slice(&node)));
             if value_type != VALUE_TYPE_MERGE {
                 ControlFlow::Break(())
             } else {
