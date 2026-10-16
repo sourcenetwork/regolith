@@ -254,6 +254,10 @@ function scalars(doc){
   for(const p of m.allocs?.paths||[])
     add(`allocs.${p.path}`,`${p.path}`,p.achieved,"allocs/op",true);
 
+  for(const [family,data] of Object.entries(m.timings||{}))
+    for(const row of data.rows||[])
+      add(`timing.${family}.${row.key}`,`${family}: ${row.name}`,row.median,row.unit,!row.higher_is_better);
+
   return out;
 }
 
@@ -394,6 +398,25 @@ function isolationSection(cur,base,threshold){
         "Contended throughput across "+levels.join(" -> ")+", left to right.",
         lineChart(series,{xlab:levels.join("  |  "),ylab:"commits/s"}))}
   </div>`;
+}
+
+function timingSection(cur,base){
+  const names=["transaction","scan_commit","append","read_rules","txn_callbacks","sync"];
+  const current=cur?.metrics?.timings||{}, previous=base?.metrics?.timings||{};
+  const cards=[...new Set([...names,...Object.keys(current),...Object.keys(previous)])].map(name=>{
+    const family=current[name]||{}, old=new Map((previous[name]?.rows||[]).map(row=>[row.key,row]));
+    const rows=(family.rows||[]).map(row=>{
+      const range=row.invalid_reason||(Number.isFinite(row.min)&&Number.isFinite(row.max)
+        ? `${fmt(row.min)} to ${fmt(row.max)}` : "not recorded");
+      return `<tr><td>${esc(row.name)}</td><td class="num">${fmt(old.get(row.key)?.median)}</td>`
+        +`<td class="num">${fmt(row.median)}</td><td>${esc(row.unit)}</td><td>${esc(range)}</td></tr>`;
+    });
+    return rows.length ? card(name.replaceAll("_"," "),
+      "Point estimates without an observed range cannot establish a performance change.",
+      `<table><thead><tr><th>Workload</th><th>Baseline</th><th>This run</th><th>Unit</th><th>Observed range</th></tr></thead>`
+      +`<tbody>${rows.join("")}</tbody></table>`,family.trust) : gap(name,name+" timing measurements");
+  });
+  return `<h2>Transaction and mechanism timings</h2><div class="grid">${cards.join("")}</div>`;
 }
 
 function correctnessSection(cur,base,threshold){
@@ -713,6 +736,7 @@ function draw(){
      section("Overview",()=>overview(cur,base,th))
     +section("Throughput",()=>throughputSection(cur,base,th))
     +section("Transaction isolation",()=>isolationSection(cur,base,th))
+    +section("Transaction and mechanism timings",()=>timingSection(cur,base))
     +section("Transaction correctness",()=>correctnessSection(cur,base,th))
     +section("Resident memory",()=>rssSection(cur,base,th))
     +section("Binary size",()=>sizeSection(cur,base,th))
