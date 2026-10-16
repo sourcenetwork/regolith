@@ -85,7 +85,9 @@
 \*   - The room: an append in place that runs out of it links more
 \*     (src/env/mem_file/extent.rs) while it holds WRITER, above the
 \*     published length, which is the in-place write modelled here; and
-\*     here a writer may take either path at any time.
+\*     here a writer may take either path at any time. MemFileExtents.tla
+\*     models the bytes: the chain of segments, the zeroing of room a write
+\*     exposes, and the reclamation of a replaced extent.
 \*   - Memory ordering: the CAS steps are atomic here; the code's Acquire
 \*     and Release make them so.
 \*   - An append at one length only (MemFile::append_at, which the

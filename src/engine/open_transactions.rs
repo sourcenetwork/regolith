@@ -13,6 +13,8 @@
 //! waiting for a lock, which then fails with `Closed`.
 
 mod claim_slots;
+#[cfg(loom)]
+pub mod loom_model;
 
 use std::sync::{Arc, OnceLock};
 

@@ -176,6 +176,7 @@ pub mod loom_exports {
         arena, families, gate, handoff, io_queue, jobs, park, skiplist, slice, snapshots, step,
         tombstones, version,
     };
+    pub use crate::engine::open_transactions::loom_model as claim_slots;
     pub use crate::env::open_file_limit::loom_model as open_files;
     pub use crate::sync::loom_model as sync;
     pub use crate::transaction::lock_loom as locks;

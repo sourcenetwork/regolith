@@ -12,9 +12,11 @@
 //! another thread may have dropped, and no reclamation scheme is needed.
 //! Only the transaction that took a slot gives it back, after it emptied it.
 
-use std::sync::{Arc, OnceLock};
+use std::marker::PhantomData;
+use std::sync::Arc;
 
-use crate::portability::{AtomicPtr, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use crate::sync::OnceCell;
+use crate::sync::internal::{AtomicPtr, AtomicU32, AtomicU64, AtomicUsize, Ordering, store_ptr};
 
 /// Slots in the first chunk; chunk `k` holds `FIRST << k`.
 const FIRST: usize = 64;
@@ -49,13 +51,42 @@ impl<T> Chunk<T> {
 
 /// The table of listed claims; `T` is the claim.
 pub(super) struct ClaimSlots<T> {
-    chunks: [OnceLock<Chunk<T>>; CHUNKS],
+    chunks: [OnceCell<Chunk<T>>; CHUNKS],
     /// The free stack: the top slot plus one in the low half, and in the high
     /// half a count of the changes made to it, so a compare-and-swap that
     /// read a top since popped and pushed back fails (ABA).
     free: AtomicU64,
     /// Slots ever handed out. Every one below this was handed out once.
     taken: AtomicUsize,
+    /// The claims are `Arc<T>`s handed between threads: the table is `Send`
+    /// and `Sync` only where they are.
+    claims: PhantomData<Arc<T>>,
+    /// The one step a loom calibration plants wrong.
+    #[cfg(loom)]
+    mutant: Mutant,
+}
+
+/// The steps a loom calibration can plant wrong, one at a time, so the
+/// models in `loom_model.rs` check this table and their calibrations fail on
+/// it.
+#[cfg(loom)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Mutant {
+    /// The production table.
+    None,
+    /// The free stack's word has no change count: a pop that read a top
+    /// since popped and pushed back succeeds (ABA).
+    NoTag,
+    /// A slot is emptied by a load and then a store, not one swap.
+    TakeByLoad,
+    /// `remove` gives the slot back before it empties it.
+    GiveBackFirst,
+    /// `fill` stores the claim with `Relaxed`, not `Release`.
+    RelaxedFill,
+    /// `remove` pushes the slot with `Relaxed`, not `Release`.
+    RelaxedPush,
+    /// `drain` stops at the first empty slot.
+    StopAtEmpty,
 }
 
 /// The chunk `slot` is in, and where in it.
@@ -68,16 +99,29 @@ fn place(slot: usize) -> (usize, usize) {
 impl<T> ClaimSlots<T> {
     pub(super) fn new() -> Self {
         Self {
-            chunks: std::array::from_fn(|_| OnceLock::new()),
+            chunks: std::array::from_fn(|_| OnceCell::new()),
             free: AtomicU64::new(0),
             taken: AtomicUsize::new(0),
+            claims: PhantomData,
+            #[cfg(loom)]
+            mutant: Mutant::None,
         }
+    }
+
+    /// A table with one step planted wrong, for a loom calibration.
+    #[cfg(loom)]
+    pub(super) fn with_mutant(mutant: Mutant) -> Self {
+        let mut slots = Self::new();
+        slots.mutant = mutant;
+        slots
     }
 
     /// The chunk and offset of a slot that was handed out.
     fn chunk(&self, slot: usize) -> (&Chunk<T>, usize) {
         let (chunk, at) = place(slot);
-        let chunk = self.chunks[chunk].get_or_init(|| Chunk::new(FIRST << chunk));
+        // Threads growing the table at once each build the chunk; one is
+        // kept and the others dropped, so no thread waits for another.
+        let chunk = self.chunks[chunk].get_or_init_racy(|| Chunk::new(FIRST << chunk));
         (chunk, at)
     }
 
@@ -91,9 +135,16 @@ impl<T> ClaimSlots<T> {
     /// Lists `claim` in `slot`, which the caller reserved.
     pub(super) fn fill(&self, slot: u32, claim: &Arc<T>) {
         let (chunk, at) = self.chunk(slot as usize);
-        chunk.claims[at].store(
+        let order = Ordering::Release;
+        #[cfg(loom)]
+        let order = match self.mutant {
+            Mutant::RelaxedFill => Ordering::Relaxed,
+            _ => order,
+        };
+        store_ptr(
+            &chunk.claims[at],
             Arc::into_raw(Arc::clone(claim)).cast_mut(),
-            Ordering::Release,
+            order,
         );
     }
 
@@ -102,14 +153,31 @@ impl<T> ClaimSlots<T> {
     pub(super) fn remove(&self, slot: u32) {
         let slot = slot as usize;
         let (chunk, at) = self.chunk(slot);
-        drop(take_claim(&chunk.claims[at]));
+        #[cfg(loom)]
+        if self.mutant == Mutant::GiveBackFirst {
+            self.give_back(chunk, at, slot);
+            drop(self.take_claim(&chunk.claims[at]));
+            return;
+        }
+        drop(self.take_claim(&chunk.claims[at]));
+        self.give_back(chunk, at, slot);
+    }
+
+    /// Pushes `slot`, which the caller holds and emptied, on the free stack.
+    fn give_back(&self, chunk: &Chunk<T>, at: usize, slot: usize) {
+        let order = Ordering::Release;
+        #[cfg(loom)]
+        let order = match self.mutant {
+            Mutant::RelaxedPush => Ordering::Relaxed,
+            _ => order,
+        };
         let mut head = self.free.load(Ordering::Relaxed);
         loop {
             chunk.below[at].store((head & TOP) as u32, Ordering::Relaxed);
-            let next = (head & !TOP).wrapping_add(TOP + 1) | (slot as u64 + 1);
+            let next = self.next_word(head, slot as u64 + 1);
             match self
                 .free
-                .compare_exchange_weak(head, next, Ordering::Release, Ordering::Relaxed)
+                .compare_exchange_weak(head, next, order, Ordering::Relaxed)
             {
                 Ok(_) => return,
                 Err(current) => head = current,
@@ -117,14 +185,29 @@ impl<T> ClaimSlots<T> {
         }
     }
 
+    /// The free stack's word after one change that leaves `top` on top: the
+    /// change count in the high half goes up by one.
+    fn next_word(&self, head: u64, top: u64) -> u64 {
+        #[cfg(loom)]
+        if self.mutant == Mutant::NoTag {
+            return (head & !TOP) | top;
+        }
+        (head & !TOP).wrapping_add(TOP + 1) | top
+    }
+
     /// Takes every claim still listed, emptying its slot; `visit` sees each
     /// once. A slot handed out while this runs may be missed.
     pub(super) fn drain(&self, mut visit: impl FnMut(Arc<T>)) {
         for slot in 0..self.taken.load(Ordering::Acquire).min(CAPACITY) {
             let (chunk, at) = place(slot);
-            if let Some(chunk) = self.chunks[chunk].get()
-                && let Some(claim) = take_claim(&chunk.claims[at])
-            {
+            let claim = self.chunks[chunk]
+                .get()
+                .and_then(|chunk| self.take_claim(&chunk.claims[at]));
+            #[cfg(loom)]
+            if claim.is_none() && self.mutant == Mutant::StopAtEmpty {
+                return;
+            }
+            if let Some(claim) = claim {
                 visit(claim);
             }
         }
@@ -141,7 +224,7 @@ impl<T> ClaimSlots<T> {
             let below = self.chunks[chunk]
                 .get()
                 .map_or(0, |chunk| chunk.below[at].load(Ordering::Relaxed));
-            let next = (head & !TOP).wrapping_add(TOP + 1) | u64::from(below);
+            let next = self.next_word(head, u64::from(below));
             match self
                 .free
                 .compare_exchange_weak(head, next, Ordering::Acquire, Ordering::Acquire)
@@ -153,23 +236,35 @@ impl<T> ClaimSlots<T> {
         let slot = self.taken.fetch_add(1, Ordering::AcqRel);
         (slot < CAPACITY).then_some(slot)
     }
+
+    /// Swaps the claim out of `cell`, taking the reference it held.
+    #[allow(unsafe_code)]
+    fn take_claim(&self, cell: &AtomicPtr<T>) -> Option<Arc<T>> {
+        #[cfg(loom)]
+        let claim = match self.mutant {
+            Mutant::TakeByLoad => {
+                let claim = cell.load(Ordering::Acquire);
+                cell.store(std::ptr::null_mut(), Ordering::Release);
+                claim
+            }
+            _ => cell.swap(std::ptr::null_mut(), Ordering::AcqRel),
+        };
+        #[cfg(not(loom))]
+        let claim = cell.swap(std::ptr::null_mut(), Ordering::AcqRel);
+        // SAFETY: a non-null pointer in a slot came from `Arc::into_raw` in
+        // `fill` and stands for one strong reference. The swap hands that
+        // reference to this caller alone: any other swap of the cell reads
+        // null until `fill` stores a new reference. (The `TakeByLoad`
+        // calibration breaks exactly this, and its model keeps the count
+        // above zero so the double drop it plants is caught, not freed.)
+        (!claim.is_null()).then(|| unsafe { Arc::from_raw(claim) })
+    }
 }
 
 impl<T> Drop for ClaimSlots<T> {
     fn drop(&mut self) {
         self.drain(drop);
     }
-}
-
-/// Swaps the claim out of `cell`, taking the reference it held.
-#[allow(unsafe_code)]
-fn take_claim<T>(cell: &AtomicPtr<T>) -> Option<Arc<T>> {
-    let claim = cell.swap(std::ptr::null_mut(), Ordering::AcqRel);
-    // SAFETY: a non-null pointer in a slot came from `Arc::into_raw` in
-    // `fill` and stands for one strong reference. The swap hands that
-    // reference to this caller alone: any other swap of the cell reads null
-    // until `fill` stores a new reference.
-    (!claim.is_null()).then(|| unsafe { Arc::from_raw(claim) })
 }
 
 #[cfg(test)]

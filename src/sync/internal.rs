@@ -44,9 +44,13 @@ pub(crate) use loom::sync::Arc;
 pub(crate) use std::sync::Arc;
 
 #[cfg(loom)]
-pub(crate) use loom::sync::atomic::{AtomicPtr, AtomicU8, AtomicU64, AtomicUsize, Ordering, fence};
+pub(crate) use loom::sync::atomic::{
+    AtomicPtr, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering, fence,
+};
 #[cfg(not(loom))]
-pub(crate) use std::sync::atomic::{AtomicPtr, AtomicU8, AtomicU64, AtomicUsize, Ordering, fence};
+pub(crate) use std::sync::atomic::{
+    AtomicPtr, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering, fence,
+};
 
 /// Take the pointer out of `atomic`, leaving null, through `&mut`: no other
 /// thread can reach the atomic, so this is a plain read and write and not a
@@ -68,6 +72,25 @@ pub(crate) fn take_ptr<T>(atomic: &mut AtomicPtr<T>) -> *mut T {
     {
         atomic.swap(std::ptr::null_mut(), Ordering::AcqRel)
     }
+}
+
+/// Store `value` into `atomic`: a plain store, except under loom, where it is
+/// a swap with the same ordering that drops what it reads.
+///
+/// loom 0.7 orders a plain store against another thread's read-modify-write
+/// of the same atomic only as far as the two threads' clocks do. A store and
+/// then a swap on one thread, racing a swap on another, then lets both swaps
+/// return the value from before the store, as if the store were not between
+/// them, which C11 forbids: a read-modify-write reads the value just before
+/// it in the atomic's one modification order. A swap that drops what it
+/// reads is the same store to every other thread, and loom orders it right.
+/// Use this where a store races a read-modify-write that a model checks.
+#[inline(always)]
+pub(crate) fn store_ptr<T>(atomic: &AtomicPtr<T>, value: *mut T, order: Ordering) {
+    #[cfg(not(loom))]
+    atomic.store(value, order);
+    #[cfg(loom)]
+    atomic.swap(value, order);
 }
 
 /// The point between the store and the load of one side of a handshake
