@@ -161,7 +161,7 @@ fn main() {
     common::write_family(
         "append",
         &format!(
-            "{{\"quick\":{quick},\"durability\":\"eventual\",\"append\":[{}],\
+            "{{\"quick\":{quick},\"reps\":{reps},\"durability\":\"eventual\",\"append\":[{}],\
              \"allocate\":{{\"latency_ns_p50\":{},\"latency_ns_p99\":{},\
              \"allocations_per_s_8_callers\":{}}}}}",
             rows.join(","),

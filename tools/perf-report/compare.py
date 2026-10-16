@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compare two schema v1 run files and decide what actually regressed.
+"""Compare schema v1 or v2 run files and decide what actually regressed.
 
 The hard part is not computing a percentage, it is refusing to report
 one that means nothing. A run recorded while the host was busy can shift
@@ -21,11 +21,15 @@ Three rules keep a verdict honest:
   reported as noise regardless.
 """
 
+from __future__ import annotations
+
 import argparse
 import json
 import pathlib
 import sys
 from dataclasses import dataclass, field
+
+import timings
 
 # Higher is better for these; lower is better for the rest.
 HIGHER_IS_BETTER = {"ops", "ops_per_s", "thrpt"}
@@ -70,7 +74,7 @@ class Report:
     def verdict(self):
         if self.regressions:
             return VERDICT_REGRESSED
-        if not self.deltas or all(d.verdict == VERDICT_UNVERIFIED for d in self.deltas):
+        if not self.deltas or self.unverified:
             return VERDICT_UNVERIFIED
         return VERDICT_PASS
 
@@ -106,34 +110,42 @@ def _classify(before, after, brange, arange, higher_is_better, threshold, reason
 
 
 def compare(base, cur, threshold=3.0):
+    for doc in (base, cur):
+        if doc.get("schema_version") not in (1, 2):
+            raise ValueError(f"unsupported schema_version {doc.get('schema_version')!r}")
     rep = Report()
 
     bt = base.get("metrics", {}).get("throughput", {})
     ct = cur.get("metrics", {}).get("throughput", {})
     unit = ct.get("unit", "ops/s")
-    for name, cw in ct.get("workloads", {}).items():
+    for name in sorted(set(bt.get("workloads", {})) | set(ct.get("workloads", {}))):
+        cw = ct.get("workloads", {}).get(name, {})
         bw = bt.get("workloads", {}).get(name, {})
-        cpts = {p["threads"]: p for p in cw.get("points", [])}
-        bpts = {p["threads"]: p for p in bw.get("points", [])}
+        cpts = {p["threads"]: p for p in timings.throughput_rows(cw)}
+        bpts = {p["threads"]: p for p in timings.throughput_rows(bw)}
+        if not cpts and not bpts:
+            rep.deltas.append(Delta("throughput", name, unit, None, None,
+                                    VERDICT_UNVERIFIED, reason="no comparable thread samples"))
         for threads in sorted(set(cpts) | set(bpts)):
             b, c = bpts.get(threads), cpts.get(threads)
-            reason = ""
+            reason = timings.reason(timings.throughput_config(bw), timings.throughput_config(cw), base, cur)
             if not _trusted(bw.get("trust")):
                 reason = f"baseline {name} is {bw.get('trust')}"
             elif not _trusted(cw.get("trust")):
                 reason = f"this run's {name} is {cw.get('trust')}"
             elif b is None or c is None:
                 reason = "only one run measured this thread count"
+            reason = reason or timings.row_reason(b, c)
             verdict, pct, why = _classify(
-                b.get("ops") if b else None,
-                c.get("ops") if c else None,
+                b.get("median") if b else None,
+                c.get("median") if c else None,
                 (b.get("min"), b.get("max")) if b and b.get("min") is not None else None,
                 (c.get("min"), c.get("max")) if c and c.get("min") is not None else None,
                 True, threshold, reason)
             rep.deltas.append(Delta(
                 family="throughput", name=f"{name} @ {threads}t", unit=unit,
-                before=b.get("ops") if b else None,
-                after=c.get("ops") if c else None,
+                before=b.get("median") if b else None,
+                after=c.get("median") if c else None,
                 verdict=verdict, pct=pct, reason=why or reason,
                 before_range=(b.get("min"), b.get("max")) if b else None,
                 after_range=(c.get("min"), c.get("max")) if c else None))
@@ -166,6 +178,33 @@ def compare(base, cur, threshold=3.0):
             unit="MiB", before=bmap.get(s.get("variant")), after=s.get("rss_peak_mib"),
             verdict=verdict, pct=pct, reason=why or reason, higher_is_better=False))
 
+    bf, cf = timings.families(base), timings.families(cur)
+    for family in sorted(set(timings.FAMILIES) | set(bf) | set(cf)):
+        before, after = bf.get(family), cf.get(family)
+        reason = timings.reason(before, after, base, cur)
+        if family not in timings.FAMILIES:
+            reason = "unknown timing family"
+        bm, cm = timings.indexed(before), timings.indexed(after)
+        keys = sorted(set(bm) | set(cm))
+        if not keys:
+            rep.deltas.append(Delta(family, family, "", None, None,
+                                    VERDICT_UNVERIFIED, reason=reason or "no timing rows collected"))
+        for key in keys:
+            b, c = bm.get(key), cm.get(key)
+            why = reason or timings.row_reason(b, c)
+            b, c = b or {}, c or {}
+            higher = c.get("higher_is_better", b.get("higher_is_better")) is True
+            verdict, pct, why = _classify(
+                b.get("median"), c.get("median"),
+                (b.get("min"), b.get("max")), (c.get("min"), c.get("max")),
+                higher, threshold, why)
+            rep.deltas.append(Delta(
+                family, c.get("name", b.get("name", key)), c.get("unit", b.get("unit", "")),
+                b.get("median"), c.get("median"), verdict, pct=pct, reason=why,
+                higher_is_better=higher,
+                before_range=(b.get("min"), b.get("max")),
+                after_range=(c.get("min"), c.get("max"))))
+
     rep.regressions = [d for d in rep.deltas if d.verdict == VERDICT_REGRESSED]
     rep.improvements = [d for d in rep.deltas if d.verdict == VERDICT_IMPROVED]
     rep.unverified = [d for d in rep.deltas if d.verdict == VERDICT_UNVERIFIED]
@@ -179,11 +218,16 @@ def main():
     ap.add_argument("--threshold", type=float, default=3.0,
                     help="percent change below which a delta is noise (default 3)")
     ap.add_argument("--fail-on-regression", action="store_true")
+    ap.add_argument("--require-complete", action="store_true",
+                    help="exit 2 when any metric cannot be verified")
     args = ap.parse_args()
 
     base = json.loads(pathlib.Path(args.baseline).read_text())
     cur = json.loads(pathlib.Path(args.current).read_text())
-    rep = compare(base, cur, args.threshold)
+    try:
+        rep = compare(base, cur, args.threshold)
+    except ValueError as error:
+        ap.error(str(error))
 
     for d in rep.regressions:
         print(f"REGRESSED  {d.name:32} {d.before:>12,.0f} -> {d.after:>12,.0f} "
@@ -192,11 +236,14 @@ def main():
         print(f"improved   {d.name:32} {d.before:>12,.0f} -> {d.after:>12,.0f} "
               f"{d.unit}  {d.pct:+.1f}%")
     if rep.unverified:
-        print(f"unverified {len(rep.unverified)} metric(s): not compared, see the report")
+        for d in rep.unverified:
+            print(f"unverified {d.name}: {d.reason}")
     print(f"verdict: {rep.verdict}")
 
     if args.fail_on_regression and rep.regressions:
         sys.exit(1)
+    if args.require_complete and rep.unverified:
+        sys.exit(2)
 
 
 if __name__ == "__main__":

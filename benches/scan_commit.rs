@@ -14,10 +14,11 @@ use std::time::Instant;
 
 use regolith::{IsolationLevel, OptimisticTransactionDb, TxnOptions};
 
-const LEVELS: [(IsolationLevel, &str); 3] = [
+const LEVELS: [(IsolationLevel, &str); 4] = [
     (IsolationLevel::SnapshotIsolation, "snapshot"),
     (IsolationLevel::RepeatableRead, "repeatable-read"),
     (IsolationLevel::Serializable, "serializable"),
+    (IsolationLevel::DefraLevel, "defralevel"),
 ];
 
 /// The scanned range. The transaction's own write sits outside it, so every
@@ -90,5 +91,11 @@ fn main() {
             ));
         }
     }
-    common::write_family("scan_commit", &format!("[{}]", rows.join(",")));
+    common::write_family(
+        "scan_commit",
+        &format!(
+            "{{\"quick\":{quick},\"reps\":{reps},\"rows\":[{}]}}",
+            rows.join(",")
+        ),
+    );
 }

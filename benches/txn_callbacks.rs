@@ -249,5 +249,11 @@ fn main() {
         );
     }
 
-    common::write_family("txn_callbacks", &format!("[{}]", rows.join(",")));
+    common::write_family(
+        "txn_callbacks",
+        &format!(
+            "{{\"quick\":{quick},\"blocks\":{blocks},\"ops_per_block\":{ops_per_block},\"rows\":[{}]}}",
+            rows.join(",")
+        ),
+    );
 }

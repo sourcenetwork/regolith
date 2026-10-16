@@ -8,6 +8,7 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 use crate::json::{self, Json};
 use crate::run_meta::die;
@@ -115,10 +116,17 @@ pub fn read_records(files: &[PathBuf]) -> Bag {
 /// Criterion's own estimates, folded in as supporting per-iteration timings
 /// beside the ops/s the throughput benches report themselves.
 pub fn criterion(trust: &str) -> Json {
+    criterion_since(trust, None, "")
+}
+
+/// Estimates produced by this invocation of one Criterion family. Earlier
+/// output and other benchmark groups must not become this run's samples.
+pub fn criterion_since(trust: &str, since: Option<SystemTime>, prefix: &str) -> Json {
     let root = PathBuf::from(std::env::var("CARGO_TARGET_DIR").unwrap_or_else(|_| "target".into()))
         .join("criterion");
     let mut found = Vec::new();
-    walk(&root, &root, 0, &mut found);
+    walk(&root, &root, 0, since, &mut found);
+    found.retain(|(id, _, _)| id.starts_with(prefix));
     found.sort_by(|a, b| a.0.cmp(&b.0));
 
     let benchmarks: Vec<Json> = found
@@ -147,7 +155,13 @@ pub fn criterion(trust: &str) -> Json {
     ])
 }
 
-fn walk(dir: &Path, root: &Path, depth: usize, out: &mut Vec<(String, f64, f64)>) {
+fn walk(
+    dir: &Path,
+    root: &Path,
+    depth: usize,
+    since: Option<SystemTime>,
+    out: &mut Vec<(String, f64, f64)>,
+) {
     if depth > 8 {
         return;
     }
@@ -165,7 +179,12 @@ fn walk(dir: &Path, root: &Path, depth: usize, out: &mut Vec<(String, f64, f64)>
         // saved baseline beside it are older copies of the same benchmark.
         if sub.file_name().is_some_and(|n| n == "new") {
             let est = sub.join("estimates.json");
-            if est.is_file() {
+            let fresh = since.is_none_or(|since| {
+                fs::metadata(&est)
+                    .and_then(|metadata| metadata.modified())
+                    .is_ok_and(|modified| modified >= since)
+            });
+            if est.is_file() && fresh {
                 let id = sub
                     .parent()
                     .and_then(|p| p.strip_prefix(root).ok())
@@ -176,7 +195,7 @@ fn walk(dir: &Path, root: &Path, depth: usize, out: &mut Vec<(String, f64, f64)>
             }
             continue;
         }
-        walk(&sub, root, depth + 1, out);
+        walk(&sub, root, depth + 1, since, out);
     }
 }
 
@@ -191,4 +210,36 @@ fn estimates(path: &Path) -> (f64, f64) {
             .unwrap_or_else(|| die(&format!("{}: no {k}.point_estimate", path.display())))
     };
     (point("mean"), point("median"))
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn earlier_criterion_output_is_not_a_sample_of_this_invocation() {
+        use super::*;
+        use std::time::Duration;
+
+        let dir = tempfile::tempdir().unwrap();
+        let new = dir.path().join("sync_uncontended/mutex/new");
+        fs::create_dir_all(&new).unwrap();
+        let path = new.join("estimates.json");
+        fs::write(
+            &path,
+            r#"{"mean":{"point_estimate":5},"median":{"point_estimate":4}}"#,
+        )
+        .unwrap();
+        let modified = fs::metadata(path).unwrap().modified().unwrap();
+        let mut rows = Vec::new();
+        walk(dir.path(), dir.path(), 0, Some(modified), &mut rows);
+        assert_eq!(rows, vec![("sync_uncontended/mutex".to_string(), 5.0, 4.0)]);
+        rows.clear();
+        walk(
+            dir.path(),
+            dir.path(),
+            0,
+            Some(modified + Duration::from_secs(1)),
+            &mut rows,
+        );
+        assert!(rows.is_empty(), "an earlier invocation's sample was reused");
+    }
 }

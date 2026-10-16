@@ -85,11 +85,12 @@ impl Flavor {
 /// read for update, `RepeatableRead` adds every point read, and `Serializable`
 /// adds the whole read set and so pays for the anti-dependency check that
 /// refuses write skew.
-const LEVELS: [(IsolationLevel, &str); 4] = [
+const LEVELS: [(IsolationLevel, &str); 5] = [
     (IsolationLevel::ReadCommitted, "read-committed"),
     (IsolationLevel::SnapshotIsolation, "snapshot"),
     (IsolationLevel::RepeatableRead, "repeatable-read"),
     (IsolationLevel::Serializable, "serializable"),
+    (IsolationLevel::DefraLevel, "defralevel"),
 ];
 
 fn with_db<R>(
@@ -477,7 +478,10 @@ fn main() {
 
     common::write_family(
         "transaction",
-        &format!("{{\"quick\":{quick},\"matrix\":[{}]}}", cells.join(",")),
+        &format!(
+            "{{\"quick\":{quick},\"reps\":{reps},\"matrix\":[{}]}}",
+            cells.join(",")
+        ),
     );
     common::write_family(
         "isolation",

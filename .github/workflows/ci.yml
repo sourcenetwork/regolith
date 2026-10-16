@@ -33,6 +33,19 @@ defaults:
 
 jobs:
 
+  perf-tools:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: python3 -m unittest discover -s tools/perf-report -p 'test_*.py' -v
+      - name: Build and exercise the collector
+        run: |
+          cargo build --bench collect --locked --message-format=json > "$RUNNER_TEMP/collect-build.jsonl"
+          python3 tools/perf-report/test_collect.py --build-log "$RUNNER_TEMP/collect-build.jsonl" -v
+
   # All three desktop and server hosts. Windows is not a formality here:
   # it is the only one of the three without `rustix`, so its file
   # locking, directory sync and positioned reads take different code in
@@ -363,7 +376,7 @@ jobs:
   # family and a failure names which one.
   bench:
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    needs: [test, clippy, fmt, doc, deny]
+    needs: [test, clippy, fmt, doc, deny, perf-tools]
     runs-on: ubuntu-latest
     timeout-minutes: 60
     strategy:
@@ -378,6 +391,11 @@ jobs:
           - batch
           - large_value
           - transaction
+          - scan_commit
+          - append
+          - read_rules
+          - txn_callbacks
+          - sync
           - memory
           - size
           - allocs
@@ -394,6 +412,11 @@ jobs:
         env:
           REGOLITH_BENCH_OUT: ${{ github.workspace }}/bench-${{ matrix.family }}.jsonl
         run: cargo bench --bench ${{ matrix.family }}
+      - name: Keep the benchmark runner's trust and provenance
+        run: >-
+          python3 tools/perf-report/stamp.py bench-${{ matrix.family }}.jsonl
+          --guard '${{ steps.guard.outcome }}'
+          --command cargo bench --bench ${{ matrix.family }}
       - uses: actions/upload-artifact@v4
         with:
           name: bench-${{ matrix.family }}

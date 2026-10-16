@@ -333,5 +333,11 @@ fn main() {
             "us",
         );
     }
-    common::write_family("read_rules", &format!("[{}]", rows.join(",")));
+    common::write_family(
+        "read_rules",
+        &format!(
+            "{{\"quick\":{quick},\"reps\":{reps},\"reads\":{reads},\"rows\":[{}]}}",
+            rows.join(",")
+        ),
+    );
 }
