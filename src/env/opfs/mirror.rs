@@ -117,10 +117,8 @@ impl Entry {
 
 /// The in-memory mirror of an OPFS-backed database.
 ///
-/// Every map is a lock-free kovan map and every file a lock-free
-/// `MemFile`, so no call takes a lock. A browser module runs this on one
-/// thread, where the persist's `await`s are the only interleaving; the
-/// atomics keep it correct beyond that too.
+/// Mutations use lock-free maps and files. Persistence batches are serialized
+/// across their browser awaits so an older manifest cannot replace a newer one.
 pub(super) struct MirrorFs {
     files: HashMap<PathBuf, Arc<Entry>>,
     dirs: HashMap<PathBuf, ()>,
@@ -129,6 +127,7 @@ pub(super) struct MirrorFs {
     deleted: HashMap<PathBuf, ()>,
     resident: Resident,
     next_version: AtomicU64,
+    persist_lock: crate::sync::Mutex<()>,
     mount: super::sah::MountId,
 }
 
@@ -216,6 +215,7 @@ impl MirrorFs {
                 max: max_resident,
             },
             next_version: AtomicU64::new(1),
+            persist_lock: crate::sync::Mutex::new_without_spin(()),
             mount,
         };
         for (path, data) in loaded {
@@ -312,7 +312,20 @@ impl MirrorFs {
 
     /// Write every dirty file back to OPFS, tables first and the MANIFEST
     /// last, then drop the deleted ones.
-    pub(super) async fn persist(&self) -> Result<(), JsValue> {
+    pub(super) async fn persist(self: &Arc<Self>) -> Result<(), JsValue> {
+        // Dropping a Rust future cannot cancel a browser write already in flight.
+        // Keep its batch and serialization guard alive until those writes finish.
+        let fs = Arc::clone(self);
+        let promise = wasm_bindgen_futures::future_to_promise(async move {
+            fs.persist_batch().await?;
+            Ok(JsValue::UNDEFINED)
+        });
+        wasm_bindgen_futures::JsFuture::from(promise).await?;
+        Ok(())
+    }
+
+    async fn persist_batch(&self) -> Result<(), JsValue> {
+        let _guard = self.persist_lock.lock().await;
         let (writes, deletes) = self.take_persist_batch();
         if writes.is_empty() && deletes.is_empty() {
             return Ok(());
@@ -328,7 +341,12 @@ impl MirrorFs {
         for path in &deletes {
             // A file deleted before it was ever persisted has no OPFS
             // entry; that is not an error.
-            let _ = js::remove_entry(&directory, &encode_name(path)).await;
+            if let Err(error) = js::remove_entry(&directory, &encode_name(path)).await {
+                let name = js_sys::Reflect::get(&error, &JsValue::from_str("name"))?;
+                if name.as_string().as_deref() != Some("NotFoundError") {
+                    return Err(error);
+                }
+            }
         }
 
         self.settle(&written, &deletes);
