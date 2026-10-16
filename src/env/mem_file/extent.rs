@@ -186,7 +186,10 @@ impl Extent {
     /// # Safety
     ///
     /// Every segment holding a byte of the range is linked.
-    unsafe fn pieces(&self, mut at: usize, n: usize, mut f: impl FnMut(*mut u8, usize, usize)) {
+    unsafe fn pieces<F>(&self, mut at: usize, n: usize, mut f: F)
+    where
+        F: FnMut(*mut u8, usize, usize),
+    {
         let mut done = 0;
         let mut segment = &self.first;
         while done < n {

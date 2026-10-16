@@ -94,7 +94,7 @@
 \*   Submit       change: `reclaim::submit()` at RECLAIM_PROMPTLY (314-318)
 \*   RLoad, RLen, RCopy, RRelease
 \*                read_exact_at / to_vec: load, `state.load(Acquire) & LEN`,
-\*                copy_out (extent.rs:220-229), the guard dropped (215-241)
+\*                copy_out (extent.rs:223-232), the guard dropped (215-241)
 \*   Free         kovan frees a retired extent nobody holds; FreeHanded is
 \*                the same for one submit() handed on, which kovan does
 \*                promptly
@@ -122,9 +122,25 @@
 \*   - How kovan decides that nobody holds an extent: its own contract. Here
 \*     Free needs no guard on the extent, which is that contract; what this
 \*     model checks is that regolith holds a guard across every use.
-\*   - The Charge an OPFS mirror reserves for a write, a failed allocation,
-\*     and a length too large to address: each ends the write before it
-\*     changes anything.
+\*   - The Charge an OPFS mirror reserves for a write, and a length too
+\*     large to address: each ends the write before it changes anything.
+\*   - A failed allocation in Reserve. in_place has taken WRITER (Claim);
+\*     the allocation fails before anything is linked, and in_place gives
+\*     WRITER back with a second CAS, state | WRITER to state, and returns
+\*     the error (351-360). If a copy froze the extent meanwhile, that CAS
+\*     fails and the word stays as the freeze left it: the file was taken
+\*     elsewhere. No byte, link or length changes, so the path leaves only
+\*     states this model reaches without it: the word as it was before the
+\*     Claim, or the frozen word a Freeze makes while a writer holds WRITER
+\*     (Freeze matches the WRITER bit it loaded). Its error ends that write
+\*     and leaves the file as it was.
+\*   - Where in the chain each byte lies: mem lays the segments end to end,
+\*     so a byte's place is its offset. That Extent::pieces cuts every
+\*     range into pieces that each stay inside their segment and cover the
+\*     range once, in order; that Extent::reserve leaves room for the whole
+\*     write and at least doubles the room; and that a link moves no byte,
+\*     hold for every chain and every range: proofs/lean/Regolith/
+\*     MemFileExtents.lean proves them.
 \*   - Several writes by one writer: one write each, by two writers, shows
 \*     every race between two; the chain grows from nothing to three
 \*     segments within that.
@@ -281,7 +297,7 @@ Apply(op, w, f) ==
             ELSE IF i <= Len(f) THEN f[i] ELSE 0]
 
 \* m with bytes [from, to) set to v; bytes past m's end stay unwritten, as
-\* `pieces` stops where the chain ends (extent.rs:204-209).
+\* `pieces` stops where the chain ends (extent.rs:207-212).
 Write(m, from, to, v) ==
   \* Inside [from, to): v; elsewhere unchanged.
   [i \in DOMAIN m |-> IF i - 1 >= from /\ i - 1 < to THEN v ELSE m[i]]

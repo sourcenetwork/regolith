@@ -130,12 +130,16 @@ fn merged(
 /// without copying them: the key's chain is walked in place from its newest
 /// write back to the one that replaced it, and only the value handed back is
 /// copied.
-pub(super) fn read_buffered<'op>(
+pub(super) fn read_buffered<'op, M, C>(
     writes: &TxnBuffer<Vec<u8>, Write>,
-    merge: impl FnOnce() -> Option<&'op dyn MergeOperator>,
+    merge: M,
     key: &[u8],
-    committed: impl FnOnce() -> io::Result<Option<DbSlice>>,
-) -> io::Result<Option<Option<Vec<u8>>>> {
+    committed: C,
+) -> io::Result<Option<Option<Vec<u8>>>>
+where
+    M: FnOnce() -> Option<&'op dyn MergeOperator>,
+    C: FnOnce() -> io::Result<Option<DbSlice>>,
+{
     let mut operands: Vec<&[u8]> = Vec::new();
     let mut base: Option<Option<&[u8]>> = None;
     writes.walk_chain(key, |write| match write {

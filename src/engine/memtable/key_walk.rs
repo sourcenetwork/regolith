@@ -53,7 +53,10 @@ impl MemTable {
     ///
     /// Used by the merge-operator read path to collect a chain of
     /// merge operands layered on top of the underlying base value.
-    pub(crate) fn collect_merge_chain(&self, lk: &LookupKey, out: &mut impl VersionSink) -> bool {
+    pub(crate) fn collect_merge_chain<S>(&self, lk: &LookupKey, out: &mut S) -> bool
+    where
+        S: VersionSink,
+    {
         self.scan_key(lk, |node, seq, value_type| {
             out.push_version((seq, value_type, self.value_slice(&node)));
             if value_type != VALUE_TYPE_MERGE {

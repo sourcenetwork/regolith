@@ -414,21 +414,21 @@
 \* docs warn about (INV_NoReadOnlyAnomaly).
 \*
 \* THE WRITE-FREE COMMIT, PIECE BY PIECE AGAINST THE CODE (E50). Line numbers
-\* are those of the Rust files at commit b229c27 on perf/e50-readonly; the
-\* commits after it change only proofs and test comments. Each entry says what the
+\* are those of the Rust files on perf/defralevel-parity (#290), refreshed from
+\* the b229c27 lines the table was first written against. Each entry says what the
 \* model piece stands for in the running program, in everyday words, then
 \* where the program does it.
 \*
 \*   "Writes nothing": no put, delete, merge or append.     WriteFree(t)
-\*       Transaction::drain_for_commit, `write_free`      src/transaction.rs:2059
+\*       Transaction::drain_for_commit, `write_free`      src/transaction.rs:2123
 \*       (a transaction never carries a range delete: delete_range refuses one)
 \*   Which road a commit takes.                           Commit(t): IF WriteFree(t)
-\*       Transaction::commit_inner                        src/transaction.rs:2016-2018
-\*       Transaction::commit_nowait_inner                 src/transaction/nowait.rs:294-297
+\*       Transaction::commit_inner                        src/transaction.rs:2080-2082
+\*       Transaction::commit_nowait_inner                 src/transaction/nowait.rs:295-298
 \*   The write-free check, one step here.                 CommitWriteFree(t)
 \*       RegolithEngine::commit_write_free                src/engine/commit/write_free.rs:107-168
 \*     It asks only that the database is open, so a latched database commits it.
-\*       ensure_open (no latch branch but the planted bug) write_free.rs:112, src/engine/mod.rs:1158
+\*       ensure_open (no latch branch but the planted bug) write_free.rs:112, src/engine/mod.rs:1173
 \*     A commit with nothing to check (no read its level checks, no validated
 \*     scan) returns there, before it takes any point: it touches no other
 \*     commit's slot. In the model its KeptReads and ScanDecider are empty,
@@ -442,8 +442,8 @@
 \*     and not applied, the check applies it first, as any helper of the
 \*     pipeline does, so the decided frontier counts it.
 \*       write_free_points, apply_decided                 write_free.rs:174-197, 203-216
-\*       (the pipeline's own apply: settle, src/engine/commit/pipeline.rs:671;
-\*        the decided frontier: last_decided_seq, src/engine/mod.rs:1254)
+\*       (the pipeline's own apply: settle, src/engine/commit/pipeline.rs:721;
+\*        the decided frontier: last_decided_seq, src/engine/mod.rs:1269)
 \*     A read, or a validated scan, made at or after the decided frontier has
 \*     nothing over it and is not looked up.               write_free.rs:121-126
 \*     Each read the level checks (ReadCands, ReadDecider): refused when its
@@ -457,32 +457,32 @@
 \*     A refusal names the key, what the transaction did with it and the
 \*     newer write (Abort(t), ReasonOf(t)).                 write_free_conflict, write_free.rs:285
 \*     It takes no sequence: `clock` is unchanged.          write_free.rs:167, Ok { seq: None }
-\*     Its receipt is its snapshot: receipt' = snap.        receipt_of, src/transaction.rs:2482
+\*     Its receipt is its snapshot: receipt' = snap.        receipt_of, src/transaction.rs:2532
 \*   Which reads a level checks.                          KeptReads, ValidatedReads, ForUpdateKept
 \*       Every point read at RepeatableRead, Serializable and DefraLevel; at
 \*       SnapshotIsolation only get_for_update reads; at ReadCommitted only
 \*       keys the commit writes, so none for a write-free commit.
-\*       Transaction::validation_set                      src/transaction.rs:2213-2300 (filter 2232-2243)
+\*       Transaction::validation_set                      src/transaction.rs:2277-2364 (filter 2296-2307)
 \*       scan stretches folded over the reads              scan_range::cover, src/transaction/scan_range.rs:294
 \*       validated ranges                                  validated_range::checks, src/transaction/validated_range.rs:57
 \*   DefraLevel's write-free relaxation.                  ValidatesNothing(t)
 \*       An optimistic DefraLevel transaction that writes nothing keeps only its
 \*       get_for_update reads and no scan.
-\*       drain_for_commit, `relaxed` and the `retain`      src/transaction.rs:2076-2081, 2098, 2117
+\*       drain_for_commit, `relaxed` and the `retain`      src/transaction.rs:2140-2145, 2162, 2181
 \*   The short road when a level checks no read (F2).     (one KeptReads stands for both roads)
-\*       checks_no_read_written_free                       src/transaction.rs:2063, 2154
+\*       checks_no_read_written_free                       src/transaction.rs:2127, 2218
 \*   A transaction's level and flavour.                    LevelOf(t), Pessimistic(t), Classified(t)
 \*       Transaction::isolation, Transaction::mode, projects   src/transaction/projection.rs:259
 \*   A get_for_update read.                               ReadForUpdate(r) (optimistic), Promote(p) (pessimistic)
 \*       Served at the snapshot when optimistic, at the published point with
 \*       the key's lock held when pessimistic, and marked to be checked.
-\*       Transaction::read_for_update, read_horizon        src/transaction.rs:1505-1521, 2323-2333
+\*       Transaction::read_for_update, read_horizon        src/transaction.rs:1510-1526, 2387-2397
 \*   A commit that writes, decided and then published.     CommitWriting(t), Publish(t)
-\*       the pipeline: decide and apply, then publish       src/engine/commit/pipeline.rs:671, 825
+\*       the pipeline: decide and apply, then publish       src/engine/commit/pipeline.rs:721, 911
 \*   A failure that latches the database.                 Latch(l), latched
-\*       RegolithEngine::latch, is_latched                  src/engine/mod.rs:1208, 1214
+\*       RegolithEngine::latch, is_latched                  src/engine/mod.rs:1223, 1229
 \*   A commit that writes, on a latched database.          CommitWriting(t), the `latched` branch
-\*       request_commit's ensure_writable                    src/engine/commit/mod.rs:423 (engine/mod.rs:1170)
+\*       request_commit's ensure_writable                    src/engine/commit/mod.rs:429 (engine/mod.rs:1185)
 \*
 \* Code steps with no step of their own here, and why none is needed:
 \*   - Taking the points before loading the view (write_free.rs:118, 129). A

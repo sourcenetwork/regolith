@@ -197,7 +197,10 @@ impl<T> ClaimSlots<T> {
 
     /// Takes every claim still listed, emptying its slot; `visit` sees each
     /// once. A slot handed out while this runs may be missed.
-    pub(super) fn drain(&self, mut visit: impl FnMut(Arc<T>)) {
+    pub(super) fn drain<V>(&self, mut visit: V)
+    where
+        V: FnMut(Arc<T>),
+    {
         for slot in 0..self.taken.load(Ordering::Acquire).min(CAPACITY) {
             let (chunk, at) = place(slot);
             let claim = self.chunks[chunk]
@@ -326,6 +329,13 @@ mod tests {
     fn concurrent_owners_and_drains_drop_every_reference_once() {
         use std::sync::atomic::AtomicBool;
 
+        // Interpreted, each round costs thousands of times what it does
+        // native; a hundred rounds an owner still race every step of a slot.
+        #[cfg(not(miri))]
+        const EACH: usize = 20_000;
+        #[cfg(miri)]
+        const EACH: usize = 100;
+
         let slots = Arc::new(ClaimSlots::new());
         let held: Arc<Vec<AtomicBool>> =
             Arc::new((0..1024).map(|_| AtomicBool::new(false)).collect());
@@ -335,7 +345,7 @@ mod tests {
                 let (slots, held) = (Arc::clone(&slots), Arc::clone(&held));
                 std::thread::spawn(move || {
                     let claim = Arc::new(());
-                    for _ in 0..20_000 {
+                    for _ in 0..EACH {
                         let slot = slots.reserve().unwrap();
                         assert!(
                             !held[slot as usize].swap(true, Ordering::AcqRel),

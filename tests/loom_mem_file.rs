@@ -193,10 +193,13 @@ impl Extent {
         tail.next.store(segment, order);
     }
 
-    /// `Extent::pieces` (`extent.rs:189-212`), a byte at a time: `f` gets
+    /// `Extent::pieces` (`extent.rs:189-215`), a byte at a time: `f` gets
     /// each byte of `[at, at + n)` and its offset in the range. Stops where
     /// the chain ends.
-    fn pieces(&self, mut at: usize, n: usize, mut f: impl FnMut(&UnsafeCell<u8>, usize)) {
+    fn pieces<F>(&self, mut at: usize, n: usize, mut f: F)
+    where
+        F: FnMut(&UnsafeCell<u8>, usize),
+    {
         let mut done = 0;
         let mut segment = &self.first;
         while done < n {
@@ -220,14 +223,14 @@ impl Extent {
         }
     }
 
-    /// `Extent::copy_out` (`extent.rs:220`).
+    /// `Extent::copy_out` (`extent.rs:223`).
     fn copy_out(&self, at: usize, out: &mut [u8]) {
         let n = out.len();
         // SAFETY: loom checks the read is ordered after the byte's write.
         self.pieces(at, n, |cell, i| out[i] = cell.with(|byte| unsafe { *byte }));
     }
 
-    /// `Extent::copy_in` (`extent.rs:238`).
+    /// `Extent::copy_in` (`extent.rs:241`).
     fn copy_in(&self, at: usize, src: &[u8]) {
         // SAFETY: loom checks no other access races the write.
         self.pieces(at, src.len(), |cell, i| {
@@ -235,12 +238,12 @@ impl Extent {
         });
     }
 
-    /// `Extent::zero` (`extent.rs:253`).
+    /// `Extent::zero` (`extent.rs:256`).
     fn zero(&self, at: usize, n: usize) {
         self.copy_in(at, &vec![0; n]);
     }
 
-    /// `Extent::copy_prefix` (`extent.rs:264`).
+    /// `Extent::copy_prefix` (`extent.rs:267`).
     fn copy_prefix(&self, src: &Extent, n: usize) {
         let mut bytes = vec![0; n];
         src.copy_out(0, &mut bytes);
@@ -433,13 +436,10 @@ impl Drop for MemFile {
 /// Run `model` under loom at `preemptions` (none: unbounded), and fail
 /// unless it explored at least `floor` schedules and `witnessed` of them
 /// reached the state it exists to check.
-fn explore(
-    name: &str,
-    preemptions: Option<usize>,
-    floor: usize,
-    witnessed: usize,
-    model: impl Fn(&StdAtomicUsize) + Send + Sync + 'static,
-) {
+fn explore<M>(name: &str, preemptions: Option<usize>, floor: usize, witnessed: usize, model: M)
+where
+    M: Fn(&StdAtomicUsize) + Send + Sync + 'static,
+{
     let runs = StdArc::new(StdAtomicUsize::new(0));
     let witness = StdArc::new(StdAtomicUsize::new(0));
     let mut builder = loom::model::Builder::new();
@@ -476,12 +476,10 @@ fn explore(
 /// Run a calibration and require it to fail with a message holding one of
 /// `any_of`: a planted bug can show as a loom causality violation or as a
 /// wrong value, depending on which schedule loom reaches first.
-fn fails_with(
-    name: &str,
-    preemptions: Option<usize>,
-    any_of: &[&str],
-    model: impl Fn(&StdAtomicUsize) + Send + Sync + 'static,
-) {
+fn fails_with<M>(name: &str, preemptions: Option<usize>, any_of: &[&str], model: M)
+where
+    M: Fn(&StdAtomicUsize) + Send + Sync + 'static,
+{
     let outcome =
         std::panic::catch_unwind(AssertUnwindSafe(|| explore(name, preemptions, 1, 0, model)));
     let panic = match outcome {

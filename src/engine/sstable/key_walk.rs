@@ -36,13 +36,16 @@ impl SsTableReader {
     /// the key does: a key with more operands than one block holds, which a
     /// pinned snapshot makes routine by keeping compaction from folding
     /// them, would otherwise lose the rest of its chain and its base.
-    pub(crate) fn collect_merge_chain(
+    pub(crate) fn collect_merge_chain<S>(
         &self,
         lk: &LookupKey,
         key_buf: &mut Vec<u8>,
         cache: &BlockCache,
-        out: &mut impl VersionSink,
-    ) -> io::Result<bool> {
+        out: &mut S,
+    ) -> io::Result<bool>
+    where
+        S: VersionSink,
+    {
         let terminated = self.scan_key(lk, key_buf, cache, |block, seq, vt, offset, len| {
             let Some(value) = DbSlice::from_block(Arc::clone(block), offset, len) else {
                 return ControlFlow::Break(Err(invalid_data("block value extends past block")));

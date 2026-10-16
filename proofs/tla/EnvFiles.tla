@@ -18,13 +18,15 @@
 \* shared position to race on.
 \*
 \* PART 2, a file in memory (MemFile, src/env/mem_file.rs). The file is a
-\* buffer with spare room and a published length L; readers read below L
-\* with no lock. An append that fits writes ABOVE L, under a WRITER flag it
-\* took with a compare-and-swap (CAS), and then publishes L+n with a second
-\* CAS. Anything else (no room, an overwrite, two appends at once) builds a
-\* NEW buffer from the old one's first L bytes plus its own, FREEZES the old
-\* buffer with a CAS so no append can publish there any more, and swaps the
-\* new buffer in with a CAS on the file's pointer.
+\* buffer (a chain of segments an append lengthens in place,
+\* src/env/mem_file/extent.rs) and a published length L; readers read below
+\* L with no lock. An append writes ABOVE L, linking more room first if it
+\* runs out, under a WRITER flag it took with a compare-and-swap (CAS), and
+\* then publishes L+n with a second CAS. Anything else (an overwrite, a
+\* shrink, two appends at once) builds a NEW buffer from the old one's first
+\* L bytes plus its own, FREEZES the old buffer with a CAS so no append can
+\* publish there any more, and swaps the new buffer in with a CAS on the
+\* file's pointer.
 \*
 \* Tiny example of why the freeze matters. Writer A holds WRITER on buffer
 \* E and is copying its record above L. Writer B gives up on E (it is busy)
@@ -88,6 +90,13 @@
 \*     here a writer may take either path at any time. MemFileExtents.tla
 \*     models the bytes: the chain of segments, the zeroing of room a write
 \*     exposes, and the reclamation of a replaced extent.
+\*   - An append in place whose room cannot be allocated: it gives WRITER
+\*     back with a CAS from the word it claimed (a no-op once a copy froze
+\*     the buffer) and fails before it writes a byte (MemFile::in_place).
+\*     Like a publish lost to a freeze, it publishes nothing and does not
+\*     return as finished, so no rule here can see it; the claim it held
+\*     only sent other writers to the copy path meanwhile, which they may
+\*     take at any time here anyway.
 \*   - Memory ordering: the CAS steps are atomic here; the code's Acquire
 \*     and Release make them so.
 \*   - An append at one length only (MemFile::append_at, which the

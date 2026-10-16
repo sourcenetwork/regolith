@@ -866,6 +866,19 @@ tla:
     check MC_ShardedStats_Green                        GREEN
     check MC_ShardedStats_Red_LostUpdate               RED QuiescentExact
     check MC_ShardedStats_Red_PartialRead              RED ReadBetween
+    # A histogram sample's skipped updates (statistics.rs, HistogramData::record):
+    # a sample of 0 leaves the sum alone, and the minimum and maximum are
+    # loaded and moved only when the sample lies outside them; three threads
+    # share one shard. Green_ReachesStaleSkip is a witness: a skip on a bound
+    # another thread has since moved is reached. Lean:
+    # Regolith/HistogramBounds.lean, minRun_eq, maxRun_eq, sumRun_eq.
+    spec=HistogramBounds
+    check MC_HistogramBounds_Green                     GREEN
+    check MC_HistogramBounds_Red_StoreAfterSkip        RED MinExact
+    check MC_HistogramBounds_Red_WrongDirection        RED MinExact
+    check MC_HistogramBounds_Red_MaxStoreAfterSkip     RED MaxExact
+    check MC_HistogramBounds_Red_SumLoadStore          RED SumExact
+    check MC_HistogramBounds_Green_ReachesStaleSkip    RED NeverSkipsStale
     # E10 and 4.7, the lock-free commit pipeline as built: helping, voiding,
     # the check in two parts (early, then in ring order), the round (one
     # claim on the log's device step), the rollback of a failed log, ordered
@@ -1273,8 +1286,10 @@ tla:
     # The slots close finds the open transactions' claims in (claim_slots.rs):
     # a lock-free free stack with an ABA tag, one swap deciding who drops a
     # claim, and a drain that sees every claim listed when it began. The
-    # Green_Reaches rows are witnesses: each GREEN run reaches its race. No
-    # Lean module yet; loom: `just loom-claims`.
+    # Green_Reaches rows are witnesses: each GREEN run reaches its race.
+    # Lean: Regolith/ClaimSlots.lean, place_bijective (every slot in one
+    # chunk cell, for every size) and no_aba (the tag's bound); loom:
+    # `just loom-claims`.
     spec=ClaimSlots
     check MC_ClaimSlots_Green                          GREEN
     check MC_ClaimSlots_Green_Reuse                    GREEN
@@ -1390,7 +1405,9 @@ tla:
     # zeroed where a write exposes it, a read holds its extent across the
     # copy, and a replaced large extent is submitted to the reclaimer after
     # the writer lets go. Red_NoSubmit breaks LargeFreed, a property of whole
-    # runs. No Lean module yet; loom: `just loom-mem-file`.
+    # runs. Lean: Regolith/MemFileExtents.lean, pieces_exact (a range cut
+    # into pieces inside their segments, no gap or overlap, for every chain)
+    # and grow_doubling; loom: `just loom-mem-file`.
     spec=MemFileExtents
     check MC_MemFileExtents_Green_Appends              GREEN
     check MC_MemFileExtents_Green_Extend               GREEN

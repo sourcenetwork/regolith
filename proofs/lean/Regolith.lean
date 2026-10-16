@@ -204,3 +204,22 @@ import Regolith.OwedStep
 -- commit keeps its lock until it is visible. Backs
 -- `proofs/tla/LockTable.tla`.
 import Regolith.LockTable
+-- The slots close finds the open transactions' claims in: `place` maps
+-- every slot below the capacity to exactly one chunk cell and back, every
+-- slot plus one fits the free stack's 32-bit top, and the stack's change
+-- count makes a word read before 1 to 2^32 - 1 changes differ from the word
+-- after them. Backs `proofs/tla/ClaimSlots.tla`.
+import Regolith.ClaimSlots
+-- An in-memory file's extent: a byte below the room lies in exactly one
+-- segment, the walk cuts a range into pieces inside their segments with no
+-- gap or overlap, and a link moves no byte and at least doubles the room.
+-- Backs `proofs/tla/MemFileExtents.tla`.
+import Regolith.MemFileExtents
+-- A key's versions held first-in-place read exactly as the list they
+-- replaced, and the merge read's fast path answers what the full path does.
+-- No TLA+ model: a chain is one read's local value, never shared.
+import Regolith.MergeChain
+-- A histogram sample skips only updates that change nothing (the minimum
+-- only falls, the maximum only rises, adding 0 is nothing), so the skips
+-- lose no sample. Backs `proofs/tla/HistogramBounds.tla`.
+import Regolith.HistogramBounds

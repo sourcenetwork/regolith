@@ -52,17 +52,22 @@
 \*
 \* WHAT IS MODELLED, and the code each piece mirrors (file and line of the
 \* tree the model was checked against; claim_slots.rs unless named):
-\*   free          ClaimSlots::free (56): `top` is the low half (the slot
+\*   free          ClaimSlots::free (58): `top` is the low half (the slot
 \*                 plus one in Rust, so slots are numbered from 1 here and
 \*                 0 is "empty"), `tag` the high half.
-\*   below         Chunk::below (36).
-\*   taken         ClaimSlots::taken (58).
-\*   chunks        the chunks whose OnceLock is set: ClaimSlots::chunk (116)
-\*                 sets one with get_or_init; drain (196) and take (217)
-\*                 only look with get.
-\*   cell          Chunk::claims (34): a claim's id, or None for null.
-\*   closed        RegolithEngine::close_state != OPEN (engine/mod.rs:3372),
-\*                 read by Claim::track's is_closed (transaction/claim.rs:57).
+\*   below         Chunk::below (38).
+\*   taken         ClaimSlots::taken (60).
+\*   chunks        the chunks whose cell is set: ClaimSlots::chunks (54), an
+\*                 array of crate::sync::OnceCell. ClaimSlots::chunk (120-126)
+\*                 sets one with get_or_init_racy (124): threads that race
+\*                 each build a chunk, one compare-and-swap publishes one of
+\*                 them and the others are dropped unseen, so the cell goes
+\*                 from unset to set in one atomic step, as Init does here.
+\*                 drain (206-208) and take (227-229) only look with get.
+\*   cell          Chunk::claims (36): a claim's id, or None for null.
+\*   closed        RegolithEngine::close_state != OPEN, read by
+\*                 RegolithEngine::is_closed (engine/mod.rs:1165-1167) in
+\*                 Claim::track (transaction/claim.rs:57).
 \*   cstate        Claim::state (transaction/claim.rs:41): open, committing
 \*                 or aborted; "none" before the transaction begins.
 \*   slotOf        Claim::slot (transaction/claim.rs:40), 0 when not listed;
@@ -78,52 +83,65 @@
 \*
 \*   Model step   Rust
 \*   Check        Claim::track: `!engine.is_closed()` (transaction/claim.rs:57)
-\*   Pop          take: `self.free.load(Acquire)` (211)
+\*   Pop          take: `self.free.load(Acquire)` (222)
 \*   Below        take: `chunk.below[at].load(Relaxed)`, 0 when the chunk is
-\*                not there (`map_or(0, ..)`, 216-218)
-\*   PopCas       take: the compare_exchange_weak (219-226); a failure
-\*                carries the word it found, as `Err(current)` does
+\*                not there (`map_or(0, ..)`, 227-229)
+\*   PopCas       take: next_word and the compare_exchange_weak (230-237); a
+\*                failure carries the word it found, as `Err(current)` does
 \*   Fresh        take: `self.taken.fetch_add(1, AcqRel)` and the CAPACITY
-\*                check (228-229); reserve's None (123-125)
-\*   Init         fill: `self.chunk(slot)`, the chunk's get_or_init (129, 116)
-\*   Fill         fill: the claim stored with Release (130-140)
+\*                check (239-240); reserve's None (131-133)
+\*   Init         fill: `self.chunk(slot as usize)` (137), the chunk's
+\*                get_or_init_racy (124)
+\*   Fill         fill: the claim stored with Release through store_ptr
+\*                (138-148)
 \*   Commit       Claim::begin_commit, OPEN -> COMMITTING
 \*                (transaction/claim.rs:90), before release_resources
 \*                (transaction.rs:1983-1993)
-\*   Swap         remove: `drop(self.take_claim(..))` (154), take_claim's
-\*                swap (245)
-\*   PushLoad     give_back: `self.free.load(Relaxed)` (166)
-\*   PushBelow    give_back: `chunk.below[at].store(..)` (168)
-\*   PushCas      give_back: the compare_exchange_weak (169-176)
+\*   Swap         remove: `drop(self.take_claim(..))` (162), take_claim's
+\*                swap (256)
+\*   PushLoad     give_back: `self.free.load(Relaxed)` (174)
+\*   PushBelow    give_back: `chunk.below[at].store(..)` (176)
+\*   PushCas      give_back: next_word and the compare_exchange_weak
+\*                (177-184)
 \*   Abort        Claim::owner_abort after release_resources on rollback
 \*                (transaction/claim.rs:102, transaction.rs:2065-2068)
-\*   Close        close: `close_state.store(CLOSING)` (engine/mod.rs:3372)
-\*   Bound        drain: `self.taken.load(Acquire).min(CAPACITY)` (193)
-\*   Visit        drain: the chunk's get, take_claim's swap (194-204)
-\*   CloseAbort   Claim::abort_for_close's CAS (transaction/claim.rs:144)
+\*   Close        close: `close_state.store(CLOSE_STATE_CLOSING)`
+\*                (engine/mod.rs:3372-3373)
+\*   Bound        drain: `self.taken.load(Acquire).min(CAPACITY)` (204)
+\*   Visit        drain: the chunk's get, take_claim's swap (205-215)
+\*   CloseAbort   Claim::abort_for_close (transaction/claim.rs:144), whose
+\*                CAS is Claim::win's (transaction/claim.rs:82-86)
 \*
 \*   Rule                Rust it holds for
-\*   OneHolder           reserve hands a slot to one caller (123, 210-230)
-\*   FreeStackSound      take and give_back (the tag: next_word, 182-188)
-\*   CellBelongsToHolder remove empties before it gives back (154 before 155)
-\*   DroppedOnce         take_claim's swap (234-253)
-\*   LiveTakenByClose    drain looks at every slot below `taken` (193)
-\*   DrainInBounds       drain's `.min(CAPACITY)` (193)
+\*   OneHolder           reserve hands a slot to one caller (131-133, 221-241)
+\*   FreeStackSound      take and give_back (the tag: next_word, 190-196)
+\*   CellBelongsToHolder remove empties before it gives back (162 before 163)
+\*   DroppedOnce         take_claim's swap (243-264)
+\*   LiveTakenByClose    drain looks at every slot below `taken` (204)
+\*   DrainInBounds       drain's `.min(CAPACITY)` (204)
 \*   AtRest              OpenTransactions::abort_all with every owner's end
 \*                       (engine/open_transactions.rs:68)
 \*
 \* WHAT IS LEFT OUT, and why that loses nothing:
 \*   - The chunk sizes: chunk k holds 2^k slots here (FIRST = 1), against
-\*     64 << k in Rust. `place` is plain arithmetic, unit-tested in
-\*     claim_slots.rs; what matters here is that a slot's chunk may be made
-\*     while close looks at it, which a chunk of any size shows.
+\*     64 << k in Rust. What matters here is that a slot's chunk may be made
+\*     while close looks at it, which a chunk of any size shows. `place`,
+\*     which finds a slot's chunk and offset, is proved for every size in
+\*     proofs/lean/Regolith/ClaimSlots.lean (place_bijective): every slot
+\*     below CAPACITY lands in a cell that exists, no two slots share a
+\*     cell, and every cell is some slot's; with the real constants every
+\*     slot plus one fits the u32 the free stack links by (real_slot_fits).
 \*   - Memory ordering: every step here is atomic and in one order. The
 \*     orderings that make them so (Acquire, Release, AcqRel) are checked by
 \*     the loom models in src/engine/open_transactions/loom_model.rs, on the
 \*     real ClaimSlots.
 \*   - The tag's width: 32 bits in Rust, wrapping after 2^32 changes made
 \*     while one thread is paused between its read and its CAS. A run here
-\*     makes a few changes, never that many.
+\*     makes a few changes, never that many. That any number of changes
+\*     from 1 to 2^32 - 1, whatever tops they leave, makes the word differ
+\*     from the one read before them is proved in
+\*     proofs/lean/Regolith/ClaimSlots.lean (no_aba), on the word's bits as
+\*     next_word writes them (nextWord_eq).
 \*   - What a claim is and what aborting one runs: TxnCallbacks.tla. Here a
 \*     claim is an id and its state word.
 \*   - A transaction whose commit began before it had a claim
@@ -519,7 +537,8 @@ Fresh(o) ==
   /\ UNCHANGED <<free, below, chunks, cell, closed, cstate, given, dropBy, ip, open, nbegun,
                  tx, head, next, path, held, closeVars>>
 
-\* fill: the slot's chunk is made if it is not there yet (get_or_init).
+\* fill: the slot's chunk is made if it is not there yet (get_or_init_racy:
+\* racing threads each build one, and one compare-and-swap publishes it).
 Init_(o) ==
   \* About to find the chunk.
   /\ pc[o] = "init"
