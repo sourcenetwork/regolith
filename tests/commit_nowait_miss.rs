@@ -28,7 +28,11 @@ const COLD: &[u8] = b"k01000";
 /// none of them, and the device it reads through.
 fn cold(dir: &TempDir) -> (OptimisticTransactionDb, Arc<Device>) {
     let (env, device) = DeviceEnv::new();
-    let options = || Options::default().env(Arc::clone(&env)).block_size(256);
+    let options = || {
+        Options::default()
+            .env(Arc::<DeviceEnv>::clone(&env))
+            .block_size(256)
+    };
     {
         let db = OptimisticTransactionDb::open(dir.path(), options()).unwrap();
         for i in 0..2_000u32 {
