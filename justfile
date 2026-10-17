@@ -1111,6 +1111,18 @@ tla:
     check MC_LandingHold_Green_Three                   GREEN
     check MC_LandingHold_Red_Fifo                      RED EveryCallFinishes
     check MC_LandingHold_Red_NoHolds                   RED RunsKeepProgress
+    # D53, a CacheOnly commit whose validation misses the cache: a miss in
+    # the early check leaves the commit owed on its queue, which reads the
+    # block and submits it again; a miss deciding its slot leaves the
+    # decision on the queue of a thread that must not read the device. The
+    # commit is never ended by a miss, and its call never reads the device.
+    # Lean: Regolith/PipelineCheck.lean, early_check_split.
+    spec=NowaitMiss
+    check MC_NowaitMiss_Green                          GREEN
+    check MC_NowaitMiss_Red_Refuse                     RED INV_NoMissEnds
+    check MC_NowaitMiss_Red_ReadOnCaller               RED INV_CallNeverReads
+    check MC_NowaitMiss_Red_NoResubmit                 RED LIVE_EveryCommitEnds
+    check MC_NowaitMiss_Red_StaleHorizon               RED INV_Exact
     # Phase 7 integration: with no worker and inline compaction on, no
     # stopped writer waits on a relief nobody runs. Every piece of progress
     # lands the stall's unit (relief handed back), a contended writer reads
