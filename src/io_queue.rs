@@ -119,6 +119,11 @@ pub enum ReadMode {
     /// polled. Naming a queue that is not open on the handle's database makes
     /// such a read fail with [`Error::InvalidArgument`](crate::Error::InvalidArgument).
     ///
+    /// A transaction's [`commit_nowait`](crate::Transaction::commit_nowait)
+    /// through it validates from the cache on the calling thread too; a block
+    /// its validation misses is read at a poll of the queue, and the commit
+    /// goes on there. A miss never ends the commit.
+    ///
     /// Neither the read nor the poll ever waits on another thread. Under
     /// [`Options::max_open_files`](crate::Options::max_open_files), a block
     /// read whose table must be reopened while every descriptor is in use by

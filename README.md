@@ -164,6 +164,9 @@ inline and the ticket is ready already. Commits from many threads still share on
 log write and one fsync per group: the fsync is a unit that the first member thread
 to poll claims and runs, and it tells every member's queue. At
 `DurabilityMode::Immediate` a commit is visible only once that fsync returned.
+A commit made through a `CacheOnly` handle validates from the cache on the calling
+thread too; a block its validation misses is read at a poll of its queue, and the
+commit goes on there. A miss never ends it: the transaction cannot commit twice.
 
 ```rust
 use regolith::{OptimisticTransactionDb, Options, TxnOptions};
