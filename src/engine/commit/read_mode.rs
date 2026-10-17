@@ -2,26 +2,27 @@
 //!
 //! Deciding a transaction's slot validates it, and validation reads: the
 //! newest version of each key it checks, which may be in a block the cache
-//! does not hold. A slot is decided by whichever thread reaches it, so two
-//! rules say what that thread may read:
+//! does not hold. A slot is decided by whichever thread reaches it, with
+//! what that thread may read:
 //!
-//! - **A commit made through a `CacheOnly` handle never reads the device,
-//!   whichever thread decides it.** Its slot is validated with misses sent
-//!   to the queue its handle names. A miss refuses the commit with the wait
-//!   for the block: it takes no sequence and no record, and the ticket
-//!   carries [`crate::TransactionError::WouldBlock`]. The block is read at
-//!   that queue's next poll, and the commit made again then finds it.
+//! - **A thread that may read the device decides the slot directly**,
+//!   whoever made the commit: a blocking call reads what the decision needs.
 //! - **A thread that must not read the device decides nobody's slot with
-//!   it.** A `commit_nowait` call made through a `CacheOnly` handle helps
-//!   the slots before its own, and one of them may belong to a commit that
-//!   is allowed to read the device. The helper validates it from the cache
-//!   alone. On a miss it decides nothing: deciding the slot with the device
-//!   becomes a unit of the slot, which the helper leaves on its queue as it
-//!   leaves a sync. A thread that may read the device decides the slot
-//!   directly and never needs the unit; the helper's poll runs it otherwise,
-//!   which is where a queue's owner does its I/O. The poll waits for no
-//!   other thread: a round or a unit in the slot's way that another thread
-//!   has parks the decision (`park.rs`).
+//!   it, its own included.** A `commit_nowait` call made through a
+//!   `CacheOnly` handle decides its own slot, and helps the slots before it,
+//!   from the cache alone. On a miss it decides nothing: deciding the slot
+//!   with the device becomes a unit of the slot, which the thread leaves on
+//!   its queue as it leaves a sync. Its poll runs the unit, which is where a
+//!   queue's owner does its I/O. A commit is never refused for a miss: its
+//!   transaction was consumed and cannot commit a second time
+//!   (`NowaitMiss.tla`). The poll waits for no other thread: a round or a
+//!   unit in the slot's way that another thread has parks the decision
+//!   (`park.rs`).
+//! - **An allocation made through a `CacheOnly` handle reads its counter
+//!   from the cache alone, whichever thread decides it.** A miss refuses it
+//!   with the wait for the block: it takes no sequence and no record, the
+//!   block is read at the next poll of the queue its handle names, and the
+//!   allocation made again finds it.
 
 use std::sync::Arc;
 use std::task::Waker;
@@ -29,7 +30,7 @@ use std::task::Waker;
 use super::super::RegolithEngine;
 use super::super::io::job::{Job, JobBody, Step};
 use super::super::io::scope;
-use super::descriptor::{After, Decision, Descriptor, Verdict as Fate};
+use super::descriptor::{After, Decision, Descriptor, Verdict as Fate, Work};
 use super::park::Help;
 use super::pipeline::Turn;
 use crate::io_queue::wait::is_would_block;
@@ -102,8 +103,12 @@ impl RegolithEngine {
         desc: &Descriptor,
         base: &After,
     ) -> Result<Decision, Arc<Job>> {
-        if let Some(queue) = desc.read_queue() {
-            let _scope = scope::cache_only(queue);
+        if let Work::Allocate {
+            read_queue: Some(queue),
+            ..
+        } = &desc.work
+        {
+            let _scope = scope::cache_only(*queue);
             return Ok(self.decide_work(index, desc, base));
         }
         // Whatever scope this thread is in holds: none for a thread that

@@ -68,9 +68,10 @@ use std::io;
 use std::sync::Arc;
 
 use super::{CommitOutcome, DurabilityMode, RegolithEngine, ValidationSet, grouped_batch_ops};
+use crate::io_queue::wait::take_would_block;
 use crate::statistics::Ticker;
 use crate::sync::internal::Arc as RingArc;
-use crate::{Conflict, WriteBatchOp};
+use crate::{Conflict, IoWait, WouldBlock, WriteBatchOp};
 
 mod allocate;
 mod append;
@@ -166,6 +167,19 @@ pub(crate) struct TxnCommit {
     pub(crate) read_queue: Option<crate::QueueId>,
 }
 
+/// A transaction's commit that passed every check that may refuse it, its
+/// early check still to run.
+struct Unchecked {
+    checks: ValidationSet,
+    ops: Vec<WriteBatchOp>,
+    appends: Vec<PendingAppend>,
+    durability: DurabilityMode,
+    read_queue: Option<crate::QueueId>,
+    /// It carries a write: it passes the write-stall admission before it
+    /// takes a slot.
+    writes: bool,
+}
+
 /// A commit checked and ready for the pipeline, or decided before it.
 enum Requested {
     /// The early check found a conflict: nothing is queued.
@@ -174,6 +188,10 @@ enum Requested {
     /// commit that does passes the write-stall admission before it takes a
     /// slot.
     Queued { request: WriteRequest, writes: bool },
+    /// The early check, run through a `CacheOnly` handle, needs a block the
+    /// cache does not hold. Nothing of the commit was taken; `wait` is the
+    /// read, recorded on the handle's queue.
+    Owed { commit: OwedCommit, wait: IoWait },
 }
 
 /// What `commit_nowait` learns from the pipeline.
@@ -184,7 +202,17 @@ pub(crate) enum NowaitCommit {
     /// it, or for the write unit another thread holds to let go before its
     /// record is written. The outcome is in the commit once it is told.
     Pending(PendingCommit),
+    /// Its early check needs a block the cache does not hold: nothing of it
+    /// was taken. Once `wait` is ready, [`RegolithEngine::resubmit_nowait`]
+    /// checks it again and goes on (`NowaitMiss.tla`).
+    Owed { commit: OwedCommit, wait: IoWait },
 }
+
+/// A `commit_nowait` commit whose early check missed, waiting to be checked
+/// again: a transaction's commit is made once, so a miss never ends it.
+/// Boxed, so only a miss pays for it and the answers that carry it stay the
+/// size they were.
+pub(crate) struct OwedCommit(Box<Unchecked>);
 
 /// A commit made by `commit_nowait` that is not published yet.
 pub(crate) struct PendingCommit {
@@ -352,7 +380,7 @@ impl RegolithEngine {
             durability,
             read_queue: None,
         };
-        match self.request_commit(txn)? {
+        match self.check_request(self.unchecked(txn)?)? {
             Requested::Decided(outcome) => Ok(outcome),
             Requested::Queued { request, writes } => {
                 // A blocking commit waits a stop out here, before it takes a
@@ -363,21 +391,59 @@ impl RegolithEngine {
                 }
                 self.conclude(self.submit_settled(request)?)
             }
+            // A miss of a `CacheOnly` scope this call runs in: its caller is
+            // handed the wait, as before the commit took anything.
+            Requested::Owed { wait, .. } => Err(wait.into_io_error()),
         }
     }
 
     /// [`Self::commit_optimistic`] for `commit_nowait`: returns once the
     /// commit is decided and written, or at the first unit in its way. When
     /// it is not published yet (it waits for a write stall to clear, for its
-    /// sync, for a unit ahead of it, or for room in a full ring),
-    /// [`NowaitCommit::Pending`] holds it; [`Self::await_commit`] then
-    /// leaves it on the committer's queue. The caller never waits here, and
-    /// with `txn.read_queue` set never reads the device.
+    /// sync, for a unit ahead of it, for room in a full ring, or for the
+    /// device to decide its slot), [`NowaitCommit::Pending`] holds it;
+    /// [`Self::await_commit`] then leaves it on the committer's queue. When
+    /// its early check missed, [`NowaitCommit::Owed`] holds it. The caller
+    /// never waits here, and with `txn.read_queue` set never reads the
+    /// device.
     pub(crate) fn commit_optimistic_nowait(&self, txn: TxnCommit) -> io::Result<NowaitCommit> {
         let _scope = txn.read_queue.map(super::io::scope::cache_only);
-        let (request, writes) = match self.request_commit(txn)? {
+        self.submit_nowait(self.unchecked(txn)?)
+    }
+
+    /// Submit `owed` again once the read its early check waited for is done:
+    /// the early check runs again, at the horizon of now (`early_check_split`
+    /// in `PipelineCheck.lean` holds at any horizon), and the commit goes on
+    /// as [`Self::commit_optimistic_nowait`] goes on, owed again if another
+    /// block is missing. `on_device`: its queue is gone and polls no more, so
+    /// it reads the device on this thread, as a blocking commit does. The
+    /// database may have closed or latched meanwhile, which refuses it as it
+    /// refuses a commit made now.
+    pub(crate) fn resubmit_nowait(
+        &self,
+        owed: OwedCommit,
+        on_device: bool,
+    ) -> io::Result<NowaitCommit> {
+        self.ensure_writable()?;
+        let mut unchecked = *owed.0;
+        let _scope = match unchecked.read_queue.filter(|_| !on_device) {
+            Some(queue) => super::io::scope::cache_only(queue),
+            None => {
+                unchecked.read_queue = None;
+                super::io::scope::blocking()
+            }
+        };
+        self.submit_nowait(unchecked)
+    }
+
+    /// The early check of `unchecked`, then the slot: what
+    /// [`Self::commit_optimistic_nowait`] and [`Self::resubmit_nowait`]
+    /// share.
+    fn submit_nowait(&self, unchecked: Unchecked) -> io::Result<NowaitCommit> {
+        let (request, writes) = match self.check_request(unchecked)? {
             Requested::Decided(outcome) => return Ok(NowaitCommit::Done(outcome)),
             Requested::Queued { request, writes } => (request, writes),
+            Requested::Owed { commit, wait } => return Ok(NowaitCommit::Owed { commit, wait }),
         };
         let pipe = self.pipe()?;
         let desc = spare::descriptor(Work::Request(request), false);
@@ -410,13 +476,13 @@ impl RegolithEngine {
         self.resume_nowait(&pending.desc, queue, &told);
     }
 
-    /// Check a commit (the handle, the sizes, the early check) and turn it
-    /// into the request the pipeline decides, or into the outcome the early
-    /// check already decided. The write-stall admission comes after, in the
-    /// caller: [`RegolithEngine::admit_commit`] for a commit that blocks,
+    /// Check what may refuse a commit (the handle, the sizes) before its
+    /// early check. The write-stall admission comes after the early check, in
+    /// the caller: [`RegolithEngine::admit_commit`] for a commit that blocks,
     /// [`RegolithEngine::admit_commit_nowait`] when a `commit_nowait` commit
     /// is about to take its slot.
-    fn request_commit(&self, txn: TxnCommit) -> io::Result<Requested> {
+    #[inline]
+    fn unchecked(&self, txn: TxnCommit) -> io::Result<Unchecked> {
         let TxnCommit {
             checks,
             point_ops,
@@ -443,20 +509,53 @@ impl RegolithEngine {
         // ordered step. A commit that writes nothing (`ops` empty, e.g. a
         // `get_for_update` with no write) takes no capacity and is not held,
         // though its conflict check still takes a slot like any other
-        // commit. An append is a write. The early check below comes first: a
-        // conflict that is already certain needs no capacity, and returns
-        // without waiting for a stall.
+        // commit. An append is a write. The early check (`check_request`)
+        // comes first: a conflict that is already certain needs no capacity,
+        // and returns without waiting for a stall.
         let writes = !ops.is_empty() || !appends.is_empty();
+        Ok(Unchecked {
+            checks,
+            ops,
+            appends,
+            durability,
+            read_queue,
+            writes,
+        })
+    }
 
+    /// Run the early check of `unchecked` and turn it into the request the
+    /// pipeline decides, into the outcome the check already decided, or,
+    /// when the check needs a block a `CacheOnly` scope may not read, into
+    /// the commit owed that read.
+    #[inline]
+    fn check_request(&self, unchecked: Unchecked) -> io::Result<Requested> {
         // Checked up to the horizon here, on this thread and before the
         // commit takes a slot; deciding the slot checks only what landed
         // above it.
-        let early = match self.check_early(&checks, &ops)? {
-            EarlyVerdict::Conflict(conflict) => {
+        let early = match self.check_early(&unchecked.checks, &unchecked.ops) {
+            Ok(EarlyVerdict::Conflict(conflict)) => {
                 return Ok(Requested::Decided(CommitOutcome::Conflict(conflict)));
             }
-            EarlyVerdict::Marks(early) => early,
+            Ok(EarlyVerdict::Marks(early)) => early,
+            Err(err) => {
+                return match take_would_block(err) {
+                    Ok(WouldBlock::Io(wait)) => Ok(Requested::Owed {
+                        commit: OwedCommit(Box::new(unchecked)),
+                        wait,
+                    }),
+                    Ok(other) => Err(io::Error::new(io::ErrorKind::WouldBlock, other)),
+                    Err(err) => Err(err),
+                };
+            }
         };
+        let Unchecked {
+            checks,
+            ops,
+            appends,
+            durability,
+            read_queue,
+            writes,
+        } = unchecked;
         Ok(Requested::Queued {
             request: WriteRequest::Txn(Box::new(TxnRequest {
                 checks,

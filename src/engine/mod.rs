@@ -100,7 +100,7 @@ use crate::sync::internal::wait_here;
 use background_health::{BackgroundHealth, Job};
 use block_cache::BlockCache;
 pub(crate) use commit::PendingAppend;
-pub(crate) use commit::{NowaitCommit, PendingCommit, TxnCommit, conclude_settled};
+pub(crate) use commit::{NowaitCommit, OwedCommit, PendingCommit, TxnCommit, conclude_settled};
 use commit::{Pipeline, StallSignal};
 use compaction::{Claims, CompactionOptions, CompactionOutcome, CompactionScheduler};
 use compaction_gate::{CompactionGate, Exclusive};
