@@ -273,10 +273,10 @@ async fn wait_out(would_block: WouldBlock) {
 /// [`Transaction::commit_nowait`]. Any other error from `prepare` is the
 /// attempt's outcome, as it is for `commit`. A write stall does not end the attempt:
 /// its commit stays pending and the ticket completes once the stop is
-/// relieved. A commit whose validation needed a block the cache does not
-/// hold waits for that read and runs the attempt again, uncounted, with the
-/// same `previous` conflict. The wait the policy asks for before a re-run is
-/// a wait on `queue` too.
+/// relieved. A commit whose validation needs a block the cache does not
+/// hold waits for that read on `queue` and goes on, so `f` is not run again
+/// for it either. The wait the policy asks for before a re-run is a wait on
+/// `queue` too.
 async fn run_async<T, E>(
     policy: RetryPolicy,
     engine: Arc<RegolithEngine>,
@@ -345,9 +345,9 @@ impl OptimisticTransactionDb {
     ///
     /// A write stall does not end the attempt: its commit stays pending
     /// until the stop is relieved, and `f` is not run again for it. A commit
-    /// whose validation needed a block the cache does not hold waits for
-    /// that read and runs the attempt again; that run is not counted against
-    /// the policy, and it gets the same previous conflict. An error from `f`
+    /// whose validation needs a block the cache does not hold waits for that
+    /// read on `queue` the same way, and `f` is not run again for it either.
+    /// An error from `f`
     /// ends the attempt with [`TransactError::Closure`] and is not retried;
     /// any failure but a conflict ends it with [`TransactError::Engine`]. A
     /// `before_commit` callback that fails is such a failure, as it is for

@@ -18,7 +18,7 @@ use tempfile::TempDir;
 use super::hook::{self, Stage};
 use crate::{
     Access, IsolationLevel, OptimisticTransactionDb, Options, ReadMode, ScanCheck, ScanDirection,
-    Transaction, TransactionDb, TransactionError, TxnOptions, WouldBlock,
+    Transaction, TransactionDb, TransactionError, TxnOptions,
 };
 
 const LEVELS: [IsolationLevel; 5] = [
@@ -396,9 +396,10 @@ fn cold(dir: &TempDir) -> OptimisticTransactionDb {
 }
 
 /// A `commit_nowait` through a `CacheOnly` handle never reads the device in
-/// its check, written or not: a miss refuses the commit with the wait for
-/// the block, and the transaction made again once the queue read it
-/// commits or conflicts as its check says.
+/// its check, written or not: a miss leaves the commit on its queue, which
+/// reads the block, and the check run again there commits or conflicts as
+/// it says. The earlier contract refused the commit here with the wait in
+/// its ticket, and the transaction it consumed was lost (`NowaitMiss.tla`).
 #[test]
 fn a_cache_only_commit_that_writes_nothing_never_reads_the_device() {
     for level in [IsolationLevel::DefraLevel, IsolationLevel::RepeatableRead] {
@@ -429,15 +430,12 @@ fn a_cache_only_commit_that_writes_nothing_never_reads_the_device() {
         db.db().flush().unwrap();
         let ticket = tx.commit_nowait();
         assert!(
-            ticket.is_ready(),
-            "{level:?}: a refused commit waits for nothing"
+            !ticket.is_ready(),
+            "{level:?}: the check read the device, or its miss ended the commit"
         );
         assert!(
-            matches!(
-                queue.block_on(ticket),
-                Err(TransactionError::WouldBlock(WouldBlock::Io(_)))
-            ),
-            "{level:?}: the check read the device"
+            matches!(queue.block_on(ticket), Err(TransactionError::Conflict(_))),
+            "{level:?}: the check run again missed the newer version"
         );
     }
 }

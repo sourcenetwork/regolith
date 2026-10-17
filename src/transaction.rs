@@ -215,11 +215,12 @@ pub enum TransactionError {
     /// names, then run the call again (see [`TxnOptions::read_mode`]); a
     /// cursor or stream carries on where it stopped, and the read is not a
     /// reason to roll back. A [`Transaction::commit_nowait`] would have read
-    /// the device to run its `before_commit` callbacks or to validate: the
-    /// transaction applied nothing and ended with its `on_abort` callbacks;
-    /// run it again once the wait is ready. A commit is never ended by a
-    /// write stall ([`crate::WouldBlock::Stall`]): it waits the stall out
-    /// (see [`Transaction::commit`]).
+    /// the device to run its `before_commit` callbacks: the transaction
+    /// applied nothing and ended with its `on_abort` callbacks; run it again
+    /// once the wait is ready. A commit is never ended by a miss of its own
+    /// validation, nor by a write stall ([`crate::WouldBlock::Stall`]): it
+    /// waits on its queue for the read or the stall (see
+    /// [`Transaction::commit_nowait`] and [`Transaction::commit`]).
     #[error("{0}")]
     WouldBlock(crate::WouldBlock),
     /// A key in the transaction's validation set was written by

@@ -533,9 +533,10 @@ impl Descriptor {
         }
     }
 
-    /// The queue the slot's own validation reads send their misses to: set
-    /// for a transaction committed without waiting through a `CacheOnly`
-    /// handle, whose validation never reads the device.
+    /// The queue of the `CacheOnly` handle the slot's commit or allocation
+    /// was made through, `None` for every other slot: the thread that drives
+    /// the slot after its call returned reads through it (`resume.rs`), and
+    /// an allocation's counter is read from the cache alone (`read_mode.rs`).
     pub(super) fn read_queue(&self) -> Option<QueueId> {
         match &self.work {
             Work::Request(WriteRequest::Txn(txn)) => txn.read_queue,

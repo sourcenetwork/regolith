@@ -74,6 +74,9 @@ impl RegolithEngine {
             if self.io().wait_on(queue, job, Some(nudge)) {
                 return;
             }
+            // The queue is gone and polls no more: the commit reads the
+            // device here, as a blocking one does.
+            let _device = scope::blocking();
             let index = if desc.is(INSTALLED) {
                 desc.index()
             } else {

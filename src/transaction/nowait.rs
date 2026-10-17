@@ -17,6 +17,13 @@
 //!   on this transaction's queue once the commit is published: the outcome
 //!   is resolved, and the transaction's callbacks run, at the poll that
 //!   delivers it, on the queue's thread.
+//! - Through a `CacheOnly` handle, a commit whose validation needs a block
+//!   the cache does not hold is never ended by the miss: the transaction
+//!   was consumed and cannot commit a second time. A miss before its slot
+//!   leaves it owed on its queue, checked again at the poll that finds the
+//!   block read (`Committed::Owed`); a miss deciding its slot leaves the
+//!   decision on the queue, where the poll makes it with the device
+//!   (`NowaitMiss.tla`). Either way the ticket completes on the queue.
 //!
 //! A pessimistic commit's key locks are released when the commit lands, by
 //! the thread that lands it: the commit is applied and visible by then (and
@@ -37,13 +44,28 @@
 //! run once, at return for a ticket ready then, else at delivery, through the
 //! same function `commit` uses (`callbacks::Ending`).
 
+use std::future::Future;
+use std::io;
+use std::pin::Pin;
 use std::sync::{Arc, Weak};
+use std::task::{Context, Poll, Waker};
 
-use super::{Transaction, TransactionError, TxResult, receipt_of};
-use crate::engine::io::job::Delivery;
+use super::{Transaction, TransactionError, TxResult, policy, receipt_of};
+use crate::engine::callback::InCommit;
+use crate::engine::io::job::{Delivery, Job, JobBody, Step};
+use crate::engine::io::scope;
 use crate::engine::io::shared::QueueShared;
-use crate::engine::{NowaitCommit, PendingCommit, RegolithEngine, SnapshotPin, conclude_settled};
-use crate::{CommitReceipt, CommitTicket, Error};
+use crate::engine::take::Take;
+use crate::engine::{
+    CommitOutcome, NowaitCommit, OwedCommit, PendingCommit, RegolithEngine, SnapshotPin,
+    ValidationSet, conclude_settled,
+};
+use crate::io_queue::completion::Completion;
+use crate::io_queue::wait::copy_would_block;
+use crate::{CommitReceipt, CommitTicket, Error, IoWait, QueueId, WouldBlock};
+
+/// The shared half of a commit's ticket.
+type Ticket = Completion<TxResult<CommitReceipt>>;
 
 /// The snapshot pin of a commit that lands later, let go by whoever lands
 /// it (see the module docs).
@@ -85,6 +107,75 @@ enum Committed {
         queue: Arc<QueueShared>,
         scan_runs_dropped: u64,
     },
+    /// Its check needs a block the cache does not hold, and nothing of it
+    /// was taken (`NowaitMiss.tla`). Boxed, so only a miss pays for it.
+    Owed(Box<Owing>),
+}
+
+/// A commit owed a read: it waits on `queue` for `wait`, and is submitted
+/// again there once the read is done.
+struct Owing {
+    owed: Owed,
+    wait: IoWait,
+    queue: Arc<QueueShared>,
+    scan_runs_dropped: u64,
+}
+
+/// What an owed commit submits again.
+enum Owed {
+    /// A commit that writes, owed its early check.
+    Writes(OwedCommit),
+    /// A commit that writes nothing, owed its check; it takes no slot
+    /// (`RegolithEngine::commit_write_free`).
+    WriteFree {
+        checks: ValidationSet,
+        read_queue: Option<QueueId>,
+    },
+}
+
+/// The read an owed commit waits for, as a job of the commit's queue: the
+/// queue's poll steps it, and it parks until the queue finished the read.
+struct ReadOwed(IoWait);
+
+impl JobBody for ReadOwed {
+    /// The read is the queue's to do, at its poll: nothing is left to run
+    /// here, and the commit submitted again reports what it finds.
+    fn run(self: Box<Self>) {}
+
+    fn step(mut self: Box<Self>, waker: &Waker) -> Step {
+        match Pin::new(&mut self.0).poll(&mut Context::from_waker(waker)) {
+            Poll::Ready(()) => Step::Done,
+            Poll::Pending => Step::Parked(self),
+        }
+    }
+
+    fn release(self: Box<Self>) {}
+}
+
+/// An owed commit waiting for its read, told on its queue's thread when the
+/// read is done, or on the thread that dropped the queue.
+struct Resubmit {
+    /// The transaction, resolved, its snapshot pinned and its locks held
+    /// until the commit lands, and what it submits again.
+    waiting: Take<(Transaction, Owed)>,
+    claimed: bool,
+    queue: Arc<QueueShared>,
+    scan_runs_dropped: u64,
+    completion: Arc<Ticket>,
+}
+
+impl Delivery for Resubmit {
+    fn deliver(&self) {
+        if let Some((txn, owed)) = self.waiting.take() {
+            txn.resubmit(
+                owed,
+                self.claimed,
+                &self.queue,
+                self.scan_runs_dropped,
+                &self.completion,
+            );
+        }
+    }
 }
 
 impl Transaction {
@@ -138,10 +229,11 @@ impl Transaction {
     ///   with [`TransactionError::WouldBlock`] in the ticket, and the
     ///   `on_abort` callbacks run. [`OptimisticTransactionDb::transact_async`](super::OptimisticTransactionDb::transact_async)
     ///   prepares first and waits out such a miss instead. The commit's own
-    ///   validation reads only the cache too, whichever thread runs it: a
-    ///   block it needs and the cache does not hold ends the commit with
-    ///   [`TransactionError::WouldBlock`] in the ticket, having taken no
-    ///   sequence and written nothing, and the read is on the queue.
+    ///   validation reads only the cache on this thread too, but a miss there
+    ///   never ends the commit, which could not be made again: the block is
+    ///   read at a poll of this transaction's queue, and the commit goes on
+    ///   there, checked again before it takes a slot or decided with the
+    ///   device once it has one. Its ticket then completes on the queue.
     /// - **Locks and the snapshot.** The snapshot is released when this
     ///   returns. A pessimistic transaction's key locks are held until the
     ///   commit lands (applied and visible, and durable at `Immediate`), so
@@ -197,6 +289,23 @@ impl Transaction {
             Committed::Done(Err(Error::Closed.into()))
         };
         self.resolved = true;
+        self.conclude_nowait(&engine, claimed, committed, &completion);
+        CommitTicket::new(completion)
+    }
+
+    /// End the commit as far as `committed` got: tell `completion` the
+    /// outcome now, leave the commit to tell it on its queue once published,
+    /// or leave it owed on its queue. What `commit_nowait` does at return,
+    /// and what an owed commit does once it was submitted again. Inlined so
+    /// the transaction is not moved again on the path that does not miss.
+    #[inline(always)]
+    fn conclude_nowait(
+        mut self,
+        engine: &Arc<RegolithEngine>,
+        claimed: bool,
+        committed: Committed,
+        completion: &Arc<Ticket>,
+    ) {
         match committed {
             Committed::Done(result) => {
                 // As `commit` ends: locks and snapshot first, so a callback
@@ -216,7 +325,7 @@ impl Transaction {
             } => {
                 let locks = self.take_landing_locks();
                 let snapshot = Arc::new(LandingSnapshot {
-                    engine: Arc::downgrade(&engine),
+                    engine: Arc::downgrade(engine),
                     pin: crate::sync::Mutex::new(self.snapshot_pin.take()),
                 });
                 self.release_resources();
@@ -231,7 +340,7 @@ impl Transaction {
                         .and_then(|settled| conclude_settled(stats.as_deref(), settled));
                     receipt_of(stats.as_deref(), settled, snapshot_seq, scan_runs_dropped)
                 }));
-                let report = Arc::downgrade(&engine);
+                let report = Arc::downgrade(engine);
                 completion.first(Box::new(move |result| {
                     if let Err(TransactionError::Conflict(conflict)) = result
                         && let Some(engine) = report.upgrade()
@@ -250,15 +359,79 @@ impl Transaction {
                 if !pending.listen(Arc::clone(&snapshot) as Arc<dyn Delivery>) {
                     snapshot.release();
                 }
-                let waiter: Arc<dyn Delivery> = Arc::clone(&completion) as Arc<dyn Delivery>;
+                let waiter: Arc<dyn Delivery> = Arc::clone(completion) as Arc<dyn Delivery>;
                 // Told on the queue once the commit is published. A queue
                 // dropped since this commit looked it up would have
                 // delivered the ticket on its thread, so this one does,
                 // once the commit was brought through.
                 engine.await_commit(&pending, &queue, waiter);
             }
+            Committed::Owed(owing) => {
+                let Owing {
+                    owed,
+                    wait,
+                    queue,
+                    scan_runs_dropped,
+                } = *owing;
+                // Nothing but this commit decides its ticket, so what the
+                // outcome owes is set once it was submitted again, before
+                // that decision.
+                let resubmit = Arc::new(Resubmit {
+                    waiting: Take::empty(),
+                    claimed,
+                    queue: Arc::clone(&queue),
+                    scan_runs_dropped,
+                    completion: Arc::clone(completion),
+                });
+                resubmit.waiting.put((self, owed));
+                let job = Job::new(Box::new(ReadOwed(wait)));
+                let told = Arc::clone(&resubmit) as Arc<dyn Delivery>;
+                if !engine.io().wait_on(&queue, job, Some(told)) {
+                    // The queue is gone and polls no more.
+                    resubmit.deliver();
+                }
+            }
         }
-        CommitTicket::new(completion)
+    }
+
+    /// Submit an owed commit again, once the read it waited for is done, and
+    /// end it as far as that gets. On its queue's thread, or on the thread
+    /// that dropped the queue: a queue that is gone polls no more, so the
+    /// commit then reads the device here, as a blocking one does.
+    fn resubmit(
+        self,
+        owed: Owed,
+        claimed: bool,
+        queue: &Arc<QueueShared>,
+        scan_runs_dropped: u64,
+        completion: &Arc<Ticket>,
+    ) {
+        let engine = Arc::clone(&self.engine);
+        let on_device = engine.io().queue(queue.id()).is_none();
+        let committed = {
+            // A panic in the caller's classifier is caught in this
+            // validation too, as `drain_for_commit` arranges for the first.
+            let _contain =
+                policy::classifier_for(&self.policy, self.isolation).map(|_| InCommit::enter());
+            match owed {
+                Owed::Writes(commit) => self.submitted(
+                    engine.resubmit_nowait(commit, on_device),
+                    Arc::clone(queue),
+                    scan_runs_dropped,
+                ),
+                Owed::WriteFree { checks, read_queue } => {
+                    let _device = on_device.then(scope::blocking);
+                    self.write_free(
+                        &engine,
+                        checks,
+                        read_queue.filter(|_| !on_device),
+                        Some(Arc::clone(queue)),
+                        scan_runs_dropped,
+                    )
+                }
+            }
+        };
+        self.conclude_nowait(&engine, claimed, committed, completion);
     }
 
     /// The commit up to the point it returns: the claim was won.
@@ -287,36 +460,93 @@ impl Transaction {
             Ok(drained) => drained,
             Err(err) => return Committed::Done(Err(err)),
         };
-        let stats = engine.statistics();
-        let receipt = |outcome| receipt_of(stats, outcome, self.snapshot_seq, scan_runs_dropped);
         // A `CacheOnly` handle never reads the device, in its commit's own
         // validation either, written or not.
         let read_queue = self.read_mode().queue();
         if write_free {
-            return Committed::Done(receipt(
-                engine.commit_write_free(&commit.checks, read_queue),
-            ));
+            return self.write_free(engine, commit.checks, read_queue, queue, scan_runs_dropped);
         }
         commit.read_queue = read_queue;
         let Some(queue) = queue else {
             // No queue to complete on: the commit syncs inline.
-            return Committed::Done(receipt(engine.commit_with_conflict_check(
+            let outcome = engine.commit_with_conflict_check(
                 commit.checks,
                 commit.point_ops,
                 commit.range_deletes,
                 commit.merges,
                 commit.appends,
                 commit.durability,
-            )));
+            );
+            return Committed::Done(self.receipt(outcome, scan_runs_dropped));
         };
-        match engine.commit_optimistic_nowait(commit) {
-            Ok(NowaitCommit::Done(outcome)) => Committed::Done(receipt(Ok(outcome))),
+        self.submitted(
+            engine.commit_optimistic_nowait(commit),
+            queue,
+            scan_runs_dropped,
+        )
+    }
+
+    /// What the engine's answer to a commit that writes makes of it.
+    fn submitted(
+        &self,
+        answer: io::Result<NowaitCommit>,
+        queue: Arc<QueueShared>,
+        scan_runs_dropped: u64,
+    ) -> Committed {
+        match answer {
+            Ok(NowaitCommit::Done(outcome)) => {
+                Committed::Done(self.receipt(Ok(outcome), scan_runs_dropped))
+            }
             Ok(NowaitCommit::Pending(pending)) => Committed::Pending {
                 pending,
                 queue,
                 scan_runs_dropped,
             },
-            Err(err) => Committed::Done(receipt(Err(err))),
+            Ok(NowaitCommit::Owed { commit, wait }) => Committed::Owed(Box::new(Owing {
+                owed: Owed::Writes(commit),
+                wait,
+                queue,
+                scan_runs_dropped,
+            })),
+            Err(err) => Committed::Done(self.receipt(Err(err), scan_runs_dropped)),
         }
+    }
+
+    /// Check a commit that writes nothing, which takes no slot, owed its
+    /// check when it needs a block a `CacheOnly` handle may not read.
+    fn write_free(
+        &self,
+        engine: &RegolithEngine,
+        checks: ValidationSet,
+        read_queue: Option<QueueId>,
+        queue: Option<Arc<QueueShared>>,
+        scan_runs_dropped: u64,
+    ) -> Committed {
+        let outcome = engine.commit_write_free(&checks, read_queue);
+        if let (Err(err), Some(queue)) = (&outcome, queue)
+            && let Some(WouldBlock::Io(wait)) = copy_would_block(err)
+        {
+            return Committed::Owed(Box::new(Owing {
+                owed: Owed::WriteFree { checks, read_queue },
+                wait,
+                queue,
+                scan_runs_dropped,
+            }));
+        }
+        Committed::Done(self.receipt(outcome, scan_runs_dropped))
+    }
+
+    /// The commit's receipt, or why it failed, from what the engine decided.
+    fn receipt(
+        &self,
+        outcome: io::Result<CommitOutcome>,
+        scan_runs_dropped: u64,
+    ) -> TxResult<CommitReceipt> {
+        receipt_of(
+            self.engine.statistics(),
+            outcome,
+            self.snapshot_seq,
+            scan_runs_dropped,
+        )
     }
 }

@@ -379,10 +379,12 @@ fn a_prepare_that_would_block_resolves_the_ticket_with_its_wait() {
     assert_eq!(db.db().get(b"k").unwrap(), None);
 }
 
-/// The commit's own validation honours `CacheOnly` as its reads do: a block
-/// it needs and the cache does not hold ends the commit with the wait for
-/// it, in the ticket, having taken no sequence. The read is on the queue,
-/// and the commit made again after the queue's polls lands.
+/// The commit's own validation honours `CacheOnly` as its reads do: it reads
+/// no block the cache does not hold on the calling thread, and takes no
+/// sequence before it has the block. The read is on the queue, and the
+/// commit, checked again at the queue's poll, lands. The earlier contract
+/// ended the commit here with the wait in its ticket, and the transaction it
+/// consumed was lost (`NowaitMiss.tla`).
 #[test]
 fn a_validation_that_would_block_resolves_the_ticket_with_its_wait() {
     let dir = TempDir::new().unwrap();
@@ -409,28 +411,17 @@ fn a_validation_that_would_block_resolves_the_ticket_with_its_wait() {
     };
     let ticket = attempt();
     let before = db.db().latest_sequence();
-    assert!(ticket.is_ready(), "a refused commit waits for nothing");
     assert!(
-        matches!(
-            queue.block_on(ticket),
-            Err(TransactionError::WouldBlock(WouldBlock::Io(_)))
-        ),
-        "the commit's validation read the device"
+        !ticket.is_ready(),
+        "the commit's validation read the device, or its miss ended the commit"
     );
     assert_eq!(db.db().latest_sequence(), before);
     assert_eq!(db.db().get(b"k01000").unwrap(), Some(b"x".to_vec()));
 
-    let mut attempts = 0;
-    loop {
-        attempts += 1;
-        assert!(attempts < 100, "the commit never found its blocks");
-        queue.poll(IoBudget::ALL);
-        match queue.block_on(attempt()) {
-            Ok(_) => break,
-            Err(TransactionError::WouldBlock(WouldBlock::Io(_))) => {}
-            Err(other) => panic!("the commit failed: {other:?}"),
-        }
-    }
+    let receipt = queue
+        .block_on(ticket)
+        .expect("the commit lands once its queue read the block");
+    assert!(receipt.seq() > before);
     assert_eq!(db.db().get(b"k01000").unwrap(), Some(b"mine".to_vec()));
 }
 

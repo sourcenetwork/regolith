@@ -290,6 +290,7 @@ fn a_drop_publishes_the_commit_left_pending_before_it_runs() {
         NowaitCommit::Done(outcome) => {
             panic!("setup: the nowait commit did not wait for its sync: {outcome:?}")
         }
+        NowaitCommit::Owed { .. } => panic!("setup: the nowait commit missed a block"),
     };
     let owed_seq = engine.last_decided_seq();
     assert!(
