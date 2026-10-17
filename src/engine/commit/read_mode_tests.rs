@@ -1,7 +1,7 @@
-//! Whose reads the decision of a slot may make: a commit made through a
-//! `CacheOnly` handle is never validated with the device, whichever thread
-//! decides it, and a thread that must not read the device decides nobody's
-//! slot with it.
+//! Whose reads the decision of a slot may make: a thread that may read the
+//! device decides a slot with it, a `CacheOnly` commit's included, and a
+//! thread that must not read the device decides nobody's slot with it, its
+//! own included: its queue's poll does.
 //!
 //! Each test stops a committer twice with the stage hooks: between its
 //! reservation and its install, while a flush raises the version past the
@@ -15,9 +15,7 @@ use std::time::Duration;
 use tempfile::TempDir;
 
 use super::super::hook::{self, Stage};
-use crate::{
-    IoBudget, OptimisticTransactionDb, Options, ReadMode, TransactionError, TxnOptions, WouldBlock,
-};
+use crate::{OptimisticTransactionDb, Options, ReadMode, TxnOptions, WouldBlock};
 
 /// A key in a table no block of which is in the cache.
 const COLD: &[u8] = b"k01000";
@@ -86,9 +84,11 @@ fn flush_past_the_horizon(db: &OptimisticTransactionDb) {
 }
 
 /// The first rule. The slot of a commit made through a `CacheOnly` handle is
-/// decided here by another thread, one that makes a blocking write and
-/// could read the device: it reads only the cache for that slot, and the
-/// miss refuses the commit with the wait, on the commit's own queue.
+/// decided here by another thread, one that makes a blocking write and may
+/// read the device: it decides the slot with it, and the commit lands. The
+/// earlier contract decided the slot from the cache alone and refused the
+/// commit with the wait, and the transaction it consumed was lost
+/// (`NowaitMiss.tla`).
 #[test]
 fn a_cache_only_commit_is_never_validated_with_the_device_whoever_decides_it() {
     let dir = TempDir::new().unwrap();
@@ -105,40 +105,59 @@ fn a_cache_only_commit_is_never_validated_with_the_device_whoever_decides_it() {
         // A blocking write behind the commit decides the commit's slot.
         || db.db().put(b"another", b"x").unwrap(),
     );
-    assert!(ticket.is_ready(), "a refused commit waits for nothing");
-    assert!(
-        matches!(
-            queue.block_on(ticket),
-            Err(TransactionError::WouldBlock(WouldBlock::Io(_)))
-        ),
-        "the commit was validated with the device"
-    );
+    let receipt = queue
+        .block_on(ticket)
+        .expect("the blocking writer decided the commit's slot with the device");
     assert_eq!(
         db.db().latest_sequence(),
-        before + 2,
-        "the refused commit took a sequence"
+        before + 3,
+        "the commit took no sequence"
     );
-    assert_eq!(db.db().get(COLD).unwrap(), Some(b"x".to_vec()));
+    assert!(
+        receipt.seq() < before + 3,
+        "the commit is ordered before the write that decided its slot"
+    );
+    assert_eq!(db.db().get(COLD).unwrap(), Some(b"mine".to_vec()));
+}
 
-    // The read is on the commit's queue: made again after the queue's
-    // polls, the commit finds its blocks and lands. A write after each
-    // attempt's snapshot makes its check look the key up again.
-    let mut attempts = 0;
-    let receipt = loop {
-        attempts += 1;
-        assert!(attempts < 100, "the commit never found its blocks");
-        queue.poll(IoBudget::ALL);
-        let txn = db.begin(&options);
-        txn.put(COLD, b"mine").unwrap();
-        db.db().put(b"bump", b"x").unwrap();
-        let ticket = txn.commit_nowait();
-        match queue.block_on(ticket) {
-            Ok(receipt) => break receipt,
-            Err(TransactionError::WouldBlock(WouldBlock::Io(_))) => {}
-            Err(other) => panic!("the commit failed: {other:?}"),
-        }
-    };
-    assert!(receipt.seq() > before + 2);
+/// The committer finds the block its slot's decision needs missing, and no
+/// other thread decides the slot: the call leaves the decision on its queue
+/// and returns, having read no block, and the queue's poll decides the slot
+/// with the device. The earlier contract refused the commit with the wait.
+#[test]
+fn a_cache_only_commit_whose_decision_misses_is_decided_at_its_queues_poll() {
+    let dir = TempDir::new().unwrap();
+    let db = cold(&dir);
+    let mut queue = db.db().io_queue();
+    let probe = db.db().io_queue();
+    let txn = db.begin(&TxnOptions::new().read_mode(ReadMode::CacheOnly(queue.id())));
+    txn.put(COLD, b"mine").unwrap();
+    let before = db.db().latest_sequence();
+
+    let ticket = stopped_twice(
+        move || txn.commit_nowait(),
+        || flush_past_the_horizon(&db),
+        || {},
+    );
+    assert!(!ticket.is_ready(), "the miss ended the commit");
+    assert_eq!(
+        db.db().latest_sequence(),
+        before + 1,
+        "the slot was decided without its block"
+    );
+    let cold_still = db
+        .db()
+        .snapshot()
+        .with_read_mode(ReadMode::CacheOnly(probe.id()))
+        .get(COLD);
+    assert!(
+        matches!(cold_still, Err(crate::Error::WouldBlock(WouldBlock::Io(_)))),
+        "the committing call read the device"
+    );
+
+    queue
+        .block_on(ticket)
+        .expect("the queue's poll decides the slot with the device");
     assert_eq!(db.db().get(COLD).unwrap(), Some(b"mine".to_vec()));
 }
 
