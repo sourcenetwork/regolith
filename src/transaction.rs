@@ -2109,8 +2109,11 @@ impl Transaction {
         // nothing needs the buffers' own copies afterwards, and draining
         // hands over the stored keys and values instead of cloning each
         // one. `settle` says what the drained writes commit as.
+        let repeated =
+            self.engine.merge_operator().is_some() && self.writes.may_have_repeated_keys();
         let (writes, mut merges) = settle(self.writes.drain());
-        if merges.len() > 1
+        if repeated
+            && merges.len() > 1
             && let Some(op) = self.engine.merge_operator()
         {
             fold_merges(&mut merges, op, self.engine.max_value_size());

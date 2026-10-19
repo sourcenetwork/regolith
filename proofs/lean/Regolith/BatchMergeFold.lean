@@ -6,6 +6,8 @@ A commit may replace two adjacent operands with the caller's exact partial
 merge. For example, [+1, +1] becomes [+2]. It must not reorder operands,
 invent an answer when the caller declines, or rewrite an older commit.
 These proofs cover every base and every surrounding operand sequence.
+The balanced fold replaces only adjacent subtrees that each reduced to one operand;
+each replacement is a Step. A unique-key buffer uses Steps.refl.
 Publication and snapshot registration remain the existing pipeline's job.
 -/
 

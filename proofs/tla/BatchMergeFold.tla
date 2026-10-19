@@ -10,7 +10,8 @@
 \* Correspondence (source lines at this change):
 \* original: the unfolded reference stream, checked by transaction_merge_folding.rs.
 \* stored, Commit: transaction.rs:2105, Transaction::drain_for_commit owns the drained writes.
-\* Fold: transaction/write_buffer.rs:213, fold_merges; merge_call.rs:28 dispatches the callback.
+\* Fold: fold_merges groups only repeated keys; fold_run replaces adjacent balanced subtrees.
+\* A unique-key buffer skips folding, the identity step. merge_call.rs dispatches the callback.
 \* INV_Reads: the callback's exactness law, proved for every surrounding list in BatchMergeFold.lean.
 \* INV_Parts: options.rs:465, MergeOperator::touches; this is a caller contract, not a new check.
 \* INV_Size: fold_merges checks both original operands and the combined encoding against the limit.

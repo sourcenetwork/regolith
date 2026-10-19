@@ -199,7 +199,7 @@ fn growing_folds_leave_valid_operands_uncombined() {
         tx.merge(b"list", &[byte]).unwrap();
     }
     tx.commit().unwrap();
-    assert_eq!(merge.calls.load(Ordering::Relaxed), 63);
+    assert_eq!(merge.calls.load(Ordering::Relaxed), 32);
     assert_eq!(db.db().get(b"list").unwrap(), Some((0..64).collect()));
 }
 
@@ -342,4 +342,61 @@ fn a_smaller_combined_payload_can_still_exceed_the_value_limit() {
         tx.commit().unwrap();
         assert_eq!(db.db().get(b"list").unwrap(), Some(vec![1, 2, 3, 4]));
     }
+}
+
+#[derive(Default)]
+struct Growing {
+    bytes: AtomicUsize,
+    calls: AtomicUsize,
+}
+
+impl MergeOperator for Growing {
+    fn name(&self) -> &'static str {
+        "growing"
+    }
+
+    fn full_merge(&self, _: &[u8], base: Option<&[u8]>, operands: &[&[u8]]) -> Option<Vec<u8>> {
+        let mut result = base.unwrap_or_default().to_vec();
+        for operand in operands {
+            result.extend_from_slice(operand.strip_prefix(b"operand:")?);
+        }
+        Some(result)
+    }
+
+    fn partial_merge(&self, _: &[u8], left: &[u8], right: &[u8]) -> Option<Vec<u8>> {
+        self.calls.fetch_add(1, Ordering::Relaxed);
+        self.bytes
+            .fetch_add(left.len() + right.len(), Ordering::Relaxed);
+        let mut result = left.to_vec();
+        result.extend_from_slice(right.strip_prefix(b"operand:")?);
+        Some(result)
+    }
+}
+
+#[test]
+fn growing_operands_have_logarithmically_bounded_commit_work() {
+    const COUNT: u32 = 10_000;
+    let op = Arc::new(Growing::default());
+    let db = OptimisticTransactionDb::open(
+        "growing-merge-work",
+        Options::memory().merge_operator(Some(op.clone())),
+    )
+    .unwrap();
+    let tx = db.begin(&TxnOptions::new());
+    let mut expected = Vec::new();
+    for index in 0..COUNT {
+        let mut operand = b"operand:".to_vec();
+        operand.extend_from_slice(&index.to_be_bytes());
+        tx.merge(b"key", &operand).unwrap();
+        expected.extend_from_slice(&index.to_be_bytes());
+    }
+    tx.commit().unwrap();
+    let bytes = op.bytes.load(Ordering::Relaxed);
+    let levels = COUNT.next_power_of_two().ilog2() as usize;
+    assert!(
+        bytes <= COUNT as usize * 12 * levels,
+        "fold processed {bytes} bytes"
+    );
+    assert_eq!(op.calls.load(Ordering::Relaxed), COUNT as usize - 1);
+    assert_eq!(db.db().get(b"key").unwrap().unwrap(), expected);
 }

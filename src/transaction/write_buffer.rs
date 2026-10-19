@@ -216,21 +216,49 @@ pub(super) fn fold_merges(
     max_value_size: usize,
 ) {
     merges.sort_by(|a, b| a.0.cmp(&b.0));
-    merges.dedup_by(|later, earlier| {
-        if earlier.0 == later.0
-            // Keep invalid inputs intact for the normal admission check.
-            && earlier.1.len() <= max_value_size
-            && later.1.len() <= max_value_size
-            && let Some(combined) = partial_merge(op, &earlier.0, &earlier.1, &later.1)
-            && combined.len() < earlier.1.len().saturating_add(later.1.len())
-            && combined.len() <= max_value_size
-        {
-            earlier.1 = combined;
-            true
-        } else {
-            false
-        }
-    });
+    let mut input = std::mem::take(merges).into_iter();
+    merges.reserve(input.len());
+    while let Some((key, _)) = input.as_slice().first() {
+        let count = input
+            .as_slice()
+            .iter()
+            .take_while(|(next, _)| next == key)
+            .count();
+        fold_run(&mut input, count, merges, op, max_value_size);
+    }
+}
+
+fn fold_run(
+    input: &mut std::vec::IntoIter<(Vec<u8>, Vec<u8>)>,
+    count: usize,
+    output: &mut Vec<(Vec<u8>, Vec<u8>)>,
+    op: &dyn MergeOperator,
+    limit: usize,
+) {
+    if count == 1 {
+        output.push(input.next().expect("the key run is bounded by the input"));
+        return;
+    }
+    let start = output.len();
+    fold_run(input, count / 2, output, op, limit);
+    let middle = output.len();
+    fold_run(input, count - count / 2, output, op, limit);
+    // A declined subtree stays intact. Retrying its prefixes would reintroduce
+    // an unbalanced fold whose callback work can grow quadratically.
+    if middle != start + 1 || output.len() != middle + 1 {
+        return;
+    }
+    let (key, left) = &output[start];
+    let right = &output[middle].1;
+    if left.len() <= limit
+        && right.len() <= limit
+        && let Some(combined) = partial_merge(op, key, left, right)
+        && combined.len() < left.len().saturating_add(right.len())
+        && combined.len() <= limit
+    {
+        output[start].1 = combined;
+        output.pop();
+    }
 }
 
 /// Split a drained buffer, newest write first, into what a commit stores.

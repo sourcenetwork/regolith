@@ -525,6 +525,17 @@ where
         self.removed += (before - remaining) as u64;
     }
 
+    /// Rule out repeated keys without allocating; large unindexed buffers stay conservative.
+    pub(crate) fn may_have_repeated_keys(&mut self) -> bool {
+        if let Some(index) = self.spill.get() {
+            return index.len() < *self.len.get_mut();
+        }
+        if *self.len.get_mut() > 32 {
+            return true;
+        }
+        self.nodes().any(|node| !Self::older(node).is_null())
+    }
+
     /// Every buffered entry, newest write of each key only.
     ///
     /// Takes `&mut self` because it consumes the buffer: draining is what
@@ -583,3 +594,36 @@ mod scan_tests;
 
 #[cfg(test)]
 mod truncate_tests;
+
+#[cfg(test)]
+mod repeated_key_tests {
+    use super::TxnBuffer;
+
+    #[test]
+    fn unindexed_detection_is_bounded_and_conservative() {
+        let mut buffer = TxnBuffer::new(0);
+        for key in 0..32 {
+            buffer.insert(key, key);
+        }
+        assert!(!buffer.may_have_repeated_keys());
+        buffer.insert(32, 32);
+        assert!(buffer.may_have_repeated_keys());
+    }
+
+    #[test]
+    fn unique_keys_and_rollback_use_the_current_index() {
+        for inline in [4, 32] {
+            let mut buffer = TxnBuffer::new(inline);
+            for key in 0..64 {
+                buffer.insert(key, key);
+            }
+            assert!(!buffer.may_have_repeated_keys());
+            buffer.insert(17, 100);
+            assert!(buffer.may_have_repeated_keys());
+            buffer.truncate(64);
+            assert!(!buffer.may_have_repeated_keys());
+            buffer.drain();
+            assert!(!buffer.may_have_repeated_keys());
+        }
+    }
+}
