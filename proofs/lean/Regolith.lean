@@ -223,3 +223,10 @@ import Regolith.MergeChain
 -- only falls, the maximum only rises, adding 0 is nothing), so the skips
 -- lose no sample. Backs `proofs/tla/HistogramBounds.tla`.
 import Regolith.HistogramBounds
+-- E20 and #289: OPFS mirror mode's persist. With the lock taken before a
+-- batch captures, the MANIFEST version OPFS holds never goes down; a failed
+-- removal stays owed and a NotFoundError counts as removed; and a batch in
+-- persist order cut short anywhere has written every table before the
+-- MANIFEST and every file before a removal. Backs
+-- `proofs/tla/MirrorPersist.tla`.
+import Regolith.MirrorPersist

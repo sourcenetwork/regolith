@@ -1452,6 +1452,33 @@ tla:
     check MC_EnvRename_Green_Moved                     RED NeverMovedOn
     check MC_EnvRename_Red_Rollback                    RED Linearizable
     check MC_EnvRename_Red_RemoveIgnoresMark           RED Linearizable
+    # OPFS mirror mode's persist (E20, and #289's lock, keep-alive and
+    # removal check): a batch takes the lock before it captures and holds
+    # it across every browser await; a caller that drops its future drops
+    # neither the batch nor the lock; a removal that fails with anything but
+    # NotFoundError fails the call and its name stays owed; a batch writes
+    # its tables, then the MANIFEST, then makes its removals, and only once
+    # every write went through. Green_ReachesWaitBehindOlder is the witness
+    # that a call waits while an older MANIFEST is being written. Lean:
+    # Regolith/MirrorPersist.lean, serial_never_older, serial_monotone,
+    # failed_removal_stays_owed, all_gone_clears, cut_short_keeps_tables,
+    # cut_short_keeps_writes, batch_ordered, and the REDs
+    # overlap_stores_older, swallow_loses_failed, strict_owed_forever,
+    # manifest_first_loses_table and removal_first_loses_manifest.
+    spec=MirrorPersist
+    check MC_MirrorPersist_Green                       GREEN
+    check MC_MirrorPersist_Red_NoLock                  RED INV_ManifestMonotone
+    check MC_MirrorPersist_Red_NoLock_Clean            RED INV_CleanIsStored
+    check MC_MirrorPersist_Red_CaptureFirst            RED INV_ManifestMonotone
+    check MC_MirrorPersist_Red_NoKeepAlive             RED INV_SerialBatches
+    check MC_MirrorPersist_Red_NoKeepAlive_Manifest    RED INV_ManifestMonotone
+    check MC_MirrorPersist_Red_SwallowRemoval          RED INV_RemovalOwed
+    check MC_MirrorPersist_Red_NotFoundFails           RED LIVE_CatchesUp
+    check MC_MirrorPersist_Red_ManifestFirst           RED INV_ManifestNamesStored
+    check MC_MirrorPersist_Red_DeleteFirst             RED INV_ManifestNamesStored
+    check MC_MirrorPersist_Red_DeleteAfterFailedWrite  RED INV_ManifestNamesStored
+    check MC_MirrorPersist_Red_NoRetry                 RED LIVE_CatchesUp
+    check MC_MirrorPersist_Green_ReachesWaitBehindOlder RED NeverWaitsBehindOlder
     # The pessimistic lock table (plan 4.6, 4.10): one holder per key, no
     # lost wake-up, bounded bypass, a wait delivered to its own queue, and a
     # lock released when its commit lands. Lean: Regolith/LockTable.lean,
