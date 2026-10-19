@@ -420,7 +420,7 @@ theorem failure_keeps_every_name (out : α → Outcome) (owed : α → Prop) (ns
   -- Look at what is owed after.
   unfold owedAfter
   -- The batch returned before settle: what was owed stays owed.
-  rw [if_neg hnot]
+  rw [ite_eq_right hnot]
   -- `k` was owed.
   exact hk
 
@@ -466,7 +466,7 @@ theorem all_gone_clears (out : α → Outcome) (owed : α → Prop) (ns : List �
   -- Look at what is owed after.
   unfold owedAfter
   -- Settle ran: owed means owed before and not captured.
-  rw [if_pos ht]
+  rw [ite_eq_left ht]
   -- Suppose `n` were still owed.
   intro h
   -- It was captured: a contradiction.
@@ -488,7 +488,7 @@ theorem swallow_loses_failed :
   -- Look at what is owed after.
   unfold owedAfter
   -- Settle ran: owed means owed before and not captured.
-  rw [if_pos ht]
+  rw [ite_eq_left ht]
   -- Suppose name 1 were still owed.
   intro h
   -- It was captured: a contradiction.
@@ -510,7 +510,7 @@ theorem strict_keeps_absent (out : α → Outcome) (owed : α → Prop) (ns : Li
   -- Look at what is owed after.
   unfold owedAfter
   -- The batch returned before settle.
-  rw [if_neg hnot]
+  rw [ite_eq_right hnot]
   -- `n` was owed.
   exact howed
 
