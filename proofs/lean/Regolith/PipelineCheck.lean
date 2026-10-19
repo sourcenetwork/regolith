@@ -596,5 +596,24 @@ theorem plain_write_is_seen :
   -- Concrete lists: evaluate.
   decide
 
+/-- A table ceiling at or below the transaction's observation excludes every
+conflicting table version. `latest_version_after` may visit only the memtables
+when `ReadView.version.last_seq` is at or below that observation. The ceiling
+belongs to the same loaded view as the sources; a concurrent flush publishes
+another view and cannot move a newer version into this one's tables. -/
+theorem old_tables_do_not_change_validation
+    -- The sources of the loaded view and the transaction being checked.
+    (mem tables : List (Nat × Nat)) (t : Txn) (ceiling : Nat)
+    -- Every table version is bounded by this view's recorded ceiling.
+    (bounded : ∀ v ∈ tables, v.2 ≤ ceiling)
+    -- The transaction observed every sequence up to that ceiling.
+    (observed : ceiling ≤ t.snap) :
+    -- Looking at old tables cannot change conflict detection.
+    conflicts (mem ++ tables) t = conflicts mem t := by
+  -- The complete check is the disjunction of the checks of its sources.
+  simp only [conflicts, List.any_append]
+  -- No table version is above the observation, so that disjunct is false.
+  rw [nothing_above_ceiling tables t t.snap ceiling bounded observed, Bool.or_false]
+
 -- The end of this file's names.
 end Regolith.PipelineCheck

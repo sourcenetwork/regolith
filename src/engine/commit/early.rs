@@ -160,7 +160,9 @@ impl RegolithEngine {
             if horizon <= check.observed_seq {
                 continue;
             }
-            let Some((seq, theirs)) = self.latest_version_in_view(&check.key, &view)? else {
+            let Some((seq, theirs)) =
+                self.latest_version_after(&check.key, check.observed_seq, &view)?
+            else {
                 continue;
             };
             if seq <= check.observed_seq {
@@ -296,7 +298,7 @@ impl RegolithEngine {
     ) -> io::Result<bool> {
         if !memtables_only {
             return Ok(self
-                .latest_version_in_view(key, view)?
+                .latest_version_after(key, horizon, view)?
                 .is_some_and(|(seq, _)| seq > horizon));
         }
         let lk = LookupKey::from_prefixed(key, u64::MAX);
