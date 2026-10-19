@@ -74,6 +74,8 @@ import Regolith.VersionStep
 -- Plan 3.3: an exact partial_merge folds to full_merge in any grouping, and
 -- the touches law. Backs `proofs/tla/RepeatableRead.tla`.
 import Regolith.MergeOperator
+-- Same-commit partial merges keep reads and leave earlier commits untouched.
+import Regolith.BatchMergeFold
 -- Plan 3.1 to 3.15: every key class's commit rule accepts only histories
 -- equal to the serial one in commit order, up to the class's relaxation.
 -- Backs `proofs/tla/RepeatableRead.tla`.

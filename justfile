@@ -545,6 +545,16 @@ tla:
     check MC_RepeatableRead_Red_Serializable           RED INV_AppendsCommit
     check MC_RepeatableRead_Red_SnapshotIsolation      RED INV_NoStaleDefinition
     check MC_RepeatableRead_Red_ReadCommitted          RED INV_NoStaleDefinition
+    # Same-commit operand folding; Lean: Regolith/BatchMergeFold.lean.
+    spec=BatchMergeFold
+    check MC_BatchMergeFold_Green                     GREEN
+    check MC_BatchMergeFold_Green_Size                GREEN
+    check MC_BatchMergeFold_Red_Order                 RED INV_Reads
+    check MC_BatchMergeFold_Red_Declined              RED INV_Reads
+    check MC_BatchMergeFold_Red_Boundary              RED INV_Reads
+    check MC_BatchMergeFold_Red_Size                  RED INV_Size
+    check MC_BatchMergeFold_Red_Parts                 RED INV_Parts
+    spec=RepeatableRead
     check MC_DefraLevel_Green_Heads                    GREEN
     check MC_DefraLevel_Green_Counters                 GREEN
     check MC_DefraLevel_Green_Counters_Clear           GREEN

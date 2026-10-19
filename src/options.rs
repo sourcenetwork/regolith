@@ -279,8 +279,10 @@ pub trait MergeOperator: Send + Sync + 'static {
 
     /// Optionally fold two adjacent operands `left` (older) and
     /// `right` (newer) into a single equivalent operand without a
-    /// base value. Compaction calls this to shrink a key's run of
-    /// operands when it has no value to fold them onto, which includes
+    /// base value. Transaction commits also use this when the combined
+    /// operand saves payload bytes and fits the value limit. Compaction
+    /// calls it to shrink a key's run of operands when it has no value
+    /// to fold them onto, which includes
     /// every run a live snapshot separates from its base. It folds a
     /// run pairwise from oldest to newest, so the fold must be
     /// associative: any run, in any grouping, has to give the value

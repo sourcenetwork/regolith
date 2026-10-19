@@ -1144,6 +1144,10 @@ impl RegolithEngine {
         self.options.merge_operator.as_deref()
     }
 
+    pub(crate) fn max_value_size(&self) -> usize {
+        self.options.max_value_size
+    }
+
     /// Refuses a merge write on a database with no operator to fold it, which
     /// reads would otherwise disagree about.
     pub(crate) fn require_merge_operator(&self) -> Result<(), crate::Error> {

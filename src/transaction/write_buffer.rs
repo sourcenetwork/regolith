@@ -14,7 +14,7 @@ use std::io;
 use std::ops::ControlFlow;
 
 use crate::DbSlice;
-use crate::engine::merge_call::apply_merge;
+use crate::engine::merge_call::{apply_merge, partial_merge};
 use crate::options::MergeOperator;
 use crate::txn_buffer::TxnBuffer;
 
@@ -206,6 +206,32 @@ pub(super) fn fold_by_key(
 /// What a commit stores: the point writes by key (`None` deletes), and the
 /// merge operands that apply on top of them, oldest first.
 pub(super) type Settled = (BTreeMap<Vec<u8>, Option<Vec<u8>>>, Vec<(Vec<u8>, Vec<u8>)>);
+
+/// Fold adjacent same-key operands inside one atomic commit when this
+/// reduces their combined payload and stays within the value limit.
+/// No version of an earlier commit is replaced.
+pub(super) fn fold_merges(
+    merges: &mut Vec<(Vec<u8>, Vec<u8>)>,
+    op: &dyn MergeOperator,
+    max_value_size: usize,
+) {
+    merges.sort_by(|a, b| a.0.cmp(&b.0));
+    merges.dedup_by(|later, earlier| {
+        if earlier.0 == later.0
+            // Keep invalid inputs intact for the normal admission check.
+            && earlier.1.len() <= max_value_size
+            && later.1.len() <= max_value_size
+            && let Some(combined) = partial_merge(op, &earlier.0, &earlier.1, &later.1)
+            && combined.len() < earlier.1.len().saturating_add(later.1.len())
+            && combined.len() <= max_value_size
+        {
+            earlier.1 = combined;
+            true
+        } else {
+            false
+        }
+    });
+}
 
 /// Split a drained buffer, newest write first, into what a commit stores.
 ///
