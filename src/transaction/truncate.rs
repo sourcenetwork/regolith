@@ -45,7 +45,9 @@ impl Transaction {
     ///   positions past the head, and a truncate only positions at or below
     ///   the head it read. This holds at every isolation level, for an
     ///   optimistic and a pessimistic transaction alike; `truncate_log`
-    ///   takes no lock. A conflict can only come from a read the
+    ///   takes no lock, so a lock another pessimistic transaction holds on an
+    ///   entry key (`get_for_update`) does not hold against it: the entry can
+    ///   be dropped while the lock is held. A conflict can only come from a read the
     ///   transaction itself made of an entry it truncates, at a level that
     ///   validates reads and for a key no classifier declares
     ///   [`KeyClass::Log`](crate::KeyClass::Log).
@@ -65,6 +67,12 @@ impl Transaction {
     /// with `m < n` writes `n` deletes, not `n - m`. regolith does not
     /// assume the entry keys of a log sort by position, so it cannot use one
     /// range delete.
+    ///
+    /// Nothing bounds that cost but the range: every delete is buffered until
+    /// commit, then written as one WAL record and inserted into the memtable.
+    /// Split a long range across transactions, each truncating a slice of it.
+    /// Splitting loses only atomicity: a truncate is idempotent, and a log
+    /// with a prefix partly truncated is as valid as one with none.
     ///
     /// # Errors
     ///

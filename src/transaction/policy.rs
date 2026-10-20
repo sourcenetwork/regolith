@@ -126,9 +126,13 @@ pub enum KeyClass {
     /// through [`crate::Db`] is not either. That is the caller's contract.
     ///
     /// Declare a key `Log` only when every writer of it is `append` or
-    /// `truncate_log`, and when nothing the transaction writes depends on
-    /// entries the log did not yet hold: a decision taken on a read of a log
-    /// may be overtaken by entries appended after the transaction's snapshot.
+    /// `truncate_log`, and when nothing the transaction writes depends on the
+    /// log staying as it read it: a decision taken on a read of a log may be
+    /// overtaken by entries appended after the transaction's snapshot, and by
+    /// a concurrent `truncate_log` dropping an entry it read. Locks do not
+    /// hold either: `truncate_log` takes none, so a pessimistic
+    /// transaction's `get_for_update` lock on an entry key does not stop a
+    /// truncate from dropping that entry.
     Log,
 }
 
