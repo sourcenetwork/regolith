@@ -1120,6 +1120,7 @@ tla:
     spec=ValidationFloor
     check MC_ValidationFloor_Green GREEN
     check MC_ValidationFloor_Red_AlwaysSkip RED Exact
+    check MC_ValidationFloor_Red_StaleIngestCeiling RED Bounded
     spec=ValidationProgress
     check MC_ValidationProgress_Green GREEN
     check MC_ValidationProgress_Green_NoOldChange GREEN

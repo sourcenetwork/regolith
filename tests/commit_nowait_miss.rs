@@ -241,3 +241,33 @@ fn skipping_old_tables_still_detects_a_newer_memtable_write() {
     ));
     assert_eq!(db.db().get(b"result").unwrap(), None);
 }
+
+#[test]
+fn validation_detects_a_newer_ingested_table() {
+    let dir = TempDir::new().unwrap();
+    let (db, _) = cold(&dir);
+    let mut queue = db.db().io_queue();
+    let txn = db.begin(&TxnOptions::new().read_mode(ReadMode::CacheOnly(queue.id())));
+    queue
+        .block_on(regolith::ready(|| txn.get_for_update(COLD)))
+        .unwrap();
+    txn.put(b"result", b"mine").unwrap();
+    let staging = TempDir::new().unwrap();
+    let path = staging.path().join("newer.sst");
+    let mut writer = regolith::SstFileWriter::create(&path, &Options::default()).unwrap();
+    writer.put(COLD, b"ingested").unwrap();
+    writer.finish().unwrap();
+    db.db()
+        .ingest_external_files(&[path], regolith::IngestOptions {
+            snapshot_consistency: false,
+            ..regolith::IngestOptions::default()
+        })
+        .wait()
+        .unwrap();
+    assert!(matches!(
+        queue.block_on(txn.commit_nowait()),
+        Err(TransactionError::Conflict(_))
+    ));
+    assert_eq!(db.db().get(COLD).unwrap(), Some(b"ingested".to_vec()));
+    assert_eq!(db.db().get(b"result").unwrap(), None);
+}

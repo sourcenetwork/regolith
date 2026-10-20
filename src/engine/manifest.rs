@@ -90,6 +90,9 @@ pub(crate) const MAX_LEVELS: usize = 7;
 pub(crate) struct Version {
     pub(crate) levels: Vec<Vec<Arc<LiveSst>>>,
     pub(crate) next_file_id: u64,
+    /// Upper bound of every sequence in this version's tables, including
+    /// ingested global sequences. Installing a table raises it in the same
+    /// edit batch; only Reset may lower it while removing every table.
     pub(crate) last_seq: u64,
     pub(crate) min_wal_id: u64,
     /// How many of the tables have no deletion counts yet
@@ -191,6 +194,7 @@ impl Version {
                 ..slot.meta.clone()
             },
             Arc::clone(&slot.reader),
+            slot.sequence_ceiling,
         );
     }
 }
@@ -1081,6 +1085,16 @@ impl VersionSet {
             }
         }
 
+        #[cfg(debug_assertions)]
+        for edit in edits {
+            if let VersionEdit::AddFile { file, .. } = edit {
+                debug_assert!(
+                    file.sequence_ceiling <= version.last_seq,
+                    "a table sequence exceeds its published version ceiling"
+                );
+            }
+        }
+
         // Checked once the whole batch is in: a compaction removes its inputs
         // and adds its outputs in one batch, so the level is only expected to
         // be sound at the end of it.
@@ -1511,7 +1525,7 @@ impl VersionSet {
                         })?
                         .with_global_seq(meta.global_seq),
                 );
-                version.levels[level].push(LiveSst::new(meta, reader));
+                version.levels[level].push(LiveSst::new(meta, reader, last_seq));
             }
         }
         // Every level left below L0 is one sorted run now: the repair above
@@ -1598,6 +1612,16 @@ mod tests {
         smallest: &[u8],
         largest: &[u8],
     ) -> Arc<LiveSst> {
+        make_live_sst_at_seq(dir, file_id, smallest, largest, 0)
+    }
+
+    fn make_live_sst_at_seq(
+        dir: &Path,
+        file_id: u64,
+        smallest: &[u8],
+        largest: &[u8],
+        seq: u64,
+    ) -> Arc<LiveSst> {
         use super::super::internal_key::{VALUE_TYPE_VALUE, encode_internal_key};
         use super::super::sstable::SsTableWriter;
         use crate::options::CompressionType;
@@ -1607,13 +1631,16 @@ mod tests {
             SsTableWriter::new(&path, 4096, 10, CompressionType::None, None, false, 4096).unwrap();
         writer
             .add(
-                &encode_internal_key(smallest, 1, VALUE_TYPE_VALUE),
+                &encode_internal_key(smallest, seq, VALUE_TYPE_VALUE),
                 b"value",
             )
             .unwrap();
         if smallest != largest {
             writer
-                .add(&encode_internal_key(largest, 1, VALUE_TYPE_VALUE), b"value")
+                .add(
+                    &encode_internal_key(largest, seq, VALUE_TYPE_VALUE),
+                    b"value",
+                )
                 .unwrap();
         }
         let summary = writer.finish().unwrap().unwrap();
@@ -1630,7 +1657,36 @@ mod tests {
                 deletions: None,
             },
             reader,
+            summary.newest_seq,
         )
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "a table sequence exceeds its published version ceiling")]
+    fn a_new_table_requires_its_sequence_ceiling() {
+        let dir = TempDir::new().unwrap();
+        let sst_dir = dir.path().join("sst");
+        std::fs::create_dir_all(&sst_dir).unwrap();
+        let file = make_live_sst_at_seq(&sst_dir, 1, b"a", b"z", 2);
+        let mut vs = VersionSet::open(dir.path(), &sst_dir).unwrap();
+        vs.apply(&[VersionEdit::AddFile { level: 0, file }])
+            .unwrap();
+    }
+
+    #[test]
+    fn a_new_table_and_its_sequence_ceiling_are_one_batch() {
+        let dir = TempDir::new().unwrap();
+        let sst_dir = dir.path().join("sst");
+        std::fs::create_dir_all(&sst_dir).unwrap();
+        let file = make_live_sst_at_seq(&sst_dir, 1, b"a", b"z", 2);
+        let mut vs = VersionSet::open(dir.path(), &sst_dir).unwrap();
+        vs.apply(&[
+            VersionEdit::AddFile { level: 0, file },
+            VersionEdit::SetLastSeq(2),
+        ])
+        .unwrap();
+        assert_eq!(vs.current().last_seq, 2);
     }
 
     fn second_record_checksum_offset(path: &Path) -> usize {

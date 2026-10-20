@@ -619,6 +619,7 @@ impl RegolithEngine {
                 }),
             },
             Arc::new(reader),
+            seq,
         );
         pending.offered_to_manifest();
         self.versions.run(|versions| {

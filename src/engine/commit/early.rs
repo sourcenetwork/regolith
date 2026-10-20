@@ -152,8 +152,10 @@ impl RegolithEngine {
     ) -> io::Result<EarlyVerdict> {
         let reads = checks.reads.len();
         let ranges = checks.ranges.len();
+        let horizon = progress
+            .as_ref()
+            .map_or_else(|| self.visible_seq.visible(), |progress| progress.horizon);
         if progress.is_none() {
-            let horizon = self.visible_seq.visible();
             let newest_read = checks.reads.iter().map(|r| r.observed_seq);
             let newest_range = checks.ranges.iter().map(|r| r.observed_seq);
             if newest_read
@@ -166,17 +168,16 @@ impl RegolithEngine {
                     marks: Vec::new(),
                 }));
             }
-            *progress = Some(EarlyProgress {
-                horizon,
-                at: 0,
-                marker: Marker {
-                    marks: Vec::new(),
-                    total: reads + ranges + ops.len(),
-                    dirty_before: false,
-                },
-            });
         }
-        let progress = progress.as_mut().expect("a check in progress");
+        let progress = progress.get_or_insert_with(|| EarlyProgress {
+            horizon,
+            at: 0,
+            marker: Marker {
+                marks: Vec::new(),
+                total: reads + ranges + ops.len(),
+                dirty_before: false,
+            },
+        });
         let horizon = progress.horizon;
         let marker = &mut progress.marker;
         let view = self.view.load();

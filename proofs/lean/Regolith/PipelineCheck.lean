@@ -596,6 +596,19 @@ theorem plain_write_is_seen :
   -- Concrete lists: evaluate.
   decide
 
+/-- Installing a table must raise the same view's ceiling to cover every
+new version. Flush and ingest establish this before publishing the view;
+compaction carries forward versions already covered by the old ceiling. -/
+theorem installed_tables_below_ceiling
+    (old added : List (Nat × Nat)) (ceiling newest : Nat)
+    (oldBound : ∀ v ∈ old, v.2 ≤ ceiling)
+    (newBound : ∀ v ∈ added, v.2 ≤ newest) :
+    ∀ v ∈ old ++ added, v.2 ≤ max ceiling newest := by
+  intro v member
+  rcases List.mem_append.mp member with before | after
+  · exact Nat.le_trans (oldBound v before) (Nat.le_max_left _ _)
+  · exact Nat.le_trans (newBound v after) (Nat.le_max_right _ _)
+
 /-- A table ceiling at or below the transaction's observation excludes every
 conflicting table version. `latest_version_after` may visit only the memtables
 when `ReadView.version.last_seq` is at or below that observation. The ceiling

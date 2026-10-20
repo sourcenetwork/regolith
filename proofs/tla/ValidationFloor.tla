@@ -38,6 +38,11 @@ Flush ==
   /\ ceiling' = seq
   \* Flush does not alter an already captured view.
   /\ UNCHANGED <<seq, viewMem, viewTables, viewCeiling, pc, result>>
+\* An ingest installs a newer table and its ceiling in the same view.
+Ingest ==
+  /\ seq = 1 /\ seq' = 2 /\ tables' = tables \cup {2}
+  /\ ceiling' = IF Mutant = "StaleIngestCeiling" THEN ceiling ELSE 2
+  /\ UNCHANGED <<mem, viewMem, viewTables, viewCeiling, pc, result>>
 \* One loaded view owns both the sources and the ceiling tested below.
 Capture ==
   \* Capture happens exactly once before checking.
@@ -57,7 +62,7 @@ Check ==
   \* The check changes only its result and phase.
   /\ UNCHANGED <<mem, tables, seq, ceiling, viewMem, viewTables, viewCeiling>>
 \* The interleavings before and after the view is loaded.
-Next == Write \/ Flush \/ Capture \/ Check
+Next == Write \/ Flush \/ Ingest \/ Capture \/ Check
 \* Every table version is covered by its own view's ceiling.
 Bounded == \A v \in viewTables : v <= viewCeiling
 \* Validation agrees with looking at every source in the captured view.
