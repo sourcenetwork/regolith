@@ -85,6 +85,7 @@ fn a_key_merged_many_times_is_probed_once() {
     stats.reset();
     let tx = db.begin(&TxnOptions::new().isolation(IsolationLevel::SnapshotIsolation));
     db.db().put(b"unrelated", b"newer").unwrap();
+    db.db().flush().unwrap();
     for _ in 0..MERGES {
         tx.merge(b"counter", &1i64.to_be_bytes()).unwrap();
     }
@@ -124,6 +125,7 @@ fn keys_merged_in_an_interleaved_order_are_probed_once_each() {
     let tx = db.begin(&TxnOptions::new().isolation(IsolationLevel::SnapshotIsolation));
     // A write after the snapshot, so the commit has to look.
     db.db().put(b"unrelated", b"newer").unwrap();
+    db.db().flush().unwrap();
     for i in 0..MERGES {
         tx.merge(KEYS[i % KEYS.len()], &1i64.to_be_bytes()).unwrap();
     }

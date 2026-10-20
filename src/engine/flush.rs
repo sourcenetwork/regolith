@@ -391,11 +391,12 @@ impl Flusher {
                 deletions: Some(summary.deletions),
             },
             reader,
+            summary.newest_seq,
         );
 
         // The sequence this memtable was sealed at, not the engine's
-        // current one. `last_seq` is read back as "every write at or
-        // below this is in an SSTable", and a checkpoint copies tables
+        // current one. `last_seq` bounds table versions and names the
+        // flushed prefix for checkpoints. A checkpoint copies tables
         // and no WAL, so stamping the global counter here would make a
         // checkpoint claim writes that are still only in a memtable it
         // did not flush.

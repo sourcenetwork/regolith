@@ -183,6 +183,7 @@ mod tests {
                 deletions: None,
             },
             Arc::new(SsTableReader::open(&path, file_id).unwrap()),
+            1,
         )
     }
 

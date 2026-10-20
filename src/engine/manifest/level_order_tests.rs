@@ -47,6 +47,7 @@ fn table(
             deletions: None,
         },
         Arc::clone(reader),
+        1,
     )
 }
 

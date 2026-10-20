@@ -72,6 +72,7 @@ fn blind_put(
 /// table, takes no sequence, and leaves the commit on its queue.
 fn owed(db: &OptimisticTransactionDb, device: &Device, txn: Transaction) -> CommitTicket {
     db.db().put(b"other", b"x").unwrap();
+    db.db().flush().unwrap();
     let (touches, seq) = (device.touches(), db.db().latest_sequence());
     let ticket = txn.commit_nowait();
     assert_eq!(
@@ -186,4 +187,90 @@ fn a_dropped_queue_brings_its_owed_commit_through() {
     assert_eq!(committed.load(Ordering::SeqCst), 1);
     assert_eq!(aborted.load(Ordering::SeqCst), 0);
     assert_eq!(db.db().get(COLD).unwrap(), Some(b"mine".to_vec()));
+}
+
+#[test]
+fn early_validation_does_not_read_tables_older_than_its_observation() {
+    let dir = TempDir::new().unwrap();
+    let (env, device) = DeviceEnv::new();
+    let options = || {
+        Options::default()
+            .env(Arc::<DeviceEnv>::clone(&env))
+            .block_size(256)
+            .block_cache_size(0)
+    };
+    {
+        let db = OptimisticTransactionDb::open(dir.path(), options()).unwrap();
+        for i in 0..2_000u32 {
+            db.db()
+                .put(format!("k{i:05}").as_bytes(), &[b'x'; 64])
+                .unwrap();
+        }
+        db.db().flush().unwrap();
+        db.db().close().unwrap();
+    }
+    let db = OptimisticTransactionDb::open(dir.path(), options()).unwrap();
+    let mut queue = db.db().io_queue();
+    let txn = db.begin(&TxnOptions::new().read_mode(ReadMode::CacheOnly(queue.id())));
+    for i in 0..2_000u32 {
+        txn.put(format!("k{i:05}").as_bytes(), b"mine").unwrap();
+    }
+    db.db().put(b"other", b"x").unwrap();
+    let touches = device.touches();
+    let ticket = txn.commit_nowait();
+    assert!(ticket.is_ready(), "old tables caused a validation read");
+    queue.block_on(ticket).unwrap();
+    assert_eq!(device.touches(), touches, "validation touched old tables");
+    assert_eq!(db.db().get(b"k01000").unwrap(), Some(b"mine".to_vec()));
+}
+
+#[test]
+fn skipping_old_tables_still_detects_a_newer_memtable_write() {
+    let dir = TempDir::new().unwrap();
+    let (db, _) = cold(&dir);
+    let mut queue = db.db().io_queue();
+    let txn = db.begin(&TxnOptions::new().read_mode(ReadMode::CacheOnly(queue.id())));
+    queue
+        .block_on(regolith::ready(|| txn.get_for_update(COLD)))
+        .unwrap();
+    txn.put(b"result", b"mine").unwrap();
+    db.db().put(COLD, b"theirs").unwrap();
+    assert!(matches!(
+        queue.block_on(txn.commit_nowait()),
+        Err(TransactionError::Conflict(_))
+    ));
+    assert_eq!(db.db().get(b"result").unwrap(), None);
+}
+
+#[test]
+fn validation_detects_a_newer_ingested_table() {
+    let dir = TempDir::new().unwrap();
+    let (db, _) = cold(&dir);
+    let mut queue = db.db().io_queue();
+    let txn = db.begin(&TxnOptions::new().read_mode(ReadMode::CacheOnly(queue.id())));
+    queue
+        .block_on(regolith::ready(|| txn.get_for_update(COLD)))
+        .unwrap();
+    txn.put(b"result", b"mine").unwrap();
+    let staging = TempDir::new().unwrap();
+    let path = staging.path().join("newer.sst");
+    let mut writer = regolith::SstFileWriter::create(&path, &Options::default()).unwrap();
+    writer.put(COLD, b"ingested").unwrap();
+    writer.finish().unwrap();
+    db.db()
+        .ingest_external_files(
+            &[path],
+            regolith::IngestOptions {
+                snapshot_consistency: false,
+                ..regolith::IngestOptions::default()
+            },
+        )
+        .wait()
+        .unwrap();
+    assert!(matches!(
+        queue.block_on(txn.commit_nowait()),
+        Err(TransactionError::Conflict(_))
+    ));
+    assert_eq!(db.db().get(COLD).unwrap(), Some(b"ingested".to_vec()));
+    assert_eq!(db.db().get(b"result").unwrap(), None);
 }

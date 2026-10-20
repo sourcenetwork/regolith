@@ -596,5 +596,45 @@ theorem plain_write_is_seen :
   -- Concrete lists: evaluate.
   decide
 
+/-- Installing a table must raise the same view's ceiling to cover every
+new version. Flush and ingest establish this before publishing the view;
+compaction carries forward versions already covered by the old ceiling. -/
+theorem installed_tables_below_ceiling
+    -- The existing and incoming tables each have a sequence ceiling.
+    (old added : List (Nat × Nat)) (ceiling newest : Nat)
+    -- The published view already bounds every existing table version.
+    (oldBound : ∀ v ∈ old, v.2 ≤ ceiling)
+    -- The writer or ingestion stamp bounds every added version.
+    (newBound : ∀ v ∈ added, v.2 ≤ newest) :
+    -- Raising the published ceiling covers both sets of tables.
+    ∀ v ∈ old ++ added, v.2 ≤ max ceiling newest := by
+  -- Pick any version in the resulting view.
+  intro v member
+  -- It came from an existing table or an added table.
+  rcases List.mem_append.mp member with before | after
+  -- Existing versions remain below the raised ceiling.
+  · exact Nat.le_trans (oldBound v before) (Nat.le_max_left _ _)
+  -- Added versions are below the ceiling supplied by their writer.
+  · exact Nat.le_trans (newBound v after) (Nat.le_max_right _ _)
+
+/-- A table ceiling at or below the transaction's observation excludes every
+conflicting table version. `latest_version_after` may visit only the memtables
+when `ReadView.version.last_seq` is at or below that observation. The ceiling
+belongs to the same loaded view as the sources; a concurrent flush publishes
+another view and cannot move a newer version into this one's tables. -/
+theorem old_tables_do_not_change_validation
+    -- The sources of the loaded view and the transaction being checked.
+    (mem tables : List (Nat × Nat)) (t : Txn) (ceiling : Nat)
+    -- Every table version is bounded by this view's recorded ceiling.
+    (bounded : ∀ v ∈ tables, v.2 ≤ ceiling)
+    -- The transaction observed every sequence up to that ceiling.
+    (observed : ceiling ≤ t.snap) :
+    -- Looking at old tables cannot change conflict detection.
+    conflicts (mem ++ tables) t = conflicts mem t := by
+  -- The complete check is the disjunction of the checks of its sources.
+  simp only [conflicts, List.any_append]
+  -- No table version is above the observation, so that disjunct is false.
+  rw [nothing_above_ceiling tables t t.snap ceiling bounded observed, Bool.or_false]
+
 -- The end of this file's names.
 end Regolith.PipelineCheck

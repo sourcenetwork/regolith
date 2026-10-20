@@ -407,6 +407,7 @@ fn a_validation_that_would_block_resolves_the_ticket_with_its_wait() {
         let txn = db.begin(&cache_only);
         txn.put(b"k01000", b"mine").unwrap();
         db.db().put(b"other", b"x").unwrap();
+        db.db().flush().unwrap();
         txn.commit_nowait()
     };
     let ticket = attempt();

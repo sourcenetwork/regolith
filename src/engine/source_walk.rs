@@ -336,7 +336,11 @@ mod tests {
             global_seq: None,
             deletions: None,
         };
-        LiveSst::new(meta, Arc::new(SsTableReader::open(&path, file_id).unwrap()))
+        LiveSst::new(
+            meta,
+            Arc::new(SsTableReader::open(&path, file_id).unwrap()),
+            summary.newest_seq,
+        )
     }
 
     /// A view of an empty memtable over `version`.
