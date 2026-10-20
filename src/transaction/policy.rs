@@ -98,7 +98,8 @@ pub enum KeyClass {
     ContentAddressed,
     /// The key belongs to a commit-ordered log: its head key, an entry key or
     /// a once key, as the log's [`crate::LogLayout`] and the `once_key` of
-    /// [`crate::Transaction::append`] name them. Only `append` writes them.
+    /// [`crate::Transaction::append`] name them. Only `append` writes them, and
+    /// [`crate::Transaction::truncate_log`] deletes entry keys.
     ///
     /// This class has an effect only for an optimistic transaction at
     /// [`IsolationLevel::DefraLevel`] with a [`KeyClassifier`] installed.
@@ -106,23 +107,28 @@ pub enum KeyClass {
     ///
     /// - A read of the key (`get`, `get_slice`, `get_for_update`) is never
     ///   validated. A reader that reads a log in a snapshot sees a dense
-    ///   prefix of it, and entries appended later are not a conflict.
+    ///   prefix of it, less the positions a commit at or before its snapshot
+    ///   truncated, and entries appended or truncated later are not a
+    ///   conflict.
     /// - A `put`, `delete` or `merge` of the key is refused with
     ///   [`crate::Error::LogKeyWrite`] when it is called, and nothing is
     ///   buffered.
     /// - `append` checks that the layout's head and entry keys and the
     ///   `once_key` are all declared `Log`, and refuses the call with
     ///   [`crate::Error::InvalidArgument`] when one is not.
+    /// - `truncate_log` checks that the layout's head and entry keys are
+    ///   declared `Log`, with the same refusal, and then deletes entry keys
+    ///   without validating the delete: truncating a log never conflicts.
     ///
     /// Other levels, pessimistic transactions and transactions without a
     /// classifier are unchanged: a pessimistic transaction consults no
     /// classifier, so its writes to log keys are not refused, and a write
     /// through [`crate::Db`] is not either. That is the caller's contract.
     ///
-    /// Declare a key `Log` only when every writer of it is `append`, and when
-    /// nothing the transaction writes depends on entries the log did not yet
-    /// hold: a decision taken on a read of a log may be overtaken by entries
-    /// appended after the transaction's snapshot.
+    /// Declare a key `Log` only when every writer of it is `append` or
+    /// `truncate_log`, and when nothing the transaction writes depends on
+    /// entries the log did not yet hold: a decision taken on a read of a log
+    /// may be overtaken by entries appended after the transaction's snapshot.
     Log,
 }
 
@@ -136,8 +142,8 @@ pub enum KeyClass {
 /// key it only deletes is not classified there.
 ///
 /// Before commit, `put`, `delete` and `merge` call it once with the key they
-/// are given, to refuse a [`KeyClass::Log`] key, and `append` calls it for
-/// each key of the log it names. A transaction begun with
+/// are given, to refuse a [`KeyClass::Log`] key, and `append` and `truncate_log`
+/// call it for each key of the log they name. A transaction begun with
 /// [`TxnOptions::early_validation`](crate::TxnOptions::early_validation) asks
 /// once more for each key it puts or merges, to leave a content-addressed one
 /// unchecked.

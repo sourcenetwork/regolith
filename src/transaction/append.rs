@@ -39,7 +39,8 @@ impl Transaction {
     ///   the order they were made. A transaction that aborts, fails
     ///   validation or fails to reach the log takes no position, and the next
     ///   commit reuses it. A reader that reads the head key in a snapshot, and
-    ///   then the entries up to it, finds every one of them.
+    ///   then the entries up to it, finds every one of them that no commit at
+    ///   or before its snapshot dropped with [`Transaction::truncate_log`].
     /// - **Never a conflict.** An append is never validated, so it cannot
     ///   fail a commit and no other commit's write can fail it. The head key
     ///   is not part of the transaction's read or write set, so two
@@ -80,8 +81,9 @@ impl Transaction {
     ///
     /// # Preconditions
     ///
-    /// Only appends write the keys of a log. A write to them by anything
-    /// else, a plain [`Db::put`](crate::Db::put) or a pessimistic
+    /// Only appends and [`Transaction::truncate_log`] write the keys of a
+    /// log, and a truncate writes only deletes of entry keys. A write to them
+    /// by anything else, a plain [`Db::put`](crate::Db::put) or a pessimistic
     /// transaction (which consults no classifier) included, can number two
     /// entries alike or leave the head behind its entries, and regolith
     /// cannot tell. The layout must follow the contract of [`LogLayout`], and
@@ -198,7 +200,7 @@ impl Transaction {
 /// The longest position stands for every other: a layout that grows its keys
 /// with the position, as a decimal or hexadecimal rendering does, is longest
 /// there. The commit checks the keys it actually builds.
-fn check_layout(
+pub(super) fn check_layout(
     log: &dyn LogLayout,
     once_key: Option<&[u8]>,
     classifier: Option<&dyn KeyClassifier>,
@@ -228,6 +230,6 @@ fn check_layout(
     Ok(())
 }
 
-fn refused(message: String) -> TransactionError {
+pub(super) fn refused(message: String) -> TransactionError {
     TransactionError::Engine(Error::InvalidArgument(message))
 }
