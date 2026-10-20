@@ -258,10 +258,13 @@ fn validation_detects_a_newer_ingested_table() {
     writer.put(COLD, b"ingested").unwrap();
     writer.finish().unwrap();
     db.db()
-        .ingest_external_files(&[path], regolith::IngestOptions {
-            snapshot_consistency: false,
-            ..regolith::IngestOptions::default()
-        })
+        .ingest_external_files(
+            &[path],
+            regolith::IngestOptions {
+                snapshot_consistency: false,
+                ..regolith::IngestOptions::default()
+            },
+        )
         .wait()
         .unwrap();
     assert!(matches!(
