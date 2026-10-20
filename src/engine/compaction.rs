@@ -2116,6 +2116,7 @@ impl<'a> StreamingCompactionWriter<'a> {
                 deletions: Some(summary.deletions),
             },
             reader,
+            summary.newest_seq,
         );
 
         self.infos.push(OutputFileInfo {
@@ -2212,6 +2213,7 @@ impl<'a> StreamingCompactionWriter<'a> {
                 deletions: Some(summary.deletions),
             },
             reader,
+            summary.newest_seq,
         );
 
         self.infos.push(OutputFileInfo {

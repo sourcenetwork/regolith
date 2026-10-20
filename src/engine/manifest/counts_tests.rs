@@ -27,6 +27,7 @@ fn table(dir: &Path, file_id: u64, deletions: Option<Deletions>) -> Arc<LiveSst>
             ..plain.meta.clone()
         },
         Arc::clone(&plain.reader),
+        plain.sequence_ceiling,
     )
 }
 

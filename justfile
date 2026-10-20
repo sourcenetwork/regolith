@@ -1117,6 +1117,16 @@ tla:
     # decision on the queue of a thread that must not read the device. The
     # commit is never ended by a miss, and its call never reads the device.
     # Lean: Regolith/PipelineCheck.lean, early_check_split.
+    spec=ValidationFloor
+    check MC_ValidationFloor_Green GREEN
+    check MC_ValidationFloor_Red_AlwaysSkip RED Exact
+    check MC_ValidationFloor_Red_StaleIngestCeiling RED Bounded
+    spec=ValidationProgress
+    check MC_ValidationProgress_Green GREEN
+    check MC_ValidationProgress_Green_NoOldChange GREEN
+    check MC_ValidationProgress_Red_Restart RED Cost
+    check MC_ValidationProgress_Red_SkipMiss RED Exact
+    check MC_ValidationProgress_Red_SkipLateCheck RED Exact
     spec=NowaitMiss
     check MC_NowaitMiss_Green                          GREEN
     check MC_NowaitMiss_Red_Refuse                     RED INV_NoMissEnds

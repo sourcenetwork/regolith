@@ -58,11 +58,13 @@ fn compaction_does_not_populate_the_foreground_cache() {
                     deletions: Some(summary.deletions),
                 },
                 Arc::new(SsTableReader::open(&path, 1).unwrap()),
+                summary.newest_seq,
             );
             versions
                 .run(|versions| {
                     versions.apply(&[
                         VersionEdit::SetNextFileId(2),
+                        VersionEdit::SetLastSeq(summary.newest_seq),
                         VersionEdit::AddFile {
                             level: 0,
                             file: Arc::clone(&input),

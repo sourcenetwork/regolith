@@ -121,46 +121,74 @@ impl Marker {
     }
 }
 
+/// A cold check retains its completed prefix and original horizon. Raising
+/// that horizon after a miss would hide changes to already checked items
+/// from the slot's remaining validation (`ValidationProgress.tla`).
+pub(super) struct EarlyProgress {
+    horizon: u64,
+    at: usize,
+    marker: Marker,
+}
+
 impl RegolithEngine {
-    /// Check `checks` and `ops` against the versions committed up to the
-    /// current read horizon, before the commit takes a slot. Returns the
-    /// conflict that settles the commit at once, or the marks the slot's
-    /// decision finishes the check from.
+    #[cfg(test)]
     pub(super) fn check_early(
         &self,
         checks: &ValidationSet,
         ops: &[WriteBatchOp],
     ) -> io::Result<EarlyVerdict> {
-        // Sampled before the view is loaded: the view then holds every
-        // version at or below it.
-        let horizon = self.visible_seq.visible();
+        self.check_early_with_progress(checks, ops, &mut None)
+    }
+
+    /// Check `checks` and `ops` against the versions committed up to the
+    /// horizon captured on the first attempt, before the commit takes a
+    /// slot. A cold miss retains the marker and current item; the slot
+    /// checks every change above that original horizon.
+    pub(super) fn check_early_with_progress(
+        &self,
+        checks: &ValidationSet,
+        ops: &[WriteBatchOp],
+        progress: &mut Option<EarlyProgress>,
+    ) -> io::Result<EarlyVerdict> {
         let reads = checks.reads.len();
         let ranges = checks.ranges.len();
-        let mut marker = Marker {
-            marks: Vec::new(),
-            total: reads + ranges + ops.len(),
-            dirty_before: false,
-        };
-        let newest_read = checks.reads.iter().map(|r| r.observed_seq);
-        let newest_range = checks.ranges.iter().map(|r| r.observed_seq);
-        // Nothing committed since any item was read: every item is clean,
-        // and no view is loaded.
-        if newest_read
-            .chain(newest_range)
-            .chain(checks.writes_at.filter(|_| !ops.is_empty()))
-            .all(|observed| horizon <= observed)
-        {
-            return Ok(EarlyVerdict::Marks(Early {
-                horizon,
-                marks: Vec::new(),
-            }));
+        let horizon = progress
+            .as_ref()
+            .map_or_else(|| self.visible_seq.visible(), |progress| progress.horizon);
+        if progress.is_none() {
+            let newest_read = checks.reads.iter().map(|r| r.observed_seq);
+            let newest_range = checks.ranges.iter().map(|r| r.observed_seq);
+            if newest_read
+                .chain(newest_range)
+                .chain(checks.writes_at.filter(|_| !ops.is_empty()))
+                .all(|observed| horizon <= observed)
+            {
+                return Ok(EarlyVerdict::Marks(Early {
+                    horizon,
+                    marks: Vec::new(),
+                }));
+            }
         }
+        let progress = progress.get_or_insert_with(|| EarlyProgress {
+            horizon,
+            at: 0,
+            marker: Marker {
+                marks: Vec::new(),
+                total: reads + ranges + ops.len(),
+                dirty_before: false,
+            },
+        });
+        let horizon = progress.horizon;
+        let marker = &mut progress.marker;
         let view = self.view.load();
-        for (at, check) in checks.reads.iter().enumerate() {
+        for (at, check) in checks.reads.iter().enumerate().skip(progress.at) {
+            progress.at = at;
             if horizon <= check.observed_seq {
                 continue;
             }
-            let Some((seq, theirs)) = self.latest_version_in_view(&check.key, &view)? else {
+            let Some((seq, theirs)) =
+                self.latest_version_after(&check.key, check.observed_seq, &view)?
+            else {
                 continue;
             };
             if seq <= check.observed_seq {
@@ -182,7 +210,13 @@ impl RegolithEngine {
             }
             marker.set(at, Mark::Dirty);
         }
-        for (at, range) in checks.ranges.iter().enumerate() {
+        for (at, range) in checks
+            .ranges
+            .iter()
+            .enumerate()
+            .skip(progress.at.saturating_sub(reads))
+        {
+            progress.at = reads + at;
             if horizon <= range.observed_seq {
                 continue;
             }
@@ -210,8 +244,13 @@ impl RegolithEngine {
             let replaced = checks.blind_merges_commute.then(|| Replaced::of(ops));
             let mut last_merged: Option<&[u8]> = None;
             // The same items, skipped the same way, as the full check.
-            for (at, op) in ops.iter().enumerate() {
+            for (at, op) in ops
+                .iter()
+                .enumerate()
+                .skip(progress.at.saturating_sub(reads + ranges))
+            {
                 let at = reads + ranges + at;
+                progress.at = at;
                 let (key, mine) = match op {
                     WriteBatchOp::Put { key, .. } => (key, Access::Put),
                     WriteBatchOp::Delete { key } => (key, Access::Delete),
@@ -270,7 +309,7 @@ impl RegolithEngine {
         }
         Ok(EarlyVerdict::Marks(Early {
             horizon,
-            marks: marker.marks,
+            marks: std::mem::take(&mut marker.marks),
         }))
     }
 
@@ -296,7 +335,7 @@ impl RegolithEngine {
     ) -> io::Result<bool> {
         if !memtables_only {
             return Ok(self
-                .latest_version_in_view(key, view)?
+                .latest_version_after(key, horizon, view)?
                 .is_some_and(|(seq, _)| seq > horizon));
         }
         let lk = LookupKey::from_prefixed(key, u64::MAX);
@@ -308,3 +347,7 @@ impl RegolithEngine {
             }))
     }
 }
+
+#[cfg(all(test, not(loom)))]
+#[path = "early_progress_tests.rs"]
+mod progress_tests;

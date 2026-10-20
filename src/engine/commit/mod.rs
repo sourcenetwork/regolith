@@ -114,7 +114,7 @@ pub(crate) use append::PendingAppend;
 pub(crate) use counters::Counters;
 pub(crate) use descriptor::After;
 use descriptor::{Descriptor, Work};
-use early::EarlyVerdict;
+use early::{EarlyProgress, EarlyVerdict};
 pub(crate) use ordered::{Ordered, OrderedTicket};
 pub(crate) use park::{Help, Needs};
 pub(crate) use pipeline::Pipeline;
@@ -171,6 +171,7 @@ pub(crate) struct TxnCommit {
 /// early check still to run.
 struct Unchecked {
     checks: ValidationSet,
+    progress: Option<EarlyProgress>,
     ops: Vec<WriteBatchOp>,
     appends: Vec<PendingAppend>,
     durability: DurabilityMode,
@@ -412,9 +413,9 @@ impl RegolithEngine {
     }
 
     /// Submit `owed` again once the read its early check waited for is done:
-    /// the early check runs again, at the horizon of now (`early_check_split`
-    /// in `PipelineCheck.lean` holds at any horizon), and the commit goes on
-    /// as [`Self::commit_optimistic_nowait`] goes on, owed again if another
+    /// the unfinished early check resumes at its original horizon
+    /// (`ValidationProgress.tla`, `PipelineCheck.early_check_cover`), and the
+    /// commit goes on as [`Self::commit_optimistic_nowait`], owed if another
     /// block is missing. `on_device`: its queue is gone and polls no more, so
     /// it reads the device on this thread, as a blocking commit does. The
     /// database may have closed or latched meanwhile, which refuses it as it
@@ -515,6 +516,7 @@ impl RegolithEngine {
         let writes = !ops.is_empty() || !appends.is_empty();
         Ok(Unchecked {
             checks,
+            progress: None,
             ops,
             appends,
             durability,
@@ -528,11 +530,15 @@ impl RegolithEngine {
     /// when the check needs a block a `CacheOnly` scope may not read, into
     /// the commit owed that read.
     #[inline]
-    fn check_request(&self, unchecked: Unchecked) -> io::Result<Requested> {
+    fn check_request(&self, mut unchecked: Unchecked) -> io::Result<Requested> {
         // Checked up to the horizon here, on this thread and before the
         // commit takes a slot; deciding the slot checks only what landed
         // above it.
-        let early = match self.check_early(&unchecked.checks, &unchecked.ops) {
+        let early = match self.check_early_with_progress(
+            &unchecked.checks,
+            &unchecked.ops,
+            &mut unchecked.progress,
+        ) {
             Ok(EarlyVerdict::Conflict(conflict)) => {
                 return Ok(Requested::Decided(CommitOutcome::Conflict(conflict)));
             }
@@ -550,6 +556,7 @@ impl RegolithEngine {
         };
         let Unchecked {
             checks,
+            progress: _,
             ops,
             appends,
             durability,

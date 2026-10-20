@@ -63,6 +63,8 @@ import Regolith.PipelineHelping
 -- lost; an abort has a cause; and the check split at a horizon decides as
 -- one check. Backs `proofs/tla/CommitPipeline.tla`.
 import Regolith.PipelineCheck
+-- Ordered progress through a cold early validation.
+import Regolith.ValidationProgress
 -- 4.7: a commit's landing listeners. Whoever waits for a commit to land is
 -- told at most once, and a closed list holds nobody. Backs
 -- `proofs/tla/Landing.tla`.

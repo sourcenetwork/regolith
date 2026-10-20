@@ -418,6 +418,9 @@ pub(crate) struct SsTableMeta {
 /// `Arc<LiveSst>` is shared between versions and between a version and
 /// any iterator built from it, so cloning is cheap.
 pub(crate) struct LiveSst {
+    /// Bound supplied by the writer, the ingest stamp, or the recovered
+    /// manifest. This is an in-memory invariant, not a new file field.
+    pub(crate) sequence_ceiling: u64,
     pub(crate) meta: SsTableMeta,
     pub(crate) reader: Arc<SsTableReader>,
     /// A compaction pass is working on this table and no other may pick it.
@@ -429,7 +432,12 @@ impl LiveSst {
     /// Pair a table's metadata with its reader. The reader must read at the
     /// sequence the metadata records, which is why both come from the one
     /// [`SsTableMeta::global_seq`].
-    pub(crate) fn new(meta: SsTableMeta, reader: Arc<SsTableReader>) -> Arc<Self> {
+    pub(crate) fn new(
+        meta: SsTableMeta,
+        reader: Arc<SsTableReader>,
+        sequence_ceiling: u64,
+    ) -> Arc<Self> {
+        debug_assert!(meta.global_seq.is_none_or(|seq| seq <= sequence_ceiling));
         debug_assert_eq!(
             meta.global_seq, reader.global_seq,
             "a table's reader reads at the sequence its metadata records"
@@ -438,6 +446,7 @@ impl LiveSst {
         // reader learns how to hand a queued read its own handle.
         let _ = reader.me.set(Arc::downgrade(&reader));
         Arc::new(Self {
+            sequence_ceiling,
             meta,
             reader,
             claimed: crate::portability::AtomicBool::new(false),
@@ -608,6 +617,7 @@ enum BlockHit {
 /// Summary of a finished SSTable, returned by [`SsTableWriter::finish`].
 #[derive(Debug)]
 pub(crate) struct SsTableWriteSummary {
+    pub(crate) newest_seq: u64,
     pub(crate) smallest_user_key: Vec<u8>,
     pub(crate) largest_user_key: Vec<u8>,
     pub(crate) num_entries: u64,
@@ -859,6 +869,7 @@ pub(crate) struct SsTableWriter {
     block_size: usize,
     current_offset: u64,
     num_entries: u64,
+    newest_seq: u64,
     last_internal_key: Vec<u8>,
     smallest_user_key: Option<Vec<u8>>,
     largest_user_key: Option<Vec<u8>>,
@@ -911,6 +922,7 @@ impl SsTableWriter {
             block_size,
             current_offset: 0,
             num_entries: 0,
+            newest_seq: 0,
             last_internal_key: Vec::new(),
             smallest_user_key: None,
             largest_user_key: None,
@@ -964,6 +976,7 @@ impl SsTableWriter {
     /// point-entry stream and do not affect `add`'s sort-order
     /// invariant.
     pub(crate) fn add_range_tombstone(&mut self, start: &[u8], end: &[u8], seq: u64) {
+        self.newest_seq = self.newest_seq.max(seq);
         self.range_tombstones
             .push(RangeTombstone::new(start.to_vec(), end.to_vec(), seq));
     }
@@ -972,6 +985,7 @@ impl SsTableWriter {
     /// sorted order. For tombstones, pass an empty value.
     pub(crate) fn add(&mut self, internal_key: &[u8], value: &[u8]) -> io::Result<()> {
         let (user_key, seq, value_type) = decode_internal_key(internal_key);
+        self.newest_seq = self.newest_seq.max(seq);
         let first_of_key = user_key != self.last_bloom_user_key.as_slice();
         self.deletions.see(user_key, seq, value_type, first_of_key);
 
@@ -1188,6 +1202,7 @@ impl SsTableWriter {
             table_key_range(points, range_tombstone_set.iter()).expect("checked non-empty above");
 
         Ok(Some(SsTableWriteSummary {
+            newest_seq: self.newest_seq,
             smallest_user_key,
             largest_user_key,
             num_entries: self.num_entries,

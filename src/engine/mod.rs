@@ -2749,10 +2749,35 @@ impl RegolithEngine {
         ceil: u64,
         view: &ReadView,
     ) -> std::io::Result<Option<(u64, WriteKind)>> {
+        self.latest_version_bounded(key, ceil, None, view)
+    }
+
+    /// Only versions newer than `floor` can invalidate that observation.
+    /// The table ceiling and the sources must come from the same view.
+    fn latest_version_after(
+        &self,
+        key: &[u8],
+        floor: u64,
+        view: &ReadView,
+    ) -> std::io::Result<Option<(u64, WriteKind)>> {
+        self.latest_version_bounded(key, u64::MAX, Some(floor), view)
+            .map(|newest| newest.filter(|(seq, _)| *seq > floor))
+    }
+
+    fn latest_version_bounded(
+        &self,
+        key: &[u8],
+        ceil: u64,
+        floor: Option<u64>,
+        view: &ReadView,
+    ) -> std::io::Result<Option<(u64, WriteKind)>> {
         let lk = LookupKey::from_prefixed(key, ceil);
         let walked = view.walk_newest_first(key, ceil, |source, max_rt_seq| {
             let version = match source {
                 Source::Memtable(mt) => mt.latest_version(&lk),
+                Source::Table(_) if floor.is_some_and(|floor| view.version.last_seq <= floor) => {
+                    return Ok(ControlFlow::Continue(()));
+                }
                 Source::Table(reader) => {
                     with_key_scratch(|buf| reader.latest_version(&lk, buf, &self.cache))?
                 }
