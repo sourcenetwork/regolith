@@ -600,13 +600,21 @@ theorem plain_write_is_seen :
 new version. Flush and ingest establish this before publishing the view;
 compaction carries forward versions already covered by the old ceiling. -/
 theorem installed_tables_below_ceiling
+    -- The existing and incoming tables each have a sequence ceiling.
     (old added : List (Nat × Nat)) (ceiling newest : Nat)
+    -- The published view already bounds every existing table version.
     (oldBound : ∀ v ∈ old, v.2 ≤ ceiling)
+    -- The writer or ingestion stamp bounds every added version.
     (newBound : ∀ v ∈ added, v.2 ≤ newest) :
+    -- Raising the published ceiling covers both sets of tables.
     ∀ v ∈ old ++ added, v.2 ≤ max ceiling newest := by
+  -- Pick any version in the resulting view.
   intro v member
+  -- It came from an existing table or an added table.
   rcases List.mem_append.mp member with before | after
+  -- Existing versions remain below the raised ceiling.
   · exact Nat.le_trans (oldBound v before) (Nat.le_max_left _ _)
+  -- Added versions are below the ceiling supplied by their writer.
   · exact Nat.le_trans (newBound v after) (Nat.le_max_right _ _)
 
 /-- A table ceiling at or below the transaction's observation excludes every

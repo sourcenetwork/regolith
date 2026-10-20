@@ -40,8 +40,11 @@ Flush ==
   /\ UNCHANGED <<seq, viewMem, viewTables, viewCeiling, pc, result>>
 \* An ingest installs a newer table and its ceiling in the same view.
 Ingest ==
+  \* The external table arrives at a newly assigned sequence.
   /\ seq = 1 /\ seq' = 2 /\ tables' = tables \cup {2}
+  \* The mutant publishes the table without covering its newer sequence.
   /\ ceiling' = IF Mutant = "StaleIngestCeiling" THEN ceiling ELSE 2
+  \* An ingest does not rewrite an already captured read view.
   /\ UNCHANGED <<mem, viewMem, viewTables, viewCeiling, pc, result>>
 \* One loaded view owns both the sources and the ceiling tested below.
 Capture ==
