@@ -9,6 +9,7 @@
 // the filesystem. The browser suite lives in tests/wasm_opfs*.rs.
 #![cfg(not(target_arch = "wasm32"))]
 
+use std::ops::ControlFlow;
 use std::sync::Arc;
 
 use regolith::prelude::*;
@@ -160,4 +161,53 @@ fn after_commit_the_log_positions_follow_the_order_appended_returned() {
     let committed = log_of(db.db(), "journal");
     assert_eq!(committed[0], "earlier");
     assert_eq!(committed[1..], seen[..]);
+}
+
+/// What `with_appended` visits, in the order it visits it.
+fn visited(tx: &Transaction, log: &Arc<dyn LogLayout>) -> Vec<String> {
+    let mut seen = Vec::new();
+    tx.with_appended(log, |entry| {
+        seen.push(String::from_utf8(entry.to_vec()).unwrap());
+        ControlFlow::Continue(())
+    });
+    seen
+}
+
+#[test]
+fn with_appended_visits_the_same_entries_newest_first() {
+    let dir = TempDir::new().unwrap();
+    let db = open(&dir);
+    let mut tx = db.begin(&TxnOptions::new());
+    assert!(visited(&tx, &Journal::named("journal")).is_empty());
+    tx.append(&Journal::named("journal"), b"1a", None).unwrap();
+    tx.append(&Journal::named("other"), b"2a", None).unwrap();
+    tx.append(&Journal::named("journal"), b"1b", None).unwrap();
+    tx.set_savepoint();
+    tx.append(&Journal::named("journal"), b"1c", None).unwrap();
+    for name in ["journal", "other", "third"] {
+        let log = Journal::named(name);
+        let mut oldest_first = texts(tx.appended(&log));
+        oldest_first.reverse();
+        assert_eq!(visited(&tx, &log), oldest_first, "{name}");
+    }
+    assert_eq!(visited(&tx, &Journal::named("journal")), ["1c", "1b", "1a"]);
+    tx.rollback_to_savepoint().unwrap();
+    assert_eq!(visited(&tx, &Journal::named("journal")), ["1b", "1a"]);
+}
+
+#[test]
+fn with_appended_stops_when_the_visit_breaks() {
+    let dir = TempDir::new().unwrap();
+    let db = open(&dir);
+    let log = Journal::named("journal");
+    let tx = db.begin(&TxnOptions::new());
+    for entry in ["a", "b", "c"] {
+        tx.append(&log, entry.as_bytes(), None).unwrap();
+    }
+    let mut calls = 0;
+    tx.with_appended(&log, |_| {
+        calls += 1;
+        ControlFlow::Break(())
+    });
+    assert_eq!(calls, 1);
 }

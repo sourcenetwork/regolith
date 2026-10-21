@@ -18,8 +18,10 @@
 \* entries of that one log, oldest first. It returns entries, never
 \* positions, so it opens no way to see an entry at a position.
 \*
-\* The queue is a chain that is walked newest first, so appended(log) keeps
-\* the log's entries and reverses them. A savepoint remembers how many
+\* The queue is a chain that is walked newest first.
+\* Transaction::with_appended(log) hands the log's entries over in that order,
+\* borrowed, for a reader that does not care about order; appended(log)
+\* collects them and reverses them. A savepoint remembers how many
 \* appends the queue held, and a rollback to it drops the newer ones.
 \*
 \* Tiny example. The transaction appends x to log l1, y to log l2, then z to
@@ -46,15 +48,16 @@
 \*   |-------------------|-----------------------------------------------------|
 \*   | buf               | transaction.rs `appends` (OnceLock<Box<TxnBuffer<(),|
 \*   |                   | PendingAppend>>>), made by transaction/append.rs    |
-\*   |                   | :272 appends_buffer; walk_chain visits it newest    |
+\*   |                   | :338 appends_buffer; walk_chain visits it newest    |
 \*   |                   | first (txn_buffer.rs:435)                           |
 \*   | Append            | transaction/append.rs:146 Transaction::append       |
-\*   | Appended(l)       | transaction/append.rs:243 Transaction::appended:    |
-\*   |                   | the walk, the head_key filter, the reversal         |
+\*   | Appended(l)       | transaction/append.rs:246 Transaction::appended,    |
+\*   |                   | the reversal, over :309 Transaction::with_appended, |
+\*   |                   | the walk and the head_key filter (newest first)     |
 \*   | Savepoint, mark   | transaction.rs:1772 set_savepoint, which keeps      |
-\*   |                   | append.rs:277 appends_len                           |
+\*   |                   | append.rs:343 appends_len                           |
 \*   | Rollback          | transaction.rs:1800 rollback_to_savepoint, which    |
-\*   |                   | calls append.rs:282 truncate_appends                |
+\*   |                   | calls append.rs:348 truncate_appends                |
 \*   | Commit, todo      | engine/commit/append.rs:103 AppendOrder::number:    |
 \*   |                   | the queue taken oldest first                        |
 \*   | Number, store     | engine/commit/append.rs:136 number_appends: each    |

@@ -191,8 +191,11 @@ impl Transaction {
     ///   entry then gets no position of its own.
     /// - **Free of the engine.** It does no I/O, records no read, is never
     ///   validated (so it cannot make a commit conflict), never returns
-    ///   [`Error::WouldBlock`], and costs the number of appends this
-    ///   transaction has made, whatever the log or the database holds.
+    ///   [`Error::WouldBlock`], and whatever the log or the database holds,
+    ///   each call walks every append this transaction has made and copies
+    ///   the matching entries. A caller on a hot path, or one that only needs
+    ///   to know whether there are any, uses [`Transaction::with_appended`],
+    ///   which copies nothing.
     ///
     /// # What it does not give
     ///
@@ -241,19 +244,82 @@ impl Transaction {
     ///
     /// [`Error::WouldBlock`]: crate::Error::WouldBlock
     pub fn appended(&self, log: &Arc<dyn LogLayout>) -> Vec<Vec<u8>> {
-        let Some(appends) = self.appends.get() else {
-            return Vec::new();
-        };
-        let head = log.head_key();
         let mut entries = Vec::new();
-        appends.walk_chain(&(), |pending| {
-            if pending.log.head_key() == head {
-                entries.push(pending.entry.clone());
-            }
+        self.with_appended(log, |entry| {
+            entries.push(entry.to_vec());
             ControlFlow::Continue(())
         });
         entries.reverse();
         entries
+    }
+
+    /// Hands each entry this transaction has appended to the log `log`
+    /// describes to `visit`, **newest first**, borrowed: no copy and no
+    /// allocation. `visit` returns [`ControlFlow::Break`] to stop early.
+    ///
+    /// The same entries as [`Transaction::appended`], with the same
+    /// guarantees except order: this is the order the buffer holds them in,
+    /// the reverse of the commit's. A reader that does not care about order,
+    /// such as a search over pending entries, reads them here for free.
+    /// Whether there are any is a visit that breaks on the first.
+    ///
+    /// An append made from inside `visit` is not visited: the walk starts at
+    /// the newest entry there was when it began.
+    ///
+    /// ```
+    /// use std::ops::ControlFlow;
+    /// use std::sync::Arc;
+    ///
+    /// use regolith::{LogLayout, OptimisticTransactionDb, Options, TxnOptions};
+    /// # struct Journal;
+    /// # impl LogLayout for Journal {
+    /// #     fn head_key(&self) -> &[u8] {
+    /// #         b"journal-head"
+    /// #     }
+    /// #     fn entry_key(&self, position: u64, out: &mut Vec<u8>) {
+    /// #         out.extend_from_slice(b"journal/");
+    /// #         out.extend_from_slice(&position.to_be_bytes());
+    /// #     }
+    /// #     fn max_entry_key_len(&self) -> usize {
+    /// #         b"journal/".len() + 8
+    /// #     }
+    /// # }
+    ///
+    /// let db = OptimisticTransactionDb::open("journal", Options::memory())?;
+    /// let journal: Arc<dyn LogLayout> = Arc::new(Journal);
+    /// let tx = db.begin(&TxnOptions::new());
+    /// tx.append(&journal, b"first", None)?;
+    /// tx.append(&journal, b"second", None)?;
+    ///
+    /// let mut bytes = 0;
+    /// tx.with_appended(&journal, |entry| {
+    ///     bytes += entry.len();
+    ///     ControlFlow::Continue(())
+    /// });
+    /// assert_eq!(bytes, 11);
+    ///
+    /// let mut any = false;
+    /// tx.with_appended(&journal, |_| {
+    ///     any = true;
+    ///     ControlFlow::Break(())
+    /// });
+    /// assert!(any);
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    pub fn with_appended<F>(&self, log: &Arc<dyn LogLayout>, mut visit: F)
+    where
+        F: FnMut(&[u8]) -> ControlFlow<()>,
+    {
+        let Some(appends) = self.appends.get() else {
+            return;
+        };
+        let head = log.head_key();
+        appends.walk_chain(&(), |pending| {
+            if pending.log.head_key() == head {
+                visit(&pending.entry)?;
+            }
+            ControlFlow::Continue(())
+        });
     }
 
     /// Refuses a put, delete or merge of `key` when the installed classifier

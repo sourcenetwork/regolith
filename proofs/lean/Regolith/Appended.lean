@@ -37,6 +37,9 @@ number of appends and logs:
    positions in the log.
 5. `newest_first_breaks_order`: a RED as a concrete counterexample. Without
    the reversal the answer is newest first and differs from commit order.
+6. `appended_is_reversed_with_appended` and `with_appended_is_reversed_appended`:
+   `with_appended` hands over exactly the entries `appended` returns, in the
+   reverse order, which is how `appended` is built from it.
 
 How to read the Lean: `def` defines a function, `theorem` states a fact and
 its proof follows `:= by`. Lines starting with `--` are comments. A log and an
@@ -72,7 +75,9 @@ def appended (log : Nat) (q : Queue) : List Nat :=
   -- Keep the entries that name this log, newest first, then reverse them.
   ((q.filter (fun p => decide (p.1 = log))).map (fun p => p.2)).reverse
 
-/-- The bug: the answer is left newest first, as the walk finds it. -/
+/-- `Transaction::with_appended` for `log`: the same entries, newest first,
+as the walk finds them. Correct for a reader that does not care about order,
+and the bug (`newest_first_breaks_order`) when taken for commit order. -/
 def appendedNewestFirst (log : Nat) (q : Queue) : List Nat :=
   -- The same walk and filter, with no reversal.
   (q.filter (fun p => decide (p.1 = log))).map (fun p => p.2)
@@ -164,6 +169,22 @@ theorem newest_first_breaks_order :
     appendedNewestFirst 1 (push 1 8 (push 1 7 [])) ≠ numbered 1 (push 1 8 (push 1 7 [])) := by
   -- Evaluate both sides: `[8, 7]` against `[7, 8]`.
   decide
+
+/-- `appended` is `with_appended`'s answer reversed: the code collects what
+`with_appended` visits and reverses it. -/
+theorem appended_is_reversed_with_appended (log : Nat) (q : Queue) :
+    -- The statement: reversing the newest-first answer gives `appended`.
+    appended log q = (appendedNewestFirst log q).reverse := by
+  -- Both sides are the same filter and map, reversed.
+  rfl
+
+/-- `with_appended` visits the entries `appended` returns, newest first: the
+same entries, none more and none fewer, in the reverse order. -/
+theorem with_appended_is_reversed_appended (log : Nat) (q : Queue) :
+    -- The statement: the newest-first answer is `appended` read backwards.
+    appendedNewestFirst log q = (appended log q).reverse := by
+  -- Unfold `appended`; reversing twice gives the list back.
+  simp [appended, appendedNewestFirst]
 
 -- Close the namespace.
 end Regolith.Appended
