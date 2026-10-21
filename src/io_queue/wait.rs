@@ -127,7 +127,10 @@ impl Clone for Listen {
 /// through its own registration, so several tasks may await clones at once.
 /// Dropping a wait never cancels the read: the queue completes it all the
 /// same. A retained ready wait protects the blocks its call needs across
-/// other queue polls; keep it until rerunning the call when delaying that run.
+/// up to 64 landing polls; keep it until rerunning the call when delaying
+/// that run. After that finite window, the call may reread expired blocks.
+/// A clone kept after the call finishes also retains blocks until it drops
+/// or reaches that limit.
 #[derive(Clone)]
 pub struct IoWait {
     listen: Listen,

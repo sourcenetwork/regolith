@@ -185,3 +185,144 @@ fn another_reader_cannot_release_a_live_callers_landing() {
         "another reader consumed this caller's hold"
     );
 }
+
+fn synthetic_key(offset: u64) -> crate::engine::io::unit::UnitKey {
+    crate::engine::io::unit::UnitKey {
+        file_id: 1,
+        offset,
+        guard: None,
+    }
+}
+
+#[test]
+fn forgotten_live_handle_expires_at_the_finite_window() {
+    use super::{LIVE_KEEP_ROUNDS, Ledger};
+    use crate::engine::io::shared::{QueueShared, WaitSlot, test_id};
+    use std::sync::Arc;
+
+    let queue = QueueShared::new(test_id(), 100);
+    let mut ledger = Ledger::default();
+    let key = synthetic_key(0);
+    let caller = Arc::new(WaitSlot::new());
+    caller.complete();
+    ledger.land(key, 200);
+    ledger.completed(Some(key), caller.clone());
+    for round in 1..=LIVE_KEEP_ROUNDS {
+        ledger.land(synthetic_key(round), 10);
+        ledger.settle(&queue);
+        assert!(ledger.is_held(&key), "lost progress at round {round}");
+        assert_eq!(ledger.live_bytes(), 200);
+    }
+    ledger.land(synthetic_key(LIVE_KEEP_ROUNDS + 1), 10);
+    ledger.settle(&queue);
+    assert!(caller.is_ready(), "expiry must not invalidate the wait");
+    assert!(!ledger.is_held(&key));
+    assert!(!ledger.keys().contains(&key));
+    assert!(ledger.bytes() <= 100);
+    assert_eq!(ledger.live_bytes(), 0);
+}
+
+#[test]
+fn live_retention_counts_shared_blocks_once_and_resets_after_drop() {
+    use super::Ledger;
+    use crate::engine::io::shared::{QueueShared, WaitSlot, test_id};
+    use std::sync::Arc;
+
+    let queue = QueueShared::new(test_id(), 100);
+    let mut ledger = Ledger::default();
+    let key = synthetic_key(0);
+    let first = Arc::new(WaitSlot::new());
+    let second = Arc::new(WaitSlot::holding(vec![key].into_boxed_slice()));
+    ledger.land(key, 60);
+    ledger.land(key, 80);
+    ledger.completed(Some(key), first.clone());
+    ledger.hold(&second);
+    ledger.completed(Some(key), second.clone());
+    ledger.settle(&queue);
+    assert_eq!(
+        ledger.live_bytes(),
+        80,
+        "shared blocks are not per-wait charges"
+    );
+    assert!(ledger.retention_warning);
+    drop(first);
+    ledger.land(synthetic_key(1), 10);
+    ledger.settle(&queue);
+    assert_eq!(ledger.live_bytes(), 80, "the other caller still retains it");
+    drop(second);
+    ledger.land(synthetic_key(2), 10);
+    ledger.settle(&queue);
+    assert_eq!(ledger.live_bytes(), 0);
+    assert!(
+        !ledger.retention_warning,
+        "the next episode must warn again"
+    );
+}
+
+#[test]
+fn duplicate_landing_eviction_keeps_the_latest_entry_until_last_removal() {
+    use super::Ledger;
+    use crate::engine::io::shared::{Landing, QueueShared, test_id};
+    use std::{io, sync::Arc};
+
+    let queue = QueueShared::new(test_id(), 100);
+    let mut ledger = Ledger::default();
+    let key = synthetic_key(0);
+    queue.land(key, Landing::Failed(Arc::new(io::Error::other("latest"))));
+    ledger.land(key, 80);
+    ledger.land(key, 80);
+    ledger.settle(&queue);
+    assert_eq!(ledger.bytes(), 80);
+    assert!(
+        queue.landed(&key).is_some(),
+        "the remaining entry must stay available"
+    );
+    ledger.land(synthetic_key(1), 100);
+    ledger.settle(&queue);
+    assert!(!ledger.keys().contains(&key));
+}
+
+#[test]
+fn an_idle_poll_reports_the_retained_live_landing() {
+    let (_dir, db) = big_values(&[b"a"]);
+    let mut queue = db.io_queue();
+    let snapshot = db
+        .snapshot()
+        .with_read_mode(ReadMode::CacheOnly(queue.id()));
+    let live = match snapshot.get(b"a") {
+        Err(Error::WouldBlock(WouldBlock::Io(wait))) => wait,
+        other => panic!("{other:?}"),
+    };
+    let landed = queue.poll(IoBudget::ALL);
+    assert!(live.is_ready());
+    assert!(landed.retained_live_bytes >= BIG);
+    let idle = queue.poll(IoBudget::ALL);
+    assert_eq!(idle.retained_live_bytes, landed.retained_live_bytes);
+    assert_eq!(idle.completed, 0);
+    assert!(!idle.more_pending);
+}
+
+#[test]
+fn a_late_drop_does_not_receive_the_rest_of_the_live_window() {
+    use super::Ledger;
+    use crate::engine::io::shared::{QueueShared, WaitSlot, test_id};
+    use std::sync::Arc;
+
+    let queue = QueueShared::new(test_id(), 100);
+    let mut ledger = Ledger::default();
+    let key = synthetic_key(0);
+    let caller = Arc::new(WaitSlot::new());
+    ledger.land(key, 200);
+    ledger.completed(Some(key), caller.clone());
+    for round in 1..=10 {
+        ledger.land(synthetic_key(round), 10);
+        ledger.settle(&queue);
+    }
+    assert!(ledger.is_held(&key));
+    drop(caller);
+    ledger.land(synthetic_key(11), 10);
+    ledger.settle(&queue);
+    assert!(!ledger.is_held(&key));
+    assert_eq!(ledger.live_bytes(), 0);
+    assert!(ledger.bytes() <= 100);
+}

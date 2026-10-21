@@ -1118,6 +1118,7 @@ tla:
     check MC_LandingLifetime_Red_ExpireLive             RED LiveLandingRetained
     check MC_LandingLifetime_Red_ConsumeLive            RED LiveLandingRetained
     check MC_LandingLifetime_Red_LeakAbandoned          RED AbandonedReleased
+    check MC_LandingLifetime_Red_LeakLive               RED LiveBounded
     # D53, a CacheOnly commit whose validation misses the cache: a miss in
     # the early check leaves the commit owed on its queue, which reads the
     # block and submits it again; a miss deciding its slot leaves the

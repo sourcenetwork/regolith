@@ -19,22 +19,25 @@
 //!   for, stay held until the call is seen again: a later wait whose holds
 //!   cover them (the call was run again and waits for one more block), or a
 //!   call that read all of them and finished ([`Message::Finished`]);
-//! - a kept wait is let go after [`KEEP_ROUNDS`] landing polls only once
-//!   no caller holds its `IoWait`; a ready caller delayed by other work
-//!   retains its progress, while an abandoned wait holds nothing for long.
+//! - abandoned waits expire after [`KEEP_ROUNDS`] landing polls; a live
+//!   caller retains progress for at most [`LIVE_KEEP_ROUNDS`] landing polls.
+//!   A forgotten handle cannot pin landings forever.
 //!
 //! The landings no call holds go oldest first, at the end of a poll, until
-//! the rest fit the bound. A caller retaining its ready wait until its next
-//! run finds every block it found before and the one it waited for, however
-//! many other polls intervene. What stays past the bound is what calls in
-//! progress need, which the reads they were asked for need anyway.
+//! total bytes fit the bound or only held landings remain. Total bytes
+//! can exceed the bound by the
+//! union of blocks held by pending and retained calls; this is not a hard
+//! total-memory bound. Completed live waits have a finite age bound, not a
+//! separate byte cap. A caller resuming within that window finds its progress;
+//! after expiry it may need to reread. IoProgress reports completed live
+//! retention bytes, with a warning once per episode above half the bound.
 //! `proofs/tla/LandingHold.tla` checks that such a call finishes, and that
 //! the eviction this replaces (oldest first, holding nothing) never lets it.
 //!
 //! [`WaitSlot::holds`]: crate::engine::io::shared::WaitSlot::holds
 //! [`Message::Finished`]: crate::engine::io::shared::Message::Finished
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
 use crate::engine::io::shared::{QueueShared, WaitSlot};
@@ -43,6 +46,9 @@ use crate::engine::io::unit::UnitKey;
 /// Landing polls an abandoned completed wait is kept before reclaiming it.
 pub(super) const KEEP_ROUNDS: u64 = 4;
 
+/// A live handle may delay reclamation for sixteen abandoned-wait windows.
+pub(super) const LIVE_KEEP_ROUNDS: u64 = 16 * KEEP_ROUNDS;
+
 /// The owner's account of what landed for its queue. Only the owner touches
 /// it, at its polls.
 #[derive(Default)]
@@ -50,6 +56,10 @@ pub(super) struct Ledger {
     /// Each landing, oldest first, with what it costs. A block landed twice
     /// is here twice; the table keeps the newer.
     order: VecDeque<(UnitKey, usize)>,
+    /// Occurrences in order; only the last eviction forgets a landing.
+    occurrences: HashMap<UnitKey, usize>,
+    /// Scratch keys reused across polls that observe live completed waits.
+    live_keys: HashSet<UnitKey>,
     /// What `order` costs.
     bytes: usize,
     /// How many pending or kept waits hold each block. A block held by none
@@ -61,6 +71,10 @@ pub(super) struct Ledger {
     round: u64,
     /// Something landed since the last [`Ledger::settle`].
     landed: bool,
+    /// Union of landed bytes protected by completed waits with live callers.
+    live_bytes: usize,
+    /// A warning has already been emitted for the current retention episode.
+    retention_warning: bool,
 }
 
 /// A completed wait, kept for its call's next run.
@@ -77,6 +91,7 @@ impl Ledger {
     /// `key` landed, costing `charge` bytes.
     pub(super) fn land(&mut self, key: UnitKey, charge: usize) {
         self.order.push_back((key, charge));
+        *self.occurrences.entry(key).or_default() += 1;
         self.bytes = self.bytes.saturating_add(charge);
         self.landed = true;
     }
@@ -113,6 +128,10 @@ impl Ledger {
             return;
         }
         let covered = |kept: &Kept| {
+            // A completed slot is never reissued. Existing callers may clone,
+            // but after only Ledger owns it the count cannot increase again.
+            // The relaxed count is only an ownership test: release reads no
+            // caller-written fields and needs no final-drop acquire here.
             Arc::strong_count(&kept.slot) == 1
                 && kept
                     .awaited
@@ -136,17 +155,27 @@ impl Ledger {
     }
 
     /// The end of a poll: when something landed, a round passed, and a kept
-    /// wait past [`KEEP_ROUNDS`] of them is let go if no caller holds it;
-    /// then unheld landings go oldest first until they fit `queue`'s bound.
+    /// wait expires after its abandoned or live window. Unheld landings
+    /// then go oldest first while total bytes exceed the queue bound.
     pub(super) fn settle(&mut self, queue: &QueueShared) {
         if !std::mem::take(&mut self.landed) {
             return;
         }
         self.round += 1;
         let mut kept = std::mem::take(&mut self.kept);
+        let mut live_keys = std::mem::take(&mut self.live_keys);
+        live_keys.clear();
         kept.retain(|wait| {
-            // After completion Ledger and caller IoWaits are the slot's owners.
-            if self.round - wait.round <= KEEP_ROUNDS || Arc::strong_count(&wait.slot) > 1 {
+            let age = self.round - wait.round;
+            // A completed slot is never reissued: existing callers can clone,
+            // but a count of one cannot later increase. The relaxed load only
+            // tests ownership; release reads no caller-written slot fields.
+            let live = Arc::strong_count(&wait.slot) > 1;
+            if age <= LIVE_KEEP_ROUNDS && (age <= KEEP_ROUNDS || live) {
+                if live {
+                    live_keys.extend(wait.slot.holds().iter().copied());
+                    live_keys.extend(wait.awaited);
+                }
                 true
             } else {
                 self.release(wait);
@@ -154,6 +183,28 @@ impl Ledger {
             }
         });
         self.kept = kept;
+        self.live_bytes = 0;
+        for (key, charge) in self.order.iter().rev() {
+            if live_keys.is_empty() {
+                break;
+            }
+            if live_keys.remove(key) {
+                self.live_bytes += charge;
+            }
+        }
+        self.live_keys = live_keys;
+        let over_half = self.live_bytes > queue.bound() / 2;
+        if over_half && !self.retention_warning {
+            tracing::warn!(
+                retained_live_bytes = self.live_bytes,
+                queue_bound_bytes = queue.bound(),
+                "live completed reads retain more than half the I/O queue byte bound"
+            );
+        }
+        self.retention_warning = over_half;
+        if self.bytes <= queue.bound() {
+            return;
+        }
         let mut i = 0;
         while self.bytes > queue.bound() && i < self.order.len() {
             let (key, charge) = self.order[i];
@@ -163,7 +214,10 @@ impl Ledger {
             }
             self.order.remove(i);
             self.bytes -= charge;
-            if !self.order.iter().any(|(other, _)| *other == key) {
+            let remaining = self.occurrences.get_mut(&key).expect("counted landing");
+            *remaining -= 1;
+            if *remaining == 0 {
+                self.occurrences.remove(&key);
                 queue.forget(&key);
             }
         }
@@ -174,7 +228,11 @@ impl Ledger {
         for (key, _) in self.order.drain(..) {
             queue.forget(&key);
         }
+        self.occurrences.clear();
+        self.live_keys.clear();
         self.bytes = 0;
+        self.live_bytes = 0;
+        self.retention_warning = false;
         self.held.clear();
         self.kept.clear();
     }
@@ -199,6 +257,11 @@ impl Ledger {
         for key in kept.slot.holds() {
             self.unpin(*key);
         }
+    }
+
+    /// Bytes retained by completed waits with live callers at the last settle.
+    pub(super) fn live_bytes(&self) -> usize {
+        self.live_bytes
     }
 
     /// How many completed waits are kept.
