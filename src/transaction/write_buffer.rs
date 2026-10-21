@@ -14,7 +14,7 @@ use std::io;
 use std::ops::ControlFlow;
 
 use crate::DbSlice;
-use crate::engine::merge_call::apply_merge;
+use crate::engine::merge_call::{apply_merge, partial_merge};
 use crate::options::MergeOperator;
 use crate::txn_buffer::TxnBuffer;
 
@@ -206,6 +206,60 @@ pub(super) fn fold_by_key(
 /// What a commit stores: the point writes by key (`None` deletes), and the
 /// merge operands that apply on top of them, oldest first.
 pub(super) type Settled = (BTreeMap<Vec<u8>, Option<Vec<u8>>>, Vec<(Vec<u8>, Vec<u8>)>);
+
+/// Fold adjacent same-key operands inside one atomic commit when this
+/// reduces their combined payload and stays within the value limit.
+/// No version of an earlier commit is replaced.
+pub(super) fn fold_merges(
+    merges: &mut Vec<(Vec<u8>, Vec<u8>)>,
+    op: &dyn MergeOperator,
+    max_value_size: usize,
+) {
+    merges.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut input = std::mem::take(merges).into_iter();
+    merges.reserve(input.len());
+    while let Some((key, _)) = input.as_slice().first() {
+        let count = input
+            .as_slice()
+            .iter()
+            .take_while(|(next, _)| next == key)
+            .count();
+        fold_run(&mut input, count, merges, op, max_value_size);
+    }
+}
+
+fn fold_run(
+    input: &mut std::vec::IntoIter<(Vec<u8>, Vec<u8>)>,
+    count: usize,
+    output: &mut Vec<(Vec<u8>, Vec<u8>)>,
+    op: &dyn MergeOperator,
+    limit: usize,
+) {
+    if count == 1 {
+        output.push(input.next().expect("the key run is bounded by the input"));
+        return;
+    }
+    let start = output.len();
+    fold_run(input, count / 2, output, op, limit);
+    let middle = output.len();
+    fold_run(input, count - count / 2, output, op, limit);
+    // A declined subtree stays intact. Retrying its prefixes would reintroduce
+    // an unbalanced fold whose callback work can grow quadratically.
+    if middle != start + 1 || output.len() != middle + 1 {
+        return;
+    }
+    let (key, left) = &output[start];
+    let right = &output[middle].1;
+    if left.len() <= limit
+        && right.len() <= limit
+        && let Some(combined) = partial_merge(op, key, left, right)
+        && combined.len() < left.len().saturating_add(right.len())
+        && combined.len() <= limit
+    {
+        output[start].1 = combined;
+        output.pop();
+    }
+}
 
 /// Split a drained buffer, newest write first, into what a commit stores.
 ///

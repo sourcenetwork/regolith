@@ -274,3 +274,7 @@ harness = false
 [[bench]]
 name = "tables"
 harness = false
+
+[[bench]]
+name = "merge_commit"
+harness = false

@@ -189,7 +189,7 @@ pub use retry::{RetryPolicy, TransactError, ready};
 use scan_range::ScanRun;
 pub use txn_options::TxnOptions;
 use validated_range::RangeRecord;
-use write_buffer::{Write, read_buffered, settle};
+use write_buffer::{Write, fold_merges, read_buffered, settle};
 
 /// Default lock-acquisition timeout for [`TransactionDb`] when the
 /// caller doesn't specify one on [`TransactionDb::with_lock_timeout`].
@@ -2109,7 +2109,15 @@ impl Transaction {
         // nothing needs the buffers' own copies afterwards, and draining
         // hands over the stored keys and values instead of cloning each
         // one. `settle` says what the drained writes commit as.
-        let (writes, merges) = settle(self.writes.drain());
+        let repeated =
+            self.engine.merge_operator().is_some() && self.writes.may_have_repeated_keys();
+        let (writes, mut merges) = settle(self.writes.drain());
+        if repeated
+            && merges.len() > 1
+            && let Some(op) = self.engine.merge_operator()
+        {
+            fold_merges(&mut merges, op, self.engine.max_value_size());
+        }
         let appends = self.appends.take().map_or_else(Vec::new, |mut buffer| {
             // Newest first out of the buffer; the commit wants the order made.
             let mut made = buffer.drain();
