@@ -59,7 +59,9 @@
 \*     run again, which lets its holds go after that many landing polls.
 \*     Here every call is run again before the next poll that lands
 \*     anything, so no kept wait ages. A call run again later than that may
-\*     find a block gone and miss it once more; it is not modelled.
+\*     find a block gone and miss it once more; it is not modelled here.
+\*     LandingLifetime.tla separately checks that a live caller prevents
+\*     this aging regardless of how many other landing polls intervene.
 \*   - Other threads: a run here is one step, as on the queue's owner,
 \*     whose own poll cannot fall inside it. The queue's messages (a wait,
 \*     a Finished) reach the owner in order before its next eviction, which

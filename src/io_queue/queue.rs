@@ -209,7 +209,7 @@ impl IoQueue {
     /// A read that must not touch the device, and the poll that does its I/O:
     ///
     /// ```
-    /// use regolith::{Db, Error, IoBudget, IoProgress, Options, ReadMode, WouldBlock};
+    /// use regolith::{Db, Error, IoBudget, Options, ReadMode, WouldBlock};
     ///
     /// let db = Db::open("rows", Options::memory())?;
     /// db.put(b"row", b"1")?;
@@ -231,7 +231,9 @@ impl IoQueue {
     /// // The same read, run again, finds the block.
     /// assert_eq!(snapshot.get(b"row")?.as_deref(), Some(&b"1"[..]));
     /// // A queue that owes nothing has nothing to do.
-    /// assert_eq!(queue.poll(IoBudget::ALL), IoProgress::default());
+    /// let idle = queue.poll(IoBudget::ALL);
+    /// assert_eq!(idle.completed, 0);
+    /// assert!(!idle.more_pending);
     /// # Ok::<(), regolith::Error>(())
     /// ```
     pub fn poll(&mut self, budget: IoBudget) -> IoProgress {
@@ -241,7 +243,10 @@ impl IoQueue {
             self.cache.io().bind_current(self.id());
         }
         if !self.owes() {
-            return IoProgress::default();
+            return IoProgress {
+                retained_live_bytes: self.ledger.live_bytes(),
+                ..IoProgress::default()
+            };
         }
         let mut completed = 0;
         self.take_inbox(&mut completed);
@@ -287,11 +292,12 @@ impl IoQueue {
         }
         self.make_room();
         // Once every message this poll took is in: what calls still need is
-        // held, and the rest of what landed fits the bound again.
+        // held within its lifetime window; unheld landings can be evicted.
         self.ledger.settle(&self.shared);
         self.shared.set_kept(self.ledger.kept());
         let wake_in = self.fire_timers(&mut completed);
         IoProgress {
+            retained_live_bytes: self.ledger.live_bytes(),
             completed,
             more_pending: self.owes(),
             wake_in,

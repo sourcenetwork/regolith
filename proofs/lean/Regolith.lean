@@ -234,3 +234,5 @@ import Regolith.HistogramBounds
 -- MANIFEST and every file before a removal. Backs
 -- `proofs/tla/MirrorPersist.tla`.
 import Regolith.MirrorPersist
+-- Completed I/O stays retained for a live caller despite intervening polls.
+import Regolith.LandingLifetime

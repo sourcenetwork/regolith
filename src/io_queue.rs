@@ -182,6 +182,12 @@ impl IoBudget {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct IoProgress {
+    /// Landed bytes protected by completed waits with live callers at the
+    /// latest landing poll. Shared blocks count once, using their newest landing charge.
+    /// This is part of the memory that can exceed the queue's byte bound;
+    /// pending calls can also hold blocks. A live wait expires after 64
+    /// landing polls, after which its caller may need to reread.
+    pub retained_live_bytes: usize,
     /// Reads this queue waited on that finished during the poll, each counted
     /// once however many of the queue's reads waited on it, whichever thread
     /// ran it; and the timed waits the poll found due.
