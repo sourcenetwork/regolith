@@ -1111,6 +1111,13 @@ tla:
     check MC_LandingHold_Green_Three                   GREEN
     check MC_LandingHold_Red_Fifo                      RED EveryCallFinishes
     check MC_LandingHold_Red_NoHolds                   RED RunsKeepProgress
+    # A completed wait keeps its landing while a delayed caller owns it;
+    # polls still reclaim abandoned waits behind live ones.
+    spec=LandingLifetime
+    check MC_LandingLifetime_Green                     GREEN
+    check MC_LandingLifetime_Red_ExpireLive             RED LiveLandingRetained
+    check MC_LandingLifetime_Red_ConsumeLive            RED LiveLandingRetained
+    check MC_LandingLifetime_Red_LeakAbandoned          RED AbandonedReleased
     # D53, a CacheOnly commit whose validation misses the cache: a miss in
     # the early check leaves the commit owed on its queue, which reads the
     # block and submits it again; a miss deciding its slot leaves the

@@ -19,16 +19,15 @@
 //!   for, stay held until the call is seen again: a later wait whose holds
 //!   cover them (the call was run again and waits for one more block), or a
 //!   call that read all of them and finished ([`Message::Finished`]);
-//! - a kept wait whose call is never run again is let go after
-//!   [`KEEP_ROUNDS`] polls that land something, so a call abandoned after a
-//!   wait holds nothing for long.
+//! - a kept wait is let go after [`KEEP_ROUNDS`] landing polls only once
+//!   no caller holds its `IoWait`; a ready caller delayed by other work
+//!   retains its progress, while an abandoned wait holds nothing for long.
 //!
 //! The landings no call holds go oldest first, at the end of a poll, until
-//! the rest fit the bound. A call run again within [`KEEP_ROUNDS`] landing
-//! polls of each wait's completion therefore finds every block it found
-//! before and the one it waited for, and finishes in one run more than the
-//! blocks it misses. What stays past the bound is what calls in progress
-//! need, which the reads they were asked for need anyway.
+//! the rest fit the bound. A caller retaining its ready wait until its next
+//! run finds every block it found before and the one it waited for, however
+//! many other polls intervene. What stays past the bound is what calls in
+//! progress need, which the reads they were asked for need anyway.
 //! `proofs/tla/LandingHold.tla` checks that such a call finishes, and that
 //! the eviction this replaces (oldest first, holding nothing) never lets it.
 //!
@@ -41,9 +40,7 @@ use std::sync::Arc;
 use crate::engine::io::shared::{QueueShared, WaitSlot};
 use crate::engine::io::unit::UnitKey;
 
-/// Landing polls a completed wait is kept for when its call is not seen
-/// again: the slack a caller has to run a call again after its wait
-/// completes.
+/// Landing polls an abandoned completed wait is kept before reclaiming it.
 pub(super) const KEEP_ROUNDS: u64 = 4;
 
 /// The owner's account of what landed for its queue. Only the owner touches
@@ -108,17 +105,18 @@ impl Ledger {
         });
     }
 
-    /// A call read `read` (sorted): every kept wait it covers, the block
-    /// waited for and everything it holds, was that call's earlier run, and
-    /// is let go. The call holds what it needs again by its own wait, or
-    /// finished.
+    /// A call read `read` (sorted). Release covered waits only after their
+    /// callers relinquish their handles: another call can read the same
+    /// blocks without consuming the delayed caller's progress.
     pub(super) fn seen(&mut self, read: &[UnitKey]) {
         if read.is_empty() || self.kept.is_empty() {
             return;
         }
         let covered = |kept: &Kept| {
-            kept.awaited
-                .is_none_or(|key| read.binary_search(&key).is_ok())
+            Arc::strong_count(&kept.slot) == 1
+                && kept
+                    .awaited
+                    .is_none_or(|key| read.binary_search(&key).is_ok())
                 && kept
                     .slot
                     .holds()
@@ -138,22 +136,24 @@ impl Ledger {
     }
 
     /// The end of a poll: when something landed, a round passed, and a kept
-    /// wait past [`KEEP_ROUNDS`] of them is let go; then the landings no
-    /// wait holds go, oldest first, until the rest fit `queue`'s bound.
+    /// wait past [`KEEP_ROUNDS`] of them is let go if no caller holds it;
+    /// then unheld landings go oldest first until they fit `queue`'s bound.
     pub(super) fn settle(&mut self, queue: &QueueShared) {
         if !std::mem::take(&mut self.landed) {
             return;
         }
         self.round += 1;
-        while self
-            .kept
-            .front()
-            .is_some_and(|kept| self.round - kept.round > KEEP_ROUNDS)
-        {
-            if let Some(kept) = self.kept.pop_front() {
-                self.release(&kept);
+        let mut kept = std::mem::take(&mut self.kept);
+        kept.retain(|wait| {
+            // After completion Ledger and caller IoWaits are the slot's owners.
+            if self.round - wait.round <= KEEP_ROUNDS || Arc::strong_count(&wait.slot) > 1 {
+                true
+            } else {
+                self.release(wait);
+                false
             }
-        }
+        });
+        self.kept = kept;
         let mut i = 0;
         while self.bytes > queue.bound() && i < self.order.len() {
             let (key, charge) = self.order[i];

@@ -126,7 +126,8 @@ impl Clone for Listen {
 /// A clone waits on the same read and is woken with it; each clone is woken
 /// through its own registration, so several tasks may await clones at once.
 /// Dropping a wait never cancels the read: the queue completes it all the
-/// same.
+/// same. A retained ready wait protects the blocks its call needs across
+/// other queue polls; keep it until rerunning the call when delaying that run.
 #[derive(Clone)]
 pub struct IoWait {
     listen: Listen,
