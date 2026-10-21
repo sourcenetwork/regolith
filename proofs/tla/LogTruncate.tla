@@ -59,13 +59,13 @@
 \*   |------------------|--------------------------------------------------------|
 \*   | Begin, snap      | transaction.rs:393 and :511, register_snapshot_at_     |
 \*   |                  | horizon: the snapshot_seq every read is served at      |
-\*   | AppendOp         | transaction/append.rs:144 Transaction::append: queued  |
+\*   | AppendOp         | transaction/append.rs:146 Transaction::append: queued  |
 \*   |                  | only, numbered at commit                               |
-\*   | TruncateOp       | transaction/truncate.rs:162 Transaction::truncate_log  |
-\*   | HeadAt(snap[w])  | truncate.rs:192 read_log_head: an unrecorded read at   |
+\*   | TruncateOp       | transaction/truncate.rs:229 Transaction::truncate_log  |
+\*   | HeadAt(snap[w])  | truncate.rs:259 read_log_head: an unrecorded read at   |
 \*   |  in the guard    | the snapshot (read_horizon), never validated           |
-\*   | the guard        | truncate.rs:173 `end > head` -> Error::InvalidArgument |
-\*   | dels             | truncate.rs:184 the Write::Delete of each entry key in |
+\*   | the guard        | truncate.rs:240 `end > head` -> Error::InvalidArgument |
+\*   | dels             | truncate.rs:250 the Write::Delete of each entry key in |
 \*   |                  | the write buffer (`self.writes`)                       |
 \*   | Rollback         | transaction.rs:1800 rollback_to_savepoint, callbacks.  |
 \*   |                  | rs:628 roll_back_to: the buffer shrinks to the mark    |
@@ -86,7 +86,7 @@
 \*   |                  | below the oldest live snapshot, engine/snapshot_       |
 \*   |                  | registry.rs:321 oldest_live_seq                        |
 \*   | PlainPut         | transaction.rs:1568 Transaction::put, refused by       |
-\*   |                  | transaction/append.rs:169 refuse_log_key               |
+\*   |                  | transaction/append.rs:328 refuse_log_key               |
 \*   | hist, wanted,    | ghost: the log as of each sequence, what the caller    |
 \*   |  got, conflicted | still wants dropped, what the commit dropped, whether  |
 \*   |                  | a commit conflicted; no Rust counterpart               |

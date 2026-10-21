@@ -44,35 +44,94 @@ impl Transaction {
     ///   concurrent `append` to the same log: an append writes only
     ///   positions past the head, and a truncate only positions at or below
     ///   the head it read. This holds at every isolation level, for an
-    ///   optimistic and a pessimistic transaction alike; `truncate_log`
-    ///   takes no lock, so a lock another pessimistic transaction holds on an
-    ///   entry key (`get_for_update`) does not hold against it: the entry can
-    ///   be dropped while the lock is held. A conflict can only come from a read the
-    ///   transaction itself made of an entry it truncates, at a level that
-    ///   validates reads and for a key no classifier declares
-    ///   [`KeyClass::Log`](crate::KeyClass::Log).
+    ///   optimistic and a pessimistic transaction alike. A conflict can only
+    ///   come from a read the transaction itself made of an entry it
+    ///   truncates, at a level that validates reads and for a key no
+    ///   classifier declares [`KeyClass::Log`](crate::KeyClass::Log).
+    /// - **No lock, by design.** `truncate_log` is the one pessimistic write
+    ///   that takes no lock, and that is deliberate, not a precedent for
+    ///   other writes: a delete is a version like any other, and the deletes
+    ///   of overlapping truncates elide into one, so a lock would order
+    ///   nothing a reader can see and would only give truncate a way to
+    ///   block. So a lock another pessimistic transaction holds on an entry
+    ///   key (`get_for_update`) does not hold against it: the entry can be
+    ///   dropped while the lock is held.
     /// - **Snapshots keep their entries.** A delete is a version like any
     ///   other: a [`Snapshot`](crate::Snapshot) taken, or a transaction
     ///   begun, before the truncating commit still reads every entry it
-    ///   dropped, until it is dropped and a compaction removes them. A
-    ///   reader that reads the head in a snapshot and then the entries up to
-    ///   it finds every entry that no commit at or before its snapshot
-    ///   truncated.
+    ///   dropped. Only once that snapshot or transaction is dropped may a
+    ///   compaction remove those versions. A reader that reads the head in a
+    ///   snapshot and then the entries up to it finds every entry that no
+    ///   commit at or before its snapshot truncated.
     /// - **Rollback.** A savepoint saves the truncates made before it, and
     ///   `rollback_to_savepoint` drops those made after, as it does any
     ///   buffered write.
     ///
-    /// The cost is one delete per position in the range, so pass only the
-    /// positions not yet truncated: truncating `1..=n` again after `1..=m`
-    /// with `m < n` writes `n` deletes, not `n - m`. regolith does not
-    /// assume the entry keys of a log sort by position, so it cannot use one
-    /// range delete.
+    /// # Cost, and truncating a long range
     ///
-    /// Nothing bounds that cost but the range: every delete is buffered until
-    /// commit, then written as one WAL record and inserted into the memtable.
-    /// Split a long range across transactions, each truncating a slice of it.
-    /// Splitting loses only atomicity: a truncate is idempotent, and a log
-    /// with a prefix partly truncated is as valid as one with none.
+    /// The call costs one buffered delete per position in `positions`, and
+    /// the commit then writes them all in one WAL record and one memtable
+    /// insert each: O(range) memory in the transaction and O(range) work at
+    /// commit, bounded by nothing but the range. regolith does not assume the
+    /// entry keys of a log sort by position, so it cannot use one range
+    /// delete. Pass only the positions not yet truncated: truncating `1..=n`
+    /// after `1..=m` with `m < n` writes `n` deletes, not `n - m`.
+    ///
+    /// So truncate a long range, such as the first pruning of a log that has
+    /// grown for months, in slices: a slice of at most `K` positions per
+    /// transaction, each committed before the next begins, with `K` sized to
+    /// the write batch the caller is willing to hold in memory (thousands, not
+    /// millions). That is safe to stop at any point. Truncates commute and
+    /// are idempotent, so a crash between slices leaves the log valid, with a
+    /// prefix truncated, and the caller resumes with the first slice it has
+    /// no record of committing; a slice committed twice changes nothing.
+    /// Splitting gives up only the atomicity of the whole range.
+    ///
+    /// ```
+    /// use std::sync::Arc;
+    ///
+    /// use regolith::{LogLayout, OptimisticTransactionDb, Options, TxnOptions};
+    /// # struct Journal;
+    /// # impl LogLayout for Journal {
+    /// #     fn head_key(&self) -> &[u8] {
+    /// #         b"journal-head"
+    /// #     }
+    /// #     fn entry_key(&self, position: u64, out: &mut Vec<u8>) {
+    /// #         out.extend_from_slice(b"journal/");
+    /// #         out.extend_from_slice(&position.to_be_bytes());
+    /// #     }
+    /// #     fn max_entry_key_len(&self) -> usize {
+    /// #         b"journal/".len() + 8
+    /// #     }
+    /// # }
+    /// let db = OptimisticTransactionDb::open("journal", Options::memory())?;
+    /// let journal: Arc<dyn LogLayout> = Arc::new(Journal);
+    /// let writer = db.begin(&TxnOptions::new());
+    /// for n in 0..10u8 {
+    ///     writer.append(&journal, &[n], None)?;
+    /// }
+    /// writer.commit()?;
+    ///
+    /// // Drop positions 1 to 9, at most K = 4 per commit: 1..=4, 5..=8, 9..=9.
+    /// const K: u64 = 4;
+    /// let (first, last) = (1, 9);
+    /// let mut start = first;
+    /// while start <= last {
+    ///     let end = (start + K - 1).min(last);
+    ///     let slice = db.begin(&TxnOptions::new());
+    ///     slice.truncate_log(&journal, start..=end)?;
+    ///     slice.commit()?;
+    ///     start = end + 1;
+    /// }
+    ///
+    /// let mut key = Vec::new();
+    /// Journal.entry_key(10, &mut key);
+    /// assert!(db.db().get(&key)?.is_some());
+    /// key.clear();
+    /// Journal.entry_key(9, &mut key);
+    /// assert!(db.db().get(&key)?.is_none());
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
     ///
     /// # Errors
     ///
