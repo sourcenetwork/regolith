@@ -5,6 +5,7 @@
 //! transaction cannot read its own appends. The numbering is in
 //! `engine::commit::append`.
 
+use std::ops::ControlFlow;
 use std::sync::Arc;
 
 use super::policy::classifier_for;
@@ -52,9 +53,10 @@ impl Transaction {
     ///   one transaction or in many, only the first to commit writes an
     ///   entry. The key then holds the entry's position, so a caller can
     ///   look an entry up by it.
-    /// - **Own appends are invisible.** The positions do not exist until
-    ///   commit, so nothing this transaction reads, a scan of the log
-    ///   included, shows its own appends.
+    /// - **Own appends are invisible at a position.** The positions do not
+    ///   exist until commit, so nothing this transaction reads, a scan of the
+    ///   log or its head included, shows its own appends. To see the entries
+    ///   themselves, without positions, use [`Transaction::appended`].
     /// - **Rollback.** A savepoint saves the appends made before it, and
     ///   `rollback_to_savepoint` drops those made after.
     ///
@@ -161,6 +163,163 @@ impl Transaction {
             },
         );
         Ok(())
+    }
+
+    /// The entries this transaction has appended to the log `log` describes,
+    /// oldest first: the order the commit gives them positions.
+    ///
+    /// This is the one way to read a transaction's own appends back. Their
+    /// positions do not exist until commit, so [`Transaction::append`] keeps
+    /// them out of every read at a position; this returns the entry bytes
+    /// alone, never a position.
+    ///
+    /// # Guarantees
+    ///
+    /// - **Order.** The entries come in the order the `append` calls were
+    ///   made, which is the order the commit numbers them: the last one
+    ///   returned takes the highest of this transaction's positions.
+    /// - **One log.** Only appends to the log with the same
+    ///   [`LogLayout::head_key`] as `log` are returned. A log is identified
+    ///   by that key, so a fresh layout value for the same log (as callers
+    ///   build per call) names the same log. Appends to other logs are left
+    ///   out.
+    /// - **Rollback.** After [`Transaction::rollback_to_savepoint`] only the
+    ///   appends kept are returned.
+    /// - **Every append.** An append whose `once_key` the commit will skip,
+    ///   because the key already holds a position, is returned all the same:
+    ///   the transaction cannot know that before the commit orders it. The
+    ///   entry then gets no position of its own.
+    /// - **Free of the engine.** It does no I/O, records no read, is never
+    ///   validated (so it cannot make a commit conflict), never returns
+    ///   [`Error::WouldBlock`], and whatever the log or the database holds,
+    ///   each call walks every append this transaction has made and copies
+    ///   the matching entries. A caller on a hot path, or one that only needs
+    ///   to know whether there are any, uses [`Transaction::with_appended`],
+    ///   which copies nothing.
+    ///
+    /// # What it does not give
+    ///
+    /// No positions, and nothing of what other transactions or earlier
+    /// commits appended: it is this transaction's queue and no more. To read
+    /// the committed log, scan it at its positions as before. An entry a
+    /// reader finds there once this transaction commits is the same bytes
+    /// returned here, but a caller must not assume a skipped append's entry
+    /// is in the log.
+    ///
+    /// # Misuse
+    ///
+    /// Treating the index of an entry in the returned list as its position:
+    /// positions are the log's next numbers at commit and depend on other
+    /// commits. Two layouts that share a head key but differ in their entry
+    /// keys are one log here, which the [`LogLayout`] contract already
+    /// forbids.
+    ///
+    /// ```
+    /// use std::sync::Arc;
+    ///
+    /// use regolith::{LogLayout, OptimisticTransactionDb, Options, TxnOptions};
+    /// # struct Journal;
+    /// # impl LogLayout for Journal {
+    /// #     fn head_key(&self) -> &[u8] {
+    /// #         b"journal-head"
+    /// #     }
+    /// #     fn entry_key(&self, position: u64, out: &mut Vec<u8>) {
+    /// #         out.extend_from_slice(b"journal/");
+    /// #         out.extend_from_slice(&position.to_be_bytes());
+    /// #     }
+    /// #     fn max_entry_key_len(&self) -> usize {
+    /// #         b"journal/".len() + 8
+    /// #     }
+    /// # }
+    ///
+    /// let db = OptimisticTransactionDb::open("journal", Options::memory())?;
+    /// let journal: Arc<dyn LogLayout> = Arc::new(Journal);
+    /// let tx = db.begin(&TxnOptions::new());
+    /// assert!(tx.appended(&journal).is_empty());
+    /// tx.append(&journal, b"first", None)?;
+    /// tx.append(&journal, b"second", None)?;
+    /// assert_eq!(tx.appended(&journal), vec![b"first".to_vec(), b"second".to_vec()]);
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    ///
+    /// [`Error::WouldBlock`]: crate::Error::WouldBlock
+    pub fn appended(&self, log: &Arc<dyn LogLayout>) -> Vec<Vec<u8>> {
+        let mut entries = Vec::new();
+        self.with_appended(log, |entry| {
+            entries.push(entry.to_vec());
+            ControlFlow::Continue(())
+        });
+        entries.reverse();
+        entries
+    }
+
+    /// Hands each entry this transaction has appended to the log `log`
+    /// describes to `visit`, **newest first**, borrowed: no copy and no
+    /// allocation. `visit` returns [`ControlFlow::Break`] to stop early.
+    ///
+    /// The same entries as [`Transaction::appended`], with the same
+    /// guarantees except order: this is the order the buffer holds them in,
+    /// the reverse of the commit's. A reader that does not care about order,
+    /// such as a search over pending entries, reads them here for free.
+    /// Whether there are any is a visit that breaks on the first.
+    ///
+    /// An append made from inside `visit` is not visited: the walk starts at
+    /// the newest entry there was when it began.
+    ///
+    /// ```
+    /// use std::ops::ControlFlow;
+    /// use std::sync::Arc;
+    ///
+    /// use regolith::{LogLayout, OptimisticTransactionDb, Options, TxnOptions};
+    /// # struct Journal;
+    /// # impl LogLayout for Journal {
+    /// #     fn head_key(&self) -> &[u8] {
+    /// #         b"journal-head"
+    /// #     }
+    /// #     fn entry_key(&self, position: u64, out: &mut Vec<u8>) {
+    /// #         out.extend_from_slice(b"journal/");
+    /// #         out.extend_from_slice(&position.to_be_bytes());
+    /// #     }
+    /// #     fn max_entry_key_len(&self) -> usize {
+    /// #         b"journal/".len() + 8
+    /// #     }
+    /// # }
+    ///
+    /// let db = OptimisticTransactionDb::open("journal", Options::memory())?;
+    /// let journal: Arc<dyn LogLayout> = Arc::new(Journal);
+    /// let tx = db.begin(&TxnOptions::new());
+    /// tx.append(&journal, b"first", None)?;
+    /// tx.append(&journal, b"second", None)?;
+    ///
+    /// let mut bytes = 0;
+    /// tx.with_appended(&journal, |entry| {
+    ///     bytes += entry.len();
+    ///     ControlFlow::Continue(())
+    /// });
+    /// assert_eq!(bytes, 11);
+    ///
+    /// let mut any = false;
+    /// tx.with_appended(&journal, |_| {
+    ///     any = true;
+    ///     ControlFlow::Break(())
+    /// });
+    /// assert!(any);
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    pub fn with_appended<F>(&self, log: &Arc<dyn LogLayout>, mut visit: F)
+    where
+        F: FnMut(&[u8]) -> ControlFlow<()>,
+    {
+        let Some(appends) = self.appends.get() else {
+            return;
+        };
+        let head = log.head_key();
+        appends.walk_chain(&(), |pending| {
+            if pending.log.head_key() == head {
+                visit(&pending.entry)?;
+            }
+            ControlFlow::Continue(())
+        });
     }
 
     /// Refuses a put, delete or merge of `key` when the installed classifier

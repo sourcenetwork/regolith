@@ -29,6 +29,9 @@ import Regolith.Append
 -- law (live entries are the positions to the head less the truncated ones), a
 -- pinned reader's view, and never conflicts. Backs `proofs/tla/LogTruncate.tla`.
 import Regolith.LogTruncate
+-- A transaction reads its own appends to a log, oldest first, the order the commit numbers them.
+-- Backs `proofs/tla/AppendedEntries.tla`.
+import Regolith.Appended
 -- Plan 3.7: conflict-free allocation reserves ranges that never overlap,
 -- only grow, and survive crashes. Backs `proofs/tla/Allocate.tla`.
 import Regolith.Allocate
