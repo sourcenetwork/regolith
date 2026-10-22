@@ -1151,6 +1151,42 @@ tla:
     check MC_NowaitMiss_Red_ReadOnCaller               RED INV_CallNeverReads
     check MC_NowaitMiss_Red_NoResubmit                 RED LIVE_EveryCommitEnds
     check MC_NowaitMiss_Red_StaleHorizon               RED INV_Exact
+    # Dropping a range of a commit-ordered log inside a transaction
+    # (Transaction::truncate_log): it deletes exactly the entry keys of its
+    # range, leaves the head alone, and never conflicts, because a delete of a
+    # key another commit deleted is elided and an append writes only past the
+    # head the truncate read; a snapshot taken before it keeps the entries;
+    # a rollback to a savepoint drops it. Lean: Regolith/LogTruncate.lean,
+    # live_is_head_less_truncated, snapshot_reads_as_of, step_keeps_reads,
+    # no_version_past_head, truncate_never_conflicts, head_monotone,
+    # truncate_commutes, truncate_idempotent, and the REDs
+    # unguarded_truncate_breaks_law and erasing_loses_snapshot.
+    spec=LogTruncate
+    check MC_LogTruncate_Green                         GREEN
+    check MC_LogTruncate_Green_Three                   GREEN
+    check MC_LogTruncate_Red_OrdinaryWrite             RED INV_NoConflict
+    check MC_LogTruncate_Red_ReadHead                  RED INV_NoConflict
+    check MC_LogTruncate_Red_NoHeadGuard               RED INV_WithinSeenHead
+    check MC_LogTruncate_Red_NoHeadGuard_Conflict      RED INV_NoConflict
+    check MC_LogTruncate_Red_OffByOne                  RED INV_LiveLaw
+    check MC_LogTruncate_Red_RewindsHead               RED INV_HeadMonotone
+    check MC_LogTruncate_Red_ErasesOnTruncate          RED INV_ReaderStable
+    check MC_LogTruncate_Red_CompactIgnoresPins        RED INV_ReaderStable
+    check MC_LogTruncate_Red_RollbackKeepsTruncate     RED INV_RollbackHonoured
+    check MC_LogTruncate_Red_OpenKeys                  RED INV_LiveLaw
+    # Reading a transaction's own appends back (Transaction::appended): the
+    # entries it returns for a log are exactly the ones its commit numbers
+    # for that log, in that order, with no position among them; a rollback to
+    # a savepoint gives back the answer the savepoint saw. The reader guard
+    # of MC_DefraLevel_Red_OwnAppendVisible is untouched, because no position
+    # is given. Lean: Regolith/Appended.lean, appended_push_same,
+    # appended_push_other, rollback_restores, appended_after_rollback,
+    # appended_is_commit_order and the RED newest_first_breaks_order.
+    spec=AppendedEntries
+    check MC_AppendedEntries_Green                     GREEN
+    check MC_AppendedEntries_Red_NewestFirst           RED INV_AppendedIsCommitOrder
+    check MC_AppendedEntries_Red_OtherLog              RED INV_AppendedIsCommitOrder
+    check MC_AppendedEntries_Red_RollbackKeeps         RED INV_RollbackRestores
     # Phase 7 integration: with no worker and inline compaction on, no
     # stopped writer waits on a relief nobody runs. Every piece of progress
     # lands the stall's unit (relief handed back), a contended writer reads

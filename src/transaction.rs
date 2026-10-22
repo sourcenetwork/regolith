@@ -173,6 +173,7 @@ mod queue;
 mod receipt;
 mod retry;
 mod scan_range;
+mod truncate;
 mod txn_options;
 mod validated_range;
 mod write_buffer;

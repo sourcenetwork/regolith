@@ -25,6 +25,13 @@ import Regolith.WalClose
 -- once key, in commit order, and a snapshot sees exactly rows 1..H. Backs
 -- `proofs/tla/CommitOrderedAppend.tla` and `CommitOrderedAppendCrash.tla`.
 import Regolith.Append
+-- Dropping a range of a commit-ordered log inside a transaction keeps the log's
+-- law (live entries are the positions to the head less the truncated ones), a
+-- pinned reader's view, and never conflicts. Backs `proofs/tla/LogTruncate.tla`.
+import Regolith.LogTruncate
+-- A transaction reads its own appends to a log, oldest first, the order the commit numbers them.
+-- Backs `proofs/tla/AppendedEntries.tla`.
+import Regolith.Appended
 -- Plan 3.7: conflict-free allocation reserves ranges that never overlap,
 -- only grow, and survive crashes. Backs `proofs/tla/Allocate.tla`.
 import Regolith.Allocate

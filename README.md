@@ -267,7 +267,8 @@ four are the relaxations):
   last commit to land winning.
 - A key declared `KeyClass::Log`, with the same classifier: a read of it is never validated,
   and a put, delete or merge of it is refused with `Error::LogKeyWrite`. Only
-  `Transaction::append` writes the keys of a commit-ordered log.
+  `Transaction::append` writes the keys of a commit-ordered log, and
+  `Transaction::truncate_log` deletes its entry keys.
 
 `Transaction::append(&log, entry, once_key)` adds an entry to a commit-ordered log, whose
 keys a `LogLayout` names. At commit, in the ordered step after validation, the entry takes
@@ -275,6 +276,11 @@ the log's next position, dense from 1, and the entry, its once key and the head 
 written in the same atomic commit. Positions follow commit order, a transaction that
 aborts takes none, an append is never validated so it never conflicts (at every level, for
 both flavours), and an append whose once key already holds a position writes nothing.
+`Transaction::truncate_log(&log, lo..=hi)` drops the entries at those positions in the same
+atomic commit and leaves the head alone, so positions keep counting from where they were.
+It refuses a range past the head the transaction reads, never conflicts (two truncates of
+overlapping ranges both commit, and so do a truncate and an append), and a snapshot taken
+before it still reads every entry it dropped.
 `Db::allocate(key, n)` reserves `n` values of a `u64` counter in the same ordered step. It
 is never a conflict, never waits on a write stall, and is logged before any commit that
 uses one of its values, so after a crash no value a surviving commit used is returned

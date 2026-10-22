@@ -3,8 +3,10 @@
 //! A commit-ordered log is a run of entries numbered 1, 2, 3, ... in the order
 //! their transactions commit. [`crate::Transaction::append`] adds an entry,
 //! and regolith picks its position while the commit is being ordered, so
-//! positions follow commit order and have no holes. regolith does not know
-//! what the keys mean: a [`LogLayout`] tells it where the log keeps them.
+//! positions follow commit order and have no holes.
+//! [`crate::Transaction::truncate_log`] drops a range of entries, and the
+//! head keeps counting from where it was. regolith does not know what the
+//! keys mean: a [`LogLayout`] tells it where the log keeps them.
 
 /// Where one commit-ordered log keeps its keys. Implement it once per log and
 /// share it behind an [`Arc`](std::sync::Arc).
@@ -18,10 +20,11 @@
 ///   the position its entry was given as an 8-byte big-endian `u64`.
 ///
 /// regolith writes all three, in the same atomic commit that numbers the
-/// entry. A caller reads them like any other key, and must not write them. A
-/// reader that reads the head key in a snapshot and then the entries up to it
-/// finds every entry present, because positions are numbered in commit order
-/// and become visible with their commit.
+/// entry, and `truncate_log` deletes entry keys. A caller reads them like any
+/// other key, and must not write them. A reader that reads the head key in a
+/// snapshot and then the entries up to it finds every entry present that no
+/// commit at or before the snapshot truncated, because positions are numbered
+/// in commit order and become visible with their commit.
 ///
 /// # Contract
 ///
@@ -112,8 +115,9 @@ pub trait LogLayout: Send + Sync + 'static {
     /// An upper bound, in bytes, on the length of every
     /// [`entry_key`](LogLayout::entry_key).
     ///
-    /// `append` refuses a layout whose key for the largest position is
-    /// longer, and a commit refuses to write an entry key that is longer, so
-    /// a commit's size is known before it waits for a place in the log.
+    /// `append` and `truncate_log` refuse a layout whose key for the largest
+    /// position is longer, and a commit refuses to write an entry key that is
+    /// longer, so a commit's size is known before it waits for a place in the
+    /// log.
     fn max_entry_key_len(&self) -> usize;
 }
