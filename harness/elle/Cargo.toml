@@ -3,7 +3,7 @@ name = "elle-harness"
 version = "0.1.0"
 publish = false
 edition = "2024"
-rust-version = "1.90"
+rust-version = "1.99"
 description = "Jepsen/Elle consistency harness for the regolith storage engine"
 
 # Detaches this crate from the regolith workspace so `cargo check --workspace`
