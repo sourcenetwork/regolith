@@ -45,10 +45,10 @@ critical-section = ["portable-atomic/critical-section"]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }
 
 [dependencies]
-kovan = "0.2.1"
-kovan-map = "0.2.1"
-kovan-queue = "0.2.1"
-kovan-channel = "0.2.1"
+kovan = "0.2.2"
+kovan-map = "0.2.2"
+kovan-queue = "0.2.2"
+kovan-channel = "0.2.2"
 
 # `fallback` supplies `AtomicU64` on 32-bit targets that have no
 # 64-bit atomic instruction; `require-cas` turns a target with no

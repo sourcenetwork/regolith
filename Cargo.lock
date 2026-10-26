@@ -573,9 +573,9 @@ dependencies = [
 
 [[package]]
 name = "kovan"
-version = "0.2.1"
+version = "0.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "21ee422c2709bb72c122469a456d61b64f440f16f8a9f88f4868f445a46c0ab5"
+checksum = "30de8e1f374a1d4cb20f4031a771b0b9c34352c9fd35be65efd1407f71186675"
 dependencies = [
  "once_cell",
  "portable-atomic",
@@ -583,9 +583,9 @@ dependencies = [
 
 [[package]]
 name = "kovan-channel"
-version = "0.2.1"
+version = "0.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e9d5bddeb256b92b472ee69779367ee6fc8a80abf1dcb88097ee0126fd5d3421"
+checksum = "28714e9cbbaf6278719faa02950a2d6c7776fcdeb79f931c0880b13a769141a5"
 dependencies = [
  "crossbeam-utils",
  "kovan",
@@ -593,9 +593,9 @@ dependencies = [
 
 [[package]]
 name = "kovan-map"
-version = "0.2.1"
+version = "0.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bdc4dbd6cb0e6f25172d457af64d528ee3624d5f75928d32d423428bb60255fe"
+checksum = "ba041f9f2d2a9912ea2b823a3db44af8d1070c558cd933e419ee69dac17c6143"
 dependencies = [
  "foldhash",
  "kovan",
@@ -603,9 +603,9 @@ dependencies = [
 
 [[package]]
 name = "kovan-queue"
-version = "0.2.1"
+version = "0.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bf1c4ad2280fae0df46606ffbfc24b824a399bb22e07e115a6d8e86a798aeba4"
+checksum = "c446fe17daab001a9a8d2edc9b6f5fe8cb8f0fd29a90a4b4fbbf85d049897ee1"
 dependencies = [
  "crossbeam-utils",
  "kovan",
