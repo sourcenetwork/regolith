@@ -10,13 +10,13 @@ resolver = "2"
 
 [package]
 name = "regolith"
-version = "0.2.2"
+version = "0.2.3"
 edition = "2024"
 authors = [
     "Ivan Vercenco <ivan@source.network>",
     "Theo Bulut <theo@source.network>"
 ]
-rust-version = "1.90"
+rust-version = "1.99"
 license = "Apache-2.0 OR MIT"
 description = "ACID, performance oriented, embedded key-value database engine for edge systems"
 repository = "https://github.com/sourcenetwork/regolith"
@@ -45,10 +45,10 @@ critical-section = ["portable-atomic/critical-section"]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }
 
 [dependencies]
-kovan = "0.2.0"
-kovan-map = "0.2.0"
-kovan-queue = "0.2.0"
-kovan-channel = "0.2.0"
+kovan = "0.2.1"
+kovan-map = "0.2.1"
+kovan-queue = "0.2.1"
+kovan-channel = "0.2.1"
 
 # `fallback` supplies `AtomicU64` on 32-bit targets that have no
 # 64-bit atomic instruction; `require-cas` turns a target with no

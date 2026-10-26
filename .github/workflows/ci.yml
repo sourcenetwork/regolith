@@ -182,7 +182,7 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.90
+      - uses: dtolnay/rust-toolchain@1.99
       - uses: Swatinem/rust-cache@v2
       - uses: extractions/setup-just@v2
       - run: just msrv

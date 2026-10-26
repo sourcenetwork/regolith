@@ -3,7 +3,7 @@ name = "regolith-fuzz"
 version = "0.0.0"
 publish = false
 edition = "2024"
-rust-version = "1.90"
+rust-version = "1.99"
 
 [package.metadata]
 cargo-fuzz = true
