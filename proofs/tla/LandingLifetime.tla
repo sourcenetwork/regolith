@@ -6,8 +6,8 @@
 \* held is the kept wait in Ledger; age is Ledger::round minus Kept::round.
 \* Tick is Ledger::settle, Run and OtherRead are Ledger::seen with its
 \* caller-ownership guard, and Drop is dropping an IoWait.
-\* Rust: src/io_queue/ledger.rs, Ledger::seen (line 126) checks ownership;
-\* Ledger::settle (line 160) applies KEEP_ROUNDS and LIVE_KEEP_ROUNDS.
+\* Rust: src/io_queue/ledger.rs, Ledger::seen (line 129) checks ownership;
+\* Ledger::settle (line 163) applies KEEP_ROUNDS and LIVE_KEEP_ROUNDS.
 \* This supplies the delayed-resumption case omitted by LandingHold.tla;
 \* its held-block invariant applies within the finite retention window.
 \* Finite bounds preserve the boundary: two clones and one age past expiry.

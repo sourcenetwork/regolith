@@ -1129,6 +1129,14 @@ tla:
     check MC_LandingLifetime_Red_ConsumeLive            RED LiveLandingRetained
     check MC_LandingLifetime_Red_LeakAbandoned          RED AbandonedReleased
     check MC_LandingLifetime_Red_LeakLive               RED LiveBounded
+    # A let-go landing frees its block while kovan has yet to reclaim the
+    # map nodes that named it: both maps hold weak handles. Lean:
+    # Regolith/LandingReclaim.lean.
+    spec=LandingReclaim
+    check MC_LandingReclaim_Green                      GREEN
+    check MC_LandingReclaim_Green_ReachesIdle          RED NeverIdleUnreclaimed
+    check MC_LandingReclaim_Red_StrongInMap            RED INV_ReleasedBlockFreed
+    check MC_LandingReclaim_Red_StrongUnit             RED INV_ReleasedBlockFreed
     # D53, a CacheOnly commit whose validation misses the cache: a miss in
     # the early check leaves the commit owed on its queue, which reads the
     # block and submits it again; a miss deciding its slot leaves the

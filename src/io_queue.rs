@@ -188,6 +188,11 @@ pub struct IoProgress {
     /// pending calls can also hold blocks. A live wait expires after 64
     /// landing polls, after which its caller may need to reread.
     pub retained_live_bytes: usize,
+    /// Bytes of every block this queue keeps landed after the poll: the
+    /// landings within its byte bound plus those pending and retained calls
+    /// hold past it, so this may exceed the bound. A rising value with few
+    /// calls in progress names those holds as what keeps the memory.
+    pub landed_bytes: usize,
     /// Reads this queue waited on that finished during the poll, each counted
     /// once however many of the queue's reads waited on it, whichever thread
     /// ran it; and the timed waits the poll found due.

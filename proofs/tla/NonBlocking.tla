@@ -87,7 +87,10 @@
 \*
 \* WHAT IS MODELLED, and the code each piece mirrors:
 \*   unit        a single-flight read: Unit, src/engine/io/unit.rs
-\*   table       the unit table: IoRuntime::units, src/engine/io/mod.rs
+\*   table       the unit table: IoRuntime::units, src/engine/io/mod.rs,
+\*               whose entries are weak: the queues waiting on a unit hold
+\*               it, and LandingReclaim.tla checks that a removed entry
+\*               keeps no block alive
 \*   inbox       a queue's lock-free inbox: QueueShared::inbox,
 \*               src/engine/io/shared.rs, a Stack with an IDLE flag bit
 \*   waiting     the units a queue registered on: IoQueue::waiting

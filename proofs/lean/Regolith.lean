@@ -243,3 +243,6 @@ import Regolith.HistogramBounds
 import Regolith.MirrorPersist
 -- Completed I/O stays retained for a live caller despite intervening polls.
 import Regolith.LandingLifetime
+-- A let-go landing frees its block whatever kovan's reclamation schedule:
+-- `proofs/tla/LandingReclaim.tla`.
+import Regolith.LandingReclaim
