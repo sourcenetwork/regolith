@@ -7,7 +7,8 @@
 \* decides when the queue lets the landing go. Removing a key from a kovan
 \* map only retires its node: the node, and whatever it owns, is freed when
 \* kovan reclaims it, and an owner thread that goes idle never takes the step
-\* that does.
+\* that does. HashMap and HopscotchMap both retire a removed entry so, which
+\* is why the fix is the handle the node owns, not the kind of map.
 \* A tiny example: a queue reads a 44 KiB block, the call finishes, the next
 \* landing pushes the block past the byte bound, and the owner idles. The
 \* ledger has let the block go, but a retired map node that owns a strong

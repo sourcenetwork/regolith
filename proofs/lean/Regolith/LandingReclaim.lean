@@ -3,7 +3,8 @@
    (QueueShared::landed, src/engine/io/shared.rs) and the unit table
    (IoRuntime::units, src/engine/io/mod.rs). A key removed from a kovan map
    leaves a retired node that kovan frees only on a later step of the thread
-   that retired it, a step an idle thread never takes.
+   that retired it, a step an idle thread never takes; HashMap and
+   HopscotchMap both retire a removed entry so.
    A tiny example: the ledger drops a 44 KiB block and its thread idles. If a
    retired node owns a strong handle, the block lives as long as the idle.
    What must never happen: a block the ledger let go and no reader holds stays

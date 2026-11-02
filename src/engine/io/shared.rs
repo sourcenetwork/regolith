@@ -12,7 +12,7 @@
 use std::io;
 use std::sync::{Arc, OnceLock};
 
-use kovan_map::HashMap;
+use kovan_map::HopscotchMap;
 
 use super::atomic_waker::AtomicWaker;
 use super::job::{Delivery, Job};
@@ -75,7 +75,8 @@ pub(crate) enum Landing {
 
 /// What the landing table keeps for a key. The map frees a removed entry
 /// only once kovan reclaims it, which a thread gone idle can put off
-/// indefinitely, so the entry holds a weak handle and the owner's ledger
+/// indefinitely (with either kovan map: a hopscotch entry is retired the
+/// same way), so the entry holds a weak handle and the owner's ledger
 /// (`io_queue::ledger`) holds the block: the block is freed when the ledger
 /// lets it go. A failure costs a few dozen bytes and is kept as it is.
 #[derive(Clone)]
@@ -97,7 +98,7 @@ pub(crate) struct QueueShared {
     /// Reads that landed for this queue, so a read run again finds its block
     /// even when the block cache did not keep it, while the owner's ledger
     /// keeps the landing. Made by the first landing.
-    landed: OnceLock<HashMap<UnitKey, Posted>>,
+    landed: OnceLock<HopscotchMap<UnitKey, Posted>>,
     /// The thread that made or last polled the queue, as its
     /// [`thread_token`]: I/O regolith starts on a thread goes to the queue
     /// that thread owns.
@@ -257,7 +258,7 @@ impl QueueShared {
             Landing::Failed(err) => Posted::Failed(Arc::clone(err)),
         };
         self.landed
-            .get_or_init(|| HashMap::with_capacity(LANDED_BUCKETS))
+            .get_or_init(|| HopscotchMap::with_capacity(LANDED_BUCKETS))
             .insert(key, posted);
     }
 
