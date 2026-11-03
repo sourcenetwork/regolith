@@ -40,7 +40,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
-use crate::engine::io::shared::{QueueShared, WaitSlot};
+use crate::engine::io::shared::{Landing, QueueShared, WaitSlot};
 use crate::engine::io::unit::UnitKey;
 
 /// Landing polls an abandoned completed wait is kept before reclaiming it.
@@ -54,8 +54,11 @@ pub(super) const LIVE_KEEP_ROUNDS: u64 = 16 * KEEP_ROUNDS;
 #[derive(Default)]
 pub(super) struct Ledger {
     /// Each landing, oldest first, with what it costs. A block landed twice
-    /// is here twice; the table keeps the newer.
-    order: VecDeque<(UnitKey, usize)>,
+    /// is here twice; the table keeps the newer. This is the one strong
+    /// handle the queue keeps on each block: the table's is weak, so a
+    /// landing dropped here frees its block now, not when kovan reclaims
+    /// the table's removed entry.
+    order: VecDeque<(UnitKey, usize, Landing)>,
     /// Occurrences in order; only the last eviction forgets a landing.
     occurrences: HashMap<UnitKey, usize>,
     /// Scratch keys reused across polls that observe live completed waits.
@@ -88,9 +91,9 @@ struct Kept {
 }
 
 impl Ledger {
-    /// `key` landed, costing `charge` bytes.
-    pub(super) fn land(&mut self, key: UnitKey, charge: usize) {
-        self.order.push_back((key, charge));
+    /// `key` landed as `landing`, costing `charge` bytes.
+    pub(super) fn land(&mut self, key: UnitKey, charge: usize, landing: Landing) {
+        self.order.push_back((key, charge, landing));
         *self.occurrences.entry(key).or_default() += 1;
         self.bytes = self.bytes.saturating_add(charge);
         self.landed = true;
@@ -184,7 +187,7 @@ impl Ledger {
         });
         self.kept = kept;
         self.live_bytes = 0;
-        for (key, charge) in self.order.iter().rev() {
+        for (key, charge, _) in self.order.iter().rev() {
             if live_keys.is_empty() {
                 break;
             }
@@ -207,7 +210,7 @@ impl Ledger {
         }
         let mut i = 0;
         while self.bytes > queue.bound() && i < self.order.len() {
-            let (key, charge) = self.order[i];
+            let (key, charge, _) = self.order[i];
             if self.held.contains_key(&key) {
                 i += 1;
                 continue;
@@ -225,7 +228,7 @@ impl Ledger {
 
     /// Let go of every landing: the queue is being dropped.
     pub(super) fn clear(&mut self, queue: &QueueShared) {
-        for (key, _) in self.order.drain(..) {
+        for (key, _, _) in self.order.drain(..) {
             queue.forget(&key);
         }
         self.occurrences.clear();
@@ -270,7 +273,6 @@ impl Ledger {
     }
 
     /// Bytes of what landed and is still kept.
-    #[cfg(test)]
     pub(super) fn bytes(&self) -> usize {
         self.bytes
     }
@@ -284,7 +286,7 @@ impl Ledger {
     /// The blocks still landed, oldest first.
     #[cfg(test)]
     pub(super) fn keys(&self) -> Vec<UnitKey> {
-        self.order.iter().map(|(key, _)| *key).collect()
+        self.order.iter().map(|(key, _, _)| *key).collect()
     }
 }
 

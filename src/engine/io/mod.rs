@@ -89,7 +89,7 @@ pub(crate) mod stack;
 pub(crate) mod unit;
 
 use std::io;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::task::Waker;
 
 use kovan_map::HashMap;
@@ -176,6 +176,27 @@ pub(crate) enum Landed {
     Filter(Arc<FilterBlock>),
 }
 
+/// A weak handle on what a unit read: what a kovan map keeps in place of
+/// the block, so an entry it removed and has yet to reclaim holds a few
+/// dozen bytes and never the block.
+#[derive(Clone)]
+pub(crate) enum WeakLanded {
+    Data(Weak<Block>),
+    Index(Weak<IndexBlock>),
+    Filter(Weak<FilterBlock>),
+}
+
+impl WeakLanded {
+    /// The block, while anyone still holds it.
+    pub(crate) fn upgrade(&self) -> Option<Landed> {
+        match self {
+            Self::Data(block) => block.upgrade().map(Landed::Data),
+            Self::Index(block) => block.upgrade().map(Landed::Index),
+            Self::Filter(block) => block.upgrade().map(Landed::Filter),
+        }
+    }
+}
+
 impl Landed {
     /// Bytes this costs while held.
     pub(crate) fn charge(&self) -> usize {
@@ -183,6 +204,14 @@ impl Landed {
             Self::Data(block) => block.charge(),
             Self::Index(block) => block.charge(),
             Self::Filter(block) => block.charge(),
+        }
+    }
+
+    pub(crate) fn downgrade(&self) -> WeakLanded {
+        match self {
+            Self::Data(block) => WeakLanded::Data(Arc::downgrade(block)),
+            Self::Index(block) => WeakLanded::Index(Arc::downgrade(block)),
+            Self::Filter(block) => WeakLanded::Filter(Arc::downgrade(block)),
         }
     }
 
@@ -221,7 +250,13 @@ fn aliased() -> io::Error {
 /// database. Lives beside its block cache, which every read path already
 /// carries to the seam.
 pub(crate) struct IoRuntime {
-    units: HashMap<UnitKey, Arc<Unit>>,
+    /// Weak, like the landing table: a unit's outcome holds the block it
+    /// read, and the map frees a removed entry only once kovan reclaims it,
+    /// which a thread gone idle can put off indefinitely. Every unit anyone
+    /// waits on is held by the queues waiting on it, the miss delivering it,
+    /// or the thread running it, so an entry that no longer upgrades names a
+    /// unit nobody can be told about, and a miss replaces it.
+    units: HashMap<UnitKey, Weak<Unit>>,
     queues: HashMap<QueueId, Arc<QueueShared>>,
     /// The jobs a single queue owns, by address, each with its queue, until
     /// they land. What bounds it: each entry is a step a write owes (at
@@ -507,7 +542,7 @@ impl IoRuntime {
         }
         let missed = self.miss_counted(queue, key, bytes, work);
         if self.gate.leave()
-            && let Some(unit) = self.units.get(&key)
+            && let Some(unit) = self.units.get(&key).and_then(|unit| unit.upgrade())
         {
             self.release(&unit);
         }
@@ -575,19 +610,22 @@ impl IoRuntime {
         bytes: usize,
         work: impl FnOnce() -> io::Result<Work>,
     ) -> io::Result<Arc<Unit>> {
-        if let Some(unit) = self.units.get(&key)
+        if let Some(unit) = self.units.get(&key).and_then(|unit| unit.upgrade())
             && !unit.is_done()
         {
             return Ok(unit);
         }
         let fresh = Arc::new(Unit::new(key, bytes, work()?));
         loop {
-            match self.units.insert_if_absent(key, Arc::clone(&fresh)) {
-                None => return Ok(fresh),
-                Some(existing) if !existing.is_done() => return Ok(existing),
-                Some(finished) => {
+            let Some(existing) = self.units.insert_if_absent(key, Arc::downgrade(&fresh)) else {
+                return Ok(fresh);
+            };
+            match existing.upgrade() {
+                Some(unit) if !unit.is_done() => return Ok(unit),
+                // Finished, or dropped by everyone who held it.
+                _ => {
                     self.units
-                        .remove_if(&key, |unit| Arc::ptr_eq(unit, &finished));
+                        .remove_if(&key, |unit| Weak::ptr_eq(unit, &existing));
                 }
             }
         }
@@ -631,8 +669,9 @@ impl IoRuntime {
     }
 
     fn forget(&self, unit: &Arc<Unit>) {
-        self.units
-            .remove_if(&unit.key(), |held| Arc::ptr_eq(held, unit));
+        self.units.remove_if(&unit.key(), |held| {
+            std::ptr::eq(held.as_ptr(), Arc::as_ptr(unit))
+        });
     }
 
     /// `close`: finish every unit nobody is running with nothing read, so
@@ -643,7 +682,9 @@ impl IoRuntime {
     pub(crate) fn close(&self) {
         self.gate.close();
         for unit in self.units.values() {
-            self.release(&unit);
+            if let Some(unit) = unit.upgrade() {
+                self.release(&unit);
+            }
         }
         // A job a queue owns is settled the same way: its waiters are told
         // now, with the outcome its body gives a closed database.
@@ -667,7 +708,7 @@ impl IoRuntime {
     /// The unit in the table for `key`.
     #[cfg(test)]
     pub(crate) fn unit(&self, key: &UnitKey) -> Option<Arc<Unit>> {
-        self.units.get(key)
+        self.units.get(key).and_then(|unit| unit.upgrade())
     }
 
     /// Jobs in the table now.

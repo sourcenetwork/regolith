@@ -12,13 +12,13 @@
 use std::io;
 use std::sync::{Arc, OnceLock};
 
-use kovan_map::HashMap;
+use kovan_map::HopscotchMap;
 
-use super::Landed;
 use super::atomic_waker::AtomicWaker;
 use super::job::{Delivery, Job};
 use super::stack::{IDLE, Rest, SHUT, Stack};
 use super::unit::{Unit, UnitKey};
+use super::{Landed, WeakLanded};
 use crate::env::open_file_limit::slots::SlotWaiter;
 use crate::io_queue::QueueId;
 use crate::sync::internal::{AtomicUsize, Ordering};
@@ -73,6 +73,18 @@ pub(crate) enum Landing {
     Failed(Arc<io::Error>),
 }
 
+/// What the landing table keeps for a key. The map frees a removed entry
+/// only once kovan reclaims it, which a thread gone idle can put off
+/// indefinitely (with either kovan map: a hopscotch entry is retired the
+/// same way), so the entry holds a weak handle and the owner's ledger
+/// (`io_queue::ledger`) holds the block: the block is freed when the ledger
+/// lets it go. A failure costs a few dozen bytes and is kept as it is.
+#[derive(Clone)]
+enum Posted {
+    Ready(WeakLanded),
+    Failed(Arc<io::Error>),
+}
+
 pub(crate) struct QueueShared {
     id: QueueId,
     inbox: Stack<Message>,
@@ -84,8 +96,9 @@ pub(crate) struct QueueShared {
     /// admitted when nothing else is pending.
     bound: usize,
     /// Reads that landed for this queue, so a read run again finds its block
-    /// even when the block cache did not keep it. Made by the first landing.
-    landed: OnceLock<HashMap<UnitKey, Landing>>,
+    /// even when the block cache did not keep it, while the owner's ledger
+    /// keeps the landing. Made by the first landing.
+    landed: OnceLock<HopscotchMap<UnitKey, Posted>>,
     /// The thread that made or last polled the queue, as its
     /// [`thread_token`]: I/O regolith starts on a thread goes to the queue
     /// that thread owns.
@@ -223,25 +236,30 @@ impl QueueShared {
 
     /// What landed for `key` on this queue, if anything. A failure is handed
     /// out once and then forgotten, so the read after it tries the device
-    /// again.
+    /// again. A block the ledger has let go is a miss, as an evicted one is.
     pub(crate) fn landed(&self, key: &UnitKey) -> Option<Landing> {
         let landed = self.landed.get()?;
         match landed.get(key)? {
-            Landing::Failed(err) => landed
+            Posted::Failed(err) => landed
                 .remove_if(
                     key,
-                    |landing| matches!(landing, Landing::Failed(e) if Arc::ptr_eq(e, &err)),
+                    |posted| matches!(posted, Posted::Failed(e) if Arc::ptr_eq(e, &err)),
                 )
                 .map(|_| Landing::Failed(err)),
-            ready => Some(ready),
+            Posted::Ready(block) => block.upgrade().map(Landing::Ready),
         }
     }
 
-    /// Keep `landing` for `key` until the owner lets it go.
-    pub(crate) fn land(&self, key: UnitKey, landing: Landing) {
+    /// Post `landing` for `key` until the owner forgets it. The caller keeps
+    /// the block alive meanwhile: the table holds only a weak handle on it.
+    pub(crate) fn land(&self, key: UnitKey, landing: &Landing) {
+        let posted = match landing {
+            Landing::Ready(landed) => Posted::Ready(landed.downgrade()),
+            Landing::Failed(err) => Posted::Failed(Arc::clone(err)),
+        };
         self.landed
-            .get_or_init(|| HashMap::with_capacity(LANDED_BUCKETS))
-            .insert(key, landing);
+            .get_or_init(|| HopscotchMap::with_capacity(LANDED_BUCKETS))
+            .insert(key, posted);
     }
 
     /// Whether the owner keeps any completed wait for a call's next run.
@@ -359,7 +377,7 @@ mod tests {
             offset: 0,
             guard: None,
         };
-        queue.land(key, Landing::Failed(Arc::new(io::Error::other("bad"))));
+        queue.land(key, &Landing::Failed(Arc::new(io::Error::other("bad"))));
         assert!(matches!(queue.landed(&key), Some(Landing::Failed(_))));
         assert!(queue.landed(&key).is_none());
     }

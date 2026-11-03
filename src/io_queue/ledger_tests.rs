@@ -186,6 +186,14 @@ fn another_reader_cannot_release_a_live_callers_landing() {
     );
 }
 
+/// A landing for ledger tests that charge by hand: a failure, which holds
+/// no block.
+fn failed() -> crate::engine::io::shared::Landing {
+    crate::engine::io::shared::Landing::Failed(std::sync::Arc::new(std::io::Error::other(
+        "synthetic",
+    )))
+}
+
 fn synthetic_key(offset: u64) -> crate::engine::io::unit::UnitKey {
     crate::engine::io::unit::UnitKey {
         file_id: 1,
@@ -205,15 +213,15 @@ fn forgotten_live_handle_expires_at_the_finite_window() {
     let key = synthetic_key(0);
     let caller = Arc::new(WaitSlot::new());
     caller.complete();
-    ledger.land(key, 200);
+    ledger.land(key, 200, failed());
     ledger.completed(Some(key), caller.clone());
     for round in 1..=LIVE_KEEP_ROUNDS {
-        ledger.land(synthetic_key(round), 10);
+        ledger.land(synthetic_key(round), 10, failed());
         ledger.settle(&queue);
         assert!(ledger.is_held(&key), "lost progress at round {round}");
         assert_eq!(ledger.live_bytes(), 200);
     }
-    ledger.land(synthetic_key(LIVE_KEEP_ROUNDS + 1), 10);
+    ledger.land(synthetic_key(LIVE_KEEP_ROUNDS + 1), 10, failed());
     ledger.settle(&queue);
     assert!(caller.is_ready(), "expiry must not invalidate the wait");
     assert!(!ledger.is_held(&key));
@@ -233,8 +241,8 @@ fn live_retention_counts_shared_blocks_once_and_resets_after_drop() {
     let key = synthetic_key(0);
     let first = Arc::new(WaitSlot::new());
     let second = Arc::new(WaitSlot::holding(vec![key].into_boxed_slice()));
-    ledger.land(key, 60);
-    ledger.land(key, 80);
+    ledger.land(key, 60, failed());
+    ledger.land(key, 80, failed());
     ledger.completed(Some(key), first.clone());
     ledger.hold(&second);
     ledger.completed(Some(key), second.clone());
@@ -246,11 +254,11 @@ fn live_retention_counts_shared_blocks_once_and_resets_after_drop() {
     );
     assert!(ledger.retention_warning);
     drop(first);
-    ledger.land(synthetic_key(1), 10);
+    ledger.land(synthetic_key(1), 10, failed());
     ledger.settle(&queue);
     assert_eq!(ledger.live_bytes(), 80, "the other caller still retains it");
     drop(second);
-    ledger.land(synthetic_key(2), 10);
+    ledger.land(synthetic_key(2), 10, failed());
     ledger.settle(&queue);
     assert_eq!(ledger.live_bytes(), 0);
     assert!(
@@ -268,16 +276,16 @@ fn duplicate_landing_eviction_keeps_the_latest_entry_until_last_removal() {
     let queue = QueueShared::new(test_id(), 100);
     let mut ledger = Ledger::default();
     let key = synthetic_key(0);
-    queue.land(key, Landing::Failed(Arc::new(io::Error::other("latest"))));
-    ledger.land(key, 80);
-    ledger.land(key, 80);
+    queue.land(key, &Landing::Failed(Arc::new(io::Error::other("latest"))));
+    ledger.land(key, 80, failed());
+    ledger.land(key, 80, failed());
     ledger.settle(&queue);
     assert_eq!(ledger.bytes(), 80);
     assert!(
         queue.landed(&key).is_some(),
         "the remaining entry must stay available"
     );
-    ledger.land(synthetic_key(1), 100);
+    ledger.land(synthetic_key(1), 100, failed());
     ledger.settle(&queue);
     assert!(!ledger.keys().contains(&key));
 }
@@ -296,8 +304,10 @@ fn an_idle_poll_reports_the_retained_live_landing() {
     let landed = queue.poll(IoBudget::ALL);
     assert!(live.is_ready());
     assert!(landed.retained_live_bytes >= BIG);
+    assert!(landed.landed_bytes >= landed.retained_live_bytes);
     let idle = queue.poll(IoBudget::ALL);
     assert_eq!(idle.retained_live_bytes, landed.retained_live_bytes);
+    assert_eq!(idle.landed_bytes, landed.landed_bytes);
     assert_eq!(idle.completed, 0);
     assert!(!idle.more_pending);
 }
@@ -312,17 +322,113 @@ fn a_late_drop_does_not_receive_the_rest_of_the_live_window() {
     let mut ledger = Ledger::default();
     let key = synthetic_key(0);
     let caller = Arc::new(WaitSlot::new());
-    ledger.land(key, 200);
+    ledger.land(key, 200, failed());
     ledger.completed(Some(key), caller.clone());
     for round in 1..=10 {
-        ledger.land(synthetic_key(round), 10);
+        ledger.land(synthetic_key(round), 10, failed());
         ledger.settle(&queue);
     }
     assert!(ledger.is_held(&key));
     drop(caller);
-    ledger.land(synthetic_key(11), 10);
+    ledger.land(synthetic_key(11), 10, failed());
     ledger.settle(&queue);
     assert!(!ledger.is_held(&key));
     assert_eq!(ledger.live_bytes(), 0);
     assert!(ledger.bytes() <= 100);
+}
+
+/// A decoded data block of about 44 KiB, the size the landings that stayed
+/// resident had, and a weak handle that says when it is freed.
+fn big_block(
+    seed: u8,
+) -> (
+    crate::engine::io::Landed,
+    std::sync::Weak<crate::engine::block::Block>,
+) {
+    use crate::engine::block::{Block, BlockBuilder};
+    let mut builder = BlockBuilder::new(16);
+    builder.add(&[seed], &vec![seed; 44 << 10]);
+    let block = std::sync::Arc::new(Block::decode(builder.finish()).unwrap());
+    let weak = std::sync::Arc::downgrade(&block);
+    (crate::engine::io::Landed::Data(block), weak)
+}
+
+#[test]
+fn a_forgotten_landing_frees_its_block_while_its_thread_idles() {
+    use super::Ledger;
+    use crate::engine::io::shared::{Landing, QueueShared, test_id};
+    use std::sync::{Arc, Barrier, mpsc};
+
+    const THREADS: usize = 4;
+    const BLOCKS: u64 = 16;
+    // Each owner lands its blocks, lets them all go, and then idles without
+    // flushing kovan: its retired map entries stay unreclaimed until the
+    // barrier releases it.
+    let idle = Arc::new(Barrier::new(THREADS + 1));
+    let (tx, rx) = mpsc::channel();
+    let owners: Vec<_> = (0..THREADS)
+        .map(|t| {
+            let idle = Arc::clone(&idle);
+            let tx = tx.clone();
+            std::thread::spawn(move || {
+                let queue = QueueShared::new(test_id(), 0);
+                let mut ledger = Ledger::default();
+                let mut weaks = Vec::new();
+                for offset in 0..BLOCKS {
+                    let (landed, weak) = big_block(t as u8);
+                    let key = synthetic_key(offset);
+                    let landing = Landing::Ready(landed);
+                    queue.land(key, &landing);
+                    ledger.land(key, 1, landing);
+                    assert!(matches!(queue.landed(&key), Some(Landing::Ready(_))));
+                    weaks.push((key, weak));
+                }
+                // A bound of zero: the settle lets every unheld landing go.
+                ledger.settle(&queue);
+                assert!(ledger.keys().is_empty());
+                for (key, _) in &weaks {
+                    assert!(queue.landed(key).is_none(), "a let-go landing is a miss");
+                }
+                tx.send(weaks.into_iter().map(|(_, weak)| weak).collect::<Vec<_>>())
+                    .unwrap();
+                idle.wait();
+                drop(queue);
+            })
+        })
+        .collect();
+    drop(tx);
+    let weaks: Vec<_> = rx.iter().take(THREADS).flatten().collect();
+    let alive = weaks.iter().filter(|weak| weak.strong_count() > 0).count();
+    idle.wait();
+    for owner in owners {
+        owner.join().unwrap();
+    }
+    assert_eq!(
+        alive,
+        0,
+        "{alive} of {} forgotten blocks stayed alive while their owners idled",
+        weaks.len()
+    );
+}
+
+#[test]
+fn a_read_block_is_freed_once_its_queue_lets_it_go() {
+    use crate::engine::io::Landed;
+    use crate::engine::io::shared::Landing;
+
+    let (_dir, db) = big_values(&[b"a", b"b", b"c"]);
+    let mut queue = db.io_queue();
+    get_through(&db, &mut queue, b"a");
+    let a = queue.landed_keys()[0];
+    let block = match queue.shared().landed(&a) {
+        Some(Landing::Ready(Landed::Data(block))) => std::sync::Arc::downgrade(&block),
+        _ => panic!("a landed as a data block"),
+    };
+    // Each later read lands past the bound, and nothing holds a: it goes.
+    get_through(&db, &mut queue, b"b");
+    get_through(&db, &mut queue, b"c");
+    assert!(!queue.landed_keys().contains(&a));
+    // Neither the landing table nor the unit table, whose removed entries
+    // kovan has yet to reclaim, keeps the block.
+    assert_eq!(block.strong_count(), 0, "the let-go block is still alive");
 }

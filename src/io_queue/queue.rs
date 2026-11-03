@@ -245,6 +245,7 @@ impl IoQueue {
         if !self.owes() {
             return IoProgress {
                 retained_live_bytes: self.ledger.live_bytes(),
+                landed_bytes: self.ledger.bytes(),
                 ..IoProgress::default()
             };
         }
@@ -298,6 +299,7 @@ impl IoQueue {
         let wake_in = self.fire_timers(&mut completed);
         IoProgress {
             retained_live_bytes: self.ledger.live_bytes(),
+            landed_bytes: self.ledger.bytes(),
             completed,
             more_pending: self.owes(),
             wake_in,
@@ -537,8 +539,8 @@ impl IoQueue {
             ),
             Some(Outcome::Released) | None => return,
         };
-        self.shared.land(unit.key(), landing);
-        self.ledger.land(unit.key(), charge);
+        self.shared.land(unit.key(), &landing);
+        self.ledger.land(unit.key(), charge, landing);
     }
 
     /// Wake the reads that waited for room, once the queue owes less than its
