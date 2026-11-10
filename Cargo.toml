@@ -10,7 +10,7 @@ resolver = "2"
 
 [package]
 name = "regolith"
-version = "0.2.4"
+version = "0.2.5"
 edition = "2024"
 authors = [
     "Ivan Vercenco <ivan@source.network>",
@@ -45,10 +45,10 @@ critical-section = ["portable-atomic/critical-section"]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }
 
 [dependencies]
-kovan = "0.2.3"
-kovan-map = "0.2.3"
-kovan-queue = "0.2.3"
-kovan-channel = "0.2.3"
+kovan = "0.2.5"
+kovan-map = "0.2.5"
+kovan-queue = "0.2.5"
+kovan-channel = "0.2.5"
 
 # `fallback` supplies `AtomicU64` on 32-bit targets that have no
 # 64-bit atomic instruction; `require-cas` turns a target with no
